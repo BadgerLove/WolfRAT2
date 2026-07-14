@@ -241,7 +241,6 @@ Reverse-engineered from original WolfRAT.exe. See `02_ENCRYPTION_ALGORITHM.txt` 
 - `wolfrat_wire.log` — Protocol debug log
 
 ### JO Server Files
-- `C:\GAMES\JOTAC\Game\JO\jotacserver.exe` — Server executable
 - `C:\GAMES\JOTAC\Game\JO\admin.cfg` — Admin credentials
 - `C:\GAMES\JOTAC\Game\JO\game.cfg` — Server configuration
 - `C:\GAMES\JOTAC\Game\JO\matchlogs\` — Match history
