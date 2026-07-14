@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <meta name="apple-mobile-web-app-capable" content="yes">
+    <meta name="apple-mobile-web-app-status-bar-style" content="black">
+    <meta name="theme-color" content="#000000">
+    <title>WolfRAT</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <!-- Login overlay -->
+    <div id="login-overlay" class="overlay">
+        <div class="overlay-content">
+            <div class="wolf-logo">🐺</div>
+            <h1>WolfRAT</h1>
+            <p class="subtitle">JO Server Admin</p>
+            <form id="login-form" class="login-form" onsubmit="return doLogin(event)">
+                <input id="login-user" type="text" placeholder="Username" autocomplete="username" autocapitalize="none">
+                <input id="login-pass" type="text" placeholder="Access Token" autocomplete="off" autocapitalize="none" spellcheck="false">
+                <label class="remember-row"><input id="login-remember" type="checkbox" checked> Remember me</label>
+                <button type="submit" class="btn btn-send">Log In</button>
+                <p id="login-error" class="login-error hidden">Login failed</p>
+            </form>
+        </div>
+    </div>
+
+    <!-- Connection overlay -->
+    <div id="conn-overlay" class="overlay hidden">
+        <div class="overlay-content">
+            <div class="wolf-logo">🐺</div>
+            <h1>WolfRAT</h1>
+            <p class="subtitle">JO Server Admin</p>
+            <div id="conn-status" class="conn-status disconnected">Connecting...</div>
+        </div>
+    </div>
+
+    <!-- Main app -->
+    <div id="app" class="app hidden">
+        <!-- Top bar -->
+        <header class="topbar">
+            <div class="topbar-left">
+                <span class="wolf-icon">🐺</span>
+                <span class="topbar-title">WolfRAT</span>
+            </div>
+            <div class="topbar-right">
+                <span id="conn-dot" class="conn-dot disconnected"></span>
+                <span id="player-badge" class="badge">0</span>
+            </div>
+        </header>
+
+        <!-- Tab content -->
+        <main class="content">
+            <!-- Dashboard -->
+            <section id="tab-dashboard" class="tab active">
+                <div class="card">
+                    <h2>Server Status</h2>
+                    <div class="stat-grid">
+                        <div class="stat">
+                            <span class="stat-label">Status</span>
+                            <span id="dash-status" class="stat-value">—</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-label">Players</span>
+                            <span id="dash-players" class="stat-value">0</span>
+                        </div>
+                        <div class="stat">
+                            <span class="stat-label">Mode</span>
+                            <span id="dash-mode" class="stat-value">—</span>
+                        </div>
+                    </div>
+                </div>
+                <div class="card">
+                    <h2>Quick Actions</h2>
+                    <div class="action-grid">
+                        <button class="btn btn-action" onclick="sendCommand('MISSION CYCLE')">⏭ Next Map</button>
+                        <button class="btn btn-action" onclick="sendCommand('player list')">🔄 Refresh</button>
+                        <button class="btn btn-action" onclick="sendCommand('chat get')">💬 Sync Chat</button>
+                    </div>
+                </div>
+                <div class="card">
+                    <h2>Recent Chat</h2>
+                    <div id="dash-chat" class="mini-chat"></div>
+                </div>
+            </section>
+
+            <!-- Players -->
+            <section id="tab-players" class="tab">
+                <div class="card">
+                    <h2>Players <span id="player-count" class="count">(0)</span></h2>
+                    <div id="player-list" class="player-list">
+                        <p class="empty">No players connected</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Chat -->
+            <section id="tab-chat" class="tab">
+                <div class="card chat-card">
+                    <h2>Server Chat</h2>
+                    <div id="chat-messages" class="chat-messages"></div>
+                    <div class="chat-input-row">
+                        <input id="chat-input" type="text" placeholder="Type a message or !command..." maxlength="65" autocomplete="off">
+                        <button class="btn btn-send" onclick="sendChat()">Send</button>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Maps -->
+            <section id="tab-maps" class="tab">
+                <div class="card">
+                    <h2>Mission Rotation</h2>
+                    <div id="map-list" class="map-list">
+                        <p class="empty">No maps loaded</p>
+                    </div>
+                </div>
+            </section>
+        </main>
+
+        <!-- Bottom nav -->
+        <nav class="bottomnav">
+            <button class="nav-btn active" data-tab="dashboard">
+                <span class="nav-icon">📊</span>
+                <span class="nav-label">Dashboard</span>
+            </button>
+            <button class="nav-btn" data-tab="players">
+                <span class="nav-icon">👥</span>
+                <span class="nav-label">Players</span>
+            </button>
+            <button class="nav-btn" data-tab="chat">
+                <span class="nav-icon">💬</span>
+                <span class="nav-label">Chat</span>
+            </button>
+            <button class="nav-btn" data-tab="maps">
+                <span class="nav-icon">🗺️</span>
+                <span class="nav-label">Maps</span>
+            </button>
+        </nav>
+    </div>
+
+    <!-- Player action sheet -->
+    <div id="action-sheet" class="action-sheet hidden">
+        <div class="action-sheet-content">
+            <div class="action-sheet-header">
+                <h3 id="action-player-name">Player</h3>
+                <button class="btn-close" onclick="closeActionSheet()">✕</button>
+            </div>
+            <div class="action-sheet-body">
+                <button class="btn btn-action-row" onclick="playerAction('swap')">🔄 Swap Team</button>
+                <button class="btn btn-action-row" onclick="playerAction('kill')">💀 Kill</button>
+                <button class="btn btn-action-row" onclick="playerAction('zero')">0️⃣ Zero Score</button>
+                <button class="btn btn-action-row btn-warning" onclick="playerAction('kick')">👢 Kick</button>
+                <button class="btn btn-action-row btn-danger" onclick="playerAction('ban')">🔨 Ban</button>
+            </div>
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
