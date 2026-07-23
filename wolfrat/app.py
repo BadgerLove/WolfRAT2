@@ -5275,40 +5275,9 @@ class MapVotingTab(QWidget):
 
     def _tick(self):
         import time
-        if not self._match_start_time:
-            return
 
-        elapsed = time.time() - self._match_start_time
-        # Use server remaining time if available (updated within last 30s)
-        if self._server_time_updated and (time.time() - self._server_time_updated) < 30:
-            match_secs = self._server_game_time_total * 60
-        else:
-            match_secs = self.match_duration_spin.value() * 60
-        trigger_secs = self.trigger_spin.value() * 60
-
-        vote_start_target = match_secs - trigger_secs
-
-        mins = int(elapsed // 60)
-        secs = int(elapsed % 60)
-
-        if self._vote_stage == 'idle':
-            rem = vote_start_target - elapsed
-            # Show remaining time from server if available
-            if self._server_time_updated and (time.time() - self._server_time_updated) < 30:
-                time_left = self._server_game_time_remaining
-                time_str = f"{time_left}m remaining"
-            else:
-                time_str = f"{mins:02d}:{secs:02d} elapsed"
-            if rem > 0:
-                self.status_lbl.setText(f"Status: Match running ({time_str}). Auto-vote in {int(rem//60):02d}:{int(rem%60):02d}")
-            else:
-                self.status_lbl.setText(f"Status: Match running ({time_str}). Auto-vote pending...")
-
-            if self.enable_cb.isChecked() and elapsed >= vote_start_target:
-                if len(self.server.players) > 0:
-                    self._start_vote()
-
-        elif self._vote_stage == 'voting':
+        # Voting stage — uses local timer for vote duration (short, self-contained)
+        if self._vote_stage == 'voting':
             vote_elapsed = time.time() - self._vote_start_time
             vote_dur_secs = self.duration_spin.value() * 60
             rem = vote_dur_secs - vote_elapsed
@@ -5323,6 +5292,37 @@ class MapVotingTab(QWidget):
                     self._last_progress_update = 2
             else:
                 self._end_vote()
+            return
+
+        # Done stage — nothing to do
+        if self._vote_stage == 'done':
+            return
+
+        # Idle stage — use server GameTime to decide when to fire
+        if self._vote_stage == 'idle':
+            trigger_mins = self.trigger_spin.value()
+
+            # No server time yet — show waiting
+            if not self._server_time_updated:
+                self.status_lbl.setText("Status: Waiting for server data...")
+                return
+
+            # Server time stale (>60s old) — show warning
+            if (time.time() - self._server_time_updated) > 60:
+                self.status_lbl.setText(f"Status: Server data stale ({self._server_game_time_remaining}m). Waiting for update...")
+                return
+
+            remaining = self._server_game_time_remaining
+            total = self._server_game_time_total
+
+            if remaining > trigger_mins:
+                self.status_lbl.setText(f"Status: {remaining}m / {total}m remaining. Auto-vote in {remaining - trigger_mins}m")
+            else:
+                self.status_lbl.setText(f"Status: {remaining}m remaining. Auto-vote pending...")
+
+            if self.enable_cb.isChecked() and remaining <= trigger_mins:
+                if len(self.server.players) > 0:
+                    self._start_vote()
 
     def _start_vote(self):
         import time
