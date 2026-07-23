@@ -1,5 +1,5 @@
 """
-WolfRAT 2.4.9 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.4.10 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -3858,7 +3858,7 @@ class SpreeTab(QWidget):
             prev = self._player_stats[pid]
             prev['name'] = name
 
-            # Map change resets handled by on_missions_updated() (v2.4.9)
+            # Map change resets handled by on_missions_updated() (v2.4.10)
 
             if deaths > prev['deaths']:
                 prev['streak'] = 0
@@ -6058,11 +6058,11 @@ class WebAdminTab(QWidget):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.4.9 Main Window."""
+    """WolfRAT 2.4.10 Main Window."""
 
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("WolfRAT 2.4.9 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.4.10 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -6079,7 +6079,7 @@ class MainWindow(QMainWindow):
         self.missions_store = MissionsStore()
         self.stats_store = StatsStore()
 
-        # Web server for mobile access (v2.4.9) - disabled by default
+        # Web server for mobile access (v2.4.10) - disabled by default
         self.web_server = WolfWebServer(self.server)
         # Don't start here - WebAdminTab controls start/stop
 
@@ -6135,7 +6135,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.4.9 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.4.10 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.reconnecting_signal.connect(lambda attempt: self.set_connected(False, f'Reconnecting (Attempt {attempt})...'))
@@ -6146,9 +6146,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.4.9 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.4.10 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.4.9 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.4.10 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -6156,7 +6156,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.4.9")
+        header = QLabel("WolfRAT 2.4.10")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -6276,7 +6276,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.4.9 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.4.10 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -6356,8 +6356,8 @@ class MainWindow(QMainWindow):
             data = json.loads(resp.read())
 
             wolfrat_data = data.get("wolfrat", {})
-            latest_version = wolfrat_data.get("version", "2.4.9")
-            current = "2.4.9"
+            latest_version = wolfrat_data.get("version", "2.4.10")
+            current = "2.4.10"
 
             if latest_version != current:
                 # Custom dialog with scrollable changelog
@@ -6491,14 +6491,14 @@ def main():
     # Log startup
     try:
         from protocol import wire_log
-        wire_log("=== WolfRAT 2.4.9 STARTED ===")
+        wire_log("=== WolfRAT 2.4.10 STARTED ===")
     except Exception:
         pass
 
     # B-Stats: anonymous usage analytics
     try:
         import bstats
-        bstats.bstats_start("wolfrat", "2.4.9")
+        bstats.bstats_start("wolfrat", "2.4.10")
     except Exception:
         pass
 
@@ -6521,7 +6521,7 @@ def main():
 
     app = QApplication(sys.argv)
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.4.9")
+    app.setApplicationName("WolfRAT 2.4.10")
 
     window = MainWindow()
     _set_dark_title_bar(window)
