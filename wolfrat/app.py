@@ -2802,6 +2802,7 @@ class ChatBotTab(QWidget):
         self._swap_cooldowns = {}  # player_name -> timestamp of last swap
         self._chat_initialized = False  # skip first chat batch (old messages from before we connected)
         self._player_chat_times = {} # player_name -> list of timestamps
+        self._spam_kick_cooldowns = {}  # player_name -> timestamp of last kick
         self._chat_config = self._load_chat_config()
         self._build_ui()
 
@@ -2810,6 +2811,7 @@ class ChatBotTab(QWidget):
         self._chat_initialized = False
         self._seen_chat_raw = set()
         self._player_chat_times = {}
+        self._spam_kick_cooldowns = {}
 
     def _chat_config_path(self):
         import os, sys
@@ -3084,6 +3086,10 @@ class ChatBotTab(QWidget):
                 player_name = text.split(':')[0].strip() if ':' in text else text.split()[0].strip()
                 if player_name and player_name != 'Server':
                     now = time.time()
+                    # Cooldown: skip if this player was kicked in the last 30 seconds
+                    last_kick = self._spam_kick_cooldowns.get(player_name.lower(), 0)
+                    if now - last_kick < 30:
+                        return
                     history = self._player_chat_times.get(player_name.lower(), [])
                     window = self.spam_time_spin.value()
                     # keep only messages within the time window
@@ -3101,6 +3107,7 @@ class ChatBotTab(QWidget):
                                 break
 
                         if pid:
+                            self._spam_kick_cooldowns[player_name.lower()] = now
                             self.server.punt_player(int(pid), "Chat spam")
                             time.sleep(0.3)
                             self.server.send_chat(f"{display_name} was kicked for spamming the chat")
