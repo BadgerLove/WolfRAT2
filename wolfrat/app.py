@@ -2802,6 +2802,7 @@ class ChatBotTab(QWidget):
         self._swap_cooldowns = {}  # player_name -> timestamp of last swap
         self._chat_initialized = False  # skip first chat batch (old messages from before we connected)
         self._player_chat_times = {} # player_name -> list of timestamps
+        self._chat_config = self._load_chat_config()
         self._build_ui()
 
     def reset_chat(self):
@@ -2809,6 +2810,40 @@ class ChatBotTab(QWidget):
         self._chat_initialized = False
         self._seen_chat_raw = set()
         self._player_chat_times = {}
+
+    def _chat_config_path(self):
+        import os, sys
+        base = os.path.dirname(sys.argv[0]) if not getattr(sys, 'frozen', False) else os.path.dirname(sys.executable)
+        return os.path.join(base, 'wolfrat_chat.json')
+
+    def _load_chat_config(self):
+        import json, os
+        try:
+            path = self._chat_config_path()
+            if os.path.exists(path):
+                with open(path) as f:
+                    return json.load(f)
+        except Exception:
+            pass
+        return {}
+
+    def _save_chat_config(self):
+        import json
+        try:
+            cfg = self._chat_config.copy() if hasattr(self, '_chat_config') else {}
+            if hasattr(self, 'auto_swap_cb'):
+                cfg['auto_swap_enabled'] = self.auto_swap_cb.isChecked()
+            if hasattr(self, 'trigger_input'):
+                cfg['swap_trigger'] = self.trigger_input.text()
+            if hasattr(self, 'spam_cb'):
+                cfg['spam_enabled'] = self.spam_cb.isChecked()
+            if hasattr(self, 'spam_msg_spin'):
+                cfg['spam_msg_count'] = self.spam_msg_spin.value()
+            self._chat_config = cfg
+            with open(self._chat_config_path(), 'w') as f:
+                json.dump(cfg, f, indent=2)
+        except Exception:
+            pass
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -2846,12 +2881,14 @@ class ChatBotTab(QWidget):
 
         self.auto_swap_cb = QCheckBox("Enable auto-swap on chat trigger")
         self.auto_swap_cb.setToolTip("When a player types the trigger word in chat, they get auto-swapped")
-        self.auto_swap_cb.setChecked(True)
+        self.auto_swap_cb.setChecked(self._chat_config.get('auto_swap_enabled', True))
+        self.auto_swap_cb.stateChanged.connect(self._save_chat_config)
         swap_layout.addWidget(self.auto_swap_cb, 0, 0, 1, 2)
 
         swap_layout.addWidget(QLabel("Trigger word:"), 1, 0)
-        self.trigger_input = QLineEdit("!switch")
+        self.trigger_input = QLineEdit(self._chat_config.get('swap_trigger', '!switch'))
         self.trigger_input.setPlaceholderText("e.g. !switch, !swap, !team")
+        self.trigger_input.textChanged.connect(self._save_chat_config)
         swap_layout.addWidget(self.trigger_input, 1, 1)
 
         swap_group.setLayout(swap_layout)
@@ -2864,12 +2901,14 @@ class ChatBotTab(QWidget):
         # Anti-Spam row
         spam_layout = QHBoxLayout()
         self.spam_cb = QCheckBox("Enable Anti-Spam (Kick players who send")
-        self.spam_cb.setChecked(True)
+        self.spam_cb.setChecked(self._chat_config.get('spam_enabled', True))
+        self.spam_cb.stateChanged.connect(self._save_chat_config)
         spam_layout.addWidget(self.spam_cb)
 
         self.spam_msg_spin = QSpinBox()
         self.spam_msg_spin.setRange(3, 20)
-        self.spam_msg_spin.setValue(6)
+        self.spam_msg_spin.setValue(self._chat_config.get('spam_msg_count', 6))
+        self.spam_msg_spin.valueChanged.connect(self._save_chat_config)
         spam_layout.addWidget(self.spam_msg_spin)
 
         spam_layout.addWidget(QLabel("msgs in"))
@@ -4990,24 +5029,40 @@ class MapVotingTab(QWidget):
                         self._match_start_time = data.get('match_start_time', 0)
                         self._reset_pool_pct = data.get('reset_pool_pct', 50)
                         self._vote_choices = data.get('vote_choices', 3)
+                        self._voting_enabled = data.get('voting_enabled', True)
+                        self._match_duration = data.get('match_duration', 30)
+                        self._trigger_mins = data.get('trigger_mins', 3)
+                        self._vote_duration = data.get('vote_duration', 2)
                     elif isinstance(data, list):
                         self._recently_played = data
                         self._current_map = None
                         self._match_start_time = 0
                         self._reset_pool_pct = 50
                         self._vote_choices = 3
+                        self._voting_enabled = True
+                        self._match_duration = 30
+                        self._trigger_mins = 3
+                        self._vote_duration = 2
             else:
                 self._recently_played = []
                 self._current_map = None
                 self._match_start_time = 0
                 self._reset_pool_pct = 50
                 self._vote_choices = 3
+                self._voting_enabled = True
+                self._match_duration = 30
+                self._trigger_mins = 3
+                self._vote_duration = 2
         except Exception:
             self._recently_played = []
             self._current_map = None
             self._match_start_time = 0
             self._reset_pool_pct = 50
             self._vote_choices = 3
+            self._voting_enabled = True
+            self._match_duration = 30
+            self._trigger_mins = 3
+            self._vote_duration = 2
 
         self._build_ui()
 
@@ -5022,25 +5077,25 @@ class MapVotingTab(QWidget):
         config_layout = QGridLayout()
 
         self.enable_cb = QCheckBox("Enable End-of-Match Auto Voting")
-        self.enable_cb.setChecked(True)
+        self.enable_cb.setChecked(self._voting_enabled)
         config_layout.addWidget(self.enable_cb, 0, 0, 1, 2)
 
         config_layout.addWidget(QLabel("Match Duration (mins):"), 1, 0)
         self.match_duration_spin = QSpinBox()
         self.match_duration_spin.setRange(1, 120)
-        self.match_duration_spin.setValue(30)
+        self.match_duration_spin.setValue(self._match_duration)
         config_layout.addWidget(self.match_duration_spin, 1, 1)
 
         config_layout.addWidget(QLabel("Trigger Vote X mins before end:"), 2, 0)
         self.trigger_spin = QSpinBox()
         self.trigger_spin.setRange(1, 20)
-        self.trigger_spin.setValue(3)
+        self.trigger_spin.setValue(self._trigger_mins)
         config_layout.addWidget(self.trigger_spin, 2, 1)
 
         config_layout.addWidget(QLabel("Vote Duration (mins):"), 3, 0)
         self.duration_spin = QSpinBox()
         self.duration_spin.setRange(1, 10)
-        self.duration_spin.setValue(2)
+        self.duration_spin.setValue(self._vote_duration)
         config_layout.addWidget(self.duration_spin, 3, 1)
 
         # (Row 1, Cols 2 & 3)
@@ -5080,6 +5135,10 @@ class MapVotingTab(QWidget):
 
         self.reset_pool_slider.valueChanged.connect(self._on_reset_pool_changed)
         self.choices_spin.valueChanged.connect(self._save_recently_played)
+        self.enable_cb.stateChanged.connect(self._save_recently_played)
+        self.match_duration_spin.valueChanged.connect(self._save_recently_played)
+        self.trigger_spin.valueChanged.connect(self._save_recently_played)
+        self.duration_spin.valueChanged.connect(self._save_recently_played)
 
         self.start_btn = SatisfyingButton("Start Vote Now")
         self.start_btn.clicked.connect(self._start_vote)
@@ -5130,7 +5189,11 @@ class MapVotingTab(QWidget):
                 'current_map': self._current_map,
                 'match_start_time': self._match_start_time,
                 'reset_pool_pct': self.reset_pool_slider.value(),
-                'vote_choices': self.choices_spin.value()
+                'vote_choices': self.choices_spin.value(),
+                'voting_enabled': self.enable_cb.isChecked(),
+                'match_duration': self.match_duration_spin.value(),
+                'trigger_mins': self.trigger_spin.value(),
+                'vote_duration': self.duration_spin.value()
             }
             with open(self._recently_played_file, 'w', encoding='utf-8') as f:
                 json.dump(data, f)
