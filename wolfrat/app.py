@@ -1,5 +1,5 @@
 """
-WolfRAT 2.6.5 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.6.6 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -23,6 +23,8 @@ from wolfrat import vote_rules
 from wolfrat import weather
 from wolfrat.weather_tab import WeatherTab, scroll_column
 from wolfrat.mod_entrance_panel import ModEntrancePanel
+from wolfrat.mod_ranks import ModRoster
+from wolfrat.mod_ranks_panel import ModRanksPanel
 from wolfrat.private_welcome_panel import PrivateWelcomePanel
 from wolfrat.protocol import (
     CHAT_MAX_LEN,
@@ -4695,7 +4697,7 @@ class ModsTab(QWidget):
         )
         self.missions_store = missions_store
         self.messages_tab = None  # set by MainWindow cross-tab wiring
-        self.mods = {}  # {lowercase_name: display_name}
+        self.roster = ModRoster()  # who is a mod, at which rank
         self._seen_chat_ids = set()  # for dedup
         self._chat_initialized = False
         # Map vote state
@@ -4725,9 +4727,11 @@ class ModsTab(QWidget):
         self._skip_timer.timeout.connect(self._skip_expired)
         self._load_config()
         self._build_ui()
-        # Populate list from saved mods
-        for name in sorted(self.mods.values()):
-            self.mod_list.addItem(name)
+
+    @property
+    def mods(self):
+        """{lowercase_name: display_name} of everyone holding any rank."""
+        return self.roster.names()
 
     def reset_chat(self):
         """Reset chat dedup state on reconnect."""
@@ -4856,8 +4860,7 @@ class ModsTab(QWidget):
             if os.path.exists(path):
                 with open(path) as f:
                     cfg = json.load(f)
-                    saved = cfg.get('mods', [])
-                    self.mods = {n.lower(): n for n in saved}
+                    self.roster = ModRoster.from_config(cfg)
                     self._vote_enabled = cfg.get('vote_enabled', True)
                     self._vote_threshold = cfg.get('vote_threshold', 51)
                     self._skip_enabled = cfg.get('skip_enabled', True)
@@ -4867,7 +4870,7 @@ class ModsTab(QWidget):
 
     def _save_config(self):
         try:
-            cfg = {'mods': sorted(self.mods.values()), 'vote_enabled': self._vote_enabled, 'vote_threshold': self._vote_threshold, 'skip_enabled': self._skip_enabled, 'skip_threshold': self._skip_threshold}
+            cfg = {**self.roster.to_config(), 'vote_enabled': self._vote_enabled, 'vote_threshold': self._vote_threshold, 'skip_enabled': self._skip_enabled, 'skip_threshold': self._skip_threshold}
             with open(self._config_path(), 'w') as f:
                 json.dump(cfg, f, indent=2)
         except Exception:
@@ -4880,51 +4883,15 @@ class ModsTab(QWidget):
         # instead of crushing the moderator list.
         left_scroll, left_col = scroll_column()
 
-        mod_group = QGroupBox("Moderators")
-        mod_layout = QVBoxLayout()
-
-        self.mod_list = QListWidget()
-        self.mod_list.setStyleSheet("""
-            QListWidget {
-                background-color: #0a0a00;
-                color: #e8c840;
-                border: 1px solid #3a3a00;
-                font-size: 11pt;
-            }
-        """)
-        mod_layout.addWidget(self.mod_list)
-
-        add_layout = QHBoxLayout()
-        self.mod_input = QLineEdit()
-        self.mod_input.setPlaceholderText("Player name (exact, case-insensitive)")
-        self.mod_input.returnPressed.connect(self._add_mod)
-        add_layout.addWidget(self.mod_input)
-
-        add_btn = SatisfyingButton("Add Mod")
-        add_btn.clicked.connect(self._add_mod)
-        add_layout.addWidget(add_btn)
-
-        remove_btn = SatisfyingButton("Remove")
-        remove_btn.clicked.connect(self._remove_mod)
-        add_layout.addWidget(remove_btn)
-
-        mod_layout.addLayout(add_layout)
-
-        # Quick-add from current players
-        quick_layout = QHBoxLayout()
-        quick_layout.addWidget(QLabel("Quick add:"))
-        self.player_combo = QComboBox()
-        self.player_combo.setPlaceholderText("Select online player...")
-        quick_layout.addWidget(self.player_combo)
-
-        quick_add_btn = SatisfyingButton("+Mod")
-        quick_add_btn.setMinimumWidth(70)
-        quick_add_btn.clicked.connect(self._quick_add_mod)
-        quick_layout.addWidget(quick_add_btn)
-
-        mod_layout.addLayout(quick_layout)
-        mod_group.setLayout(mod_layout)
-        left_col.addWidget(mod_group)
+        # People (who holds which rank) and Ranks (what each rank may type)
+        self.ranks_panel = ModRanksPanel(
+            self.roster,
+            changed=self._roster_changed,
+            log=lambda text: self.mod_log.addItem(
+                f"[{time.strftime('%H:%M:%S')}] {text}"
+            ),
+        )
+        left_col.addWidget(self.ranks_panel, 1)
 
         # Map database info
         maps_group = QGroupBox("Map Database")
@@ -4951,9 +4918,8 @@ class ModsTab(QWidget):
             log=self._entrance_log,
         )
         left_col.addWidget(self.entrance_panel)
-        # the list takes whatever height is left over, never less than a few rows
-        self.mod_list.setMinimumHeight(110)
-        self.mod_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        # the ranks panel takes whatever height is left over
+        self.ranks_panel.setMinimumHeight(400)
         # wide enough that the scroll bar never covers the buttons
         left_scroll.setMinimumWidth(left_scroll.widget().minimumSizeHint().width() + 22)
 
@@ -5110,6 +5076,10 @@ class ModsTab(QWidget):
                 mono.setFamily("Consolas")
                 command_item.setFont(mono)
                 command_item.setForeground(QColor("#ffe060"))
+                # every command on one reference row shares one permission
+                ranks = self.roster.ranks_allowing(command.split()[0])
+                if ranks:
+                    description += "\nRanks: " + ", ".join(ranks)
                 description_item = QTableWidgetItem(description)
                 if highlighted:
                     for item in (command_item, description_item):
@@ -5145,32 +5115,10 @@ class ModsTab(QWidget):
             f"[{time.strftime('%H:%M:%S')}] Command cheat sheet copied to clipboard"
         )
 
-    def _add_mod(self):
-        name = self.mod_input.text().strip()
-        if name and name.lower() not in self.mods:
-            self.mods[name.lower()] = name
-            self.mod_list.addItem(name)
-            self.mod_input.clear()
-            self.mod_log.addItem(f"[{time.strftime('%H:%M:%S')}] Mod added: {name}")
-            self._save_config()
-
-    def _remove_mod(self):
-        row = self.mod_list.currentRow()
-        if row >= 0:
-            item = self.mod_list.item(row)
-            name = item.text()
-            self.mods.pop(name.lower(), None)
-            self.mod_list.takeItem(row)
-            self.mod_log.addItem(f"[{time.strftime('%H:%M:%S')}] Mod removed: {name}")
-            self._save_config()
-
-    def _quick_add_mod(self):
-        name = self.player_combo.currentText().strip()
-        if name and name.lower() not in self.mods:
-            self.mods[name.lower()] = name
-            self.mod_list.addItem(name)
-            self.mod_log.addItem(f"[{time.strftime('%H:%M:%S')}] Mod added: {name}")
-            self._save_config()
+    def _roster_changed(self):
+        self._save_config()
+        self._fill_command_table()
+        self._filter_commands(self.cmd_filter.text())
 
     def _refresh_maps(self):
         """Re-fetch missions from server to update the store."""
@@ -5201,16 +5149,9 @@ class ModsTab(QWidget):
     def update_players(self, players):
         """Update the quick-add player dropdown."""
         self.entrance_panel.on_players(players, self.mods.values())
-        current = self.player_combo.currentText()
-        self.player_combo.clear()
-        for p in players:
-            name = p.get('name', '').strip()
-            if name:
-                self.player_combo.addItem(name)
-        # Restore selection if still available
-        idx = self.player_combo.findText(current)
-        if idx >= 0:
-            self.player_combo.setCurrentIndex(idx)
+        self.ranks_panel.set_online_players(
+            p.get('name', '').strip() for p in players
+        )
 
 
     def update_chat(self, messages):
@@ -5587,9 +5528,20 @@ class ModsTab(QWidget):
                 wire_log(f"[VOTE] Error forwarding vote: {e}")
             return
 
-        # All other commands require mod status
+        # All other commands require mod status...
         if sender != 'web_admin' and sender not in self.mods:
             wire_log(f"[MODS] sender '{sender}' not in mods {list(self.mods.keys())} - ignoring")
+            return
+        # ...and a rank that includes this command
+        if sender != 'web_admin' and not self.roster.allows(sender, cmd):
+            rank = self.roster.rank_of(sender).name
+            wire_log(f"[MODS] {sender} ({rank}) may not use {cmd}")
+            self.mod_log.addItem(
+                f"[{now}] {sender} ({rank}) tried {cmd} - not allowed for that rank"
+            )
+            self._send_mod_chat(
+                f"{cmd} is not allowed for {rank}.", "Send rank refusal"
+            )
             return
 
         # Resolve to the mod's original-case name for display
@@ -7389,7 +7341,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.6.5 Main Window."""
+    """WolfRAT 2.6.6 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -7408,7 +7360,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.6.5 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.6.6 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -7482,7 +7434,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.6.5 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.6.6 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -7494,9 +7446,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.6.5 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.6.6 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.6.5 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.6.6 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -7504,7 +7456,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.6.5")
+        header = QLabel("WolfRAT 2.6.6")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -7655,7 +7607,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.6.5 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.6.6 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -7711,7 +7663,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.6.5"
+    _CURRENT_VERSION = "2.6.6"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -7955,7 +7907,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.6.5")
+    app.setApplicationName("WolfRAT 2.6.6")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -8064,7 +8016,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.6.5 STARTED ===")
+    wire_log("=== WolfRAT 2.6.6 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -8117,7 +8069,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.6.5",
+                "2.6.6",
                 data_dir=runtime.data_dir,
             )
         except Exception:
