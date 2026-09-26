@@ -23,6 +23,7 @@ from wolfrat import wildlife
 from wolfrat.weather_wildlife_page import WildlifePage
 from wolfrat.protocol import wire_log
 from wolfrat.runtime import DesktopRuntime
+from wolfrat.admin_commands import MAX_CHAT_LEN
 
 # A mod who types no minutes gets the Manual page's "hold for" time; when that
 # is "until I clear it", this instead - only the tab itself can hold forever.
@@ -844,7 +845,7 @@ class WeatherTab(QWidget):
         if request.switch == "status":
             if not page.enabled_cb.isChecked():
                 return "Weather is off. Mods can type !weather on"
-            return f"Weather is on ({page.frequency_combo.currentText().lower()}). {self._dynamic_status_for_chat()}"[:62]
+            return f"Weather is on ({page.frequency_combo.currentText().lower()}). {self._dynamic_status_for_chat()}"[:MAX_CHAT_LEN]
         if request.switch == "off":
             if not page.enabled_cb.isChecked():
                 return "Weather is already off."
@@ -891,5 +892,5 @@ class WeatherTab(QWidget):
             minutes = request.minutes or self.minutes_spin.value() or MOD_FALLBACK_MINUTES
             ok = self._start(request.weather, request.name, minutes, sender)
         if not ok:
-            return "Weather is not available: WolfRAT must run on the server PC."
+            return "No weather: WolfRAT must run on the server PC."
         return None if self.announce_cb.isChecked() else "Weather changed."

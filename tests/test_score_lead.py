@@ -138,7 +138,7 @@ def test_too_long_lines_are_skipped_or_cut():
     templates = ["{player} takes the lead with {score} kills in a thrilling finish", "{player} leads"]
     assert sl.pick_line(templates, event, sl.DM, rng) == "A" * 40 + " leads"
     only_long = ["{player} takes the lead with {score} kills in a thrilling finish"]
-    assert len(sl.pick_line(only_long, event, sl.DM, rng)) == 62
+    assert len(sl.pick_line(only_long, event, sl.DM, rng)) == sl.CHAT_LIMIT == 59
 
 
 # ---- the Sprees tab ------------------------------------------------------------------------

@@ -12,7 +12,7 @@ new leader is announced at once, plus the first flag / goal of the map.  In
 TDM / DM the lead can swap every few seconds, so a new leader must hold it
 for 30 seconds and there is at most one lead line a minute.  The first
 reading after a map change is only remembered (it can still be the last
-map's scores).  Every line fits JO's 62-character chat.
+map's scores).  Every line fits JO's 59-character chat.
 """
 
 from __future__ import annotations
@@ -23,6 +23,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from wolfrat import vote_rules
+from wolfrat.admin_commands import MAX_CHAT_LEN
 
 CTF, FB, TDM, DM = vote_rules.MODE_CTF, vote_rules.MODE_FB, vote_rules.MODE_TDM, vote_rules.MODE_DM
 MODES = (CTF, FB, TDM, DM)
@@ -30,7 +31,7 @@ TEAM_MODES = (CTF, FB, TDM)
 CAPS_MODES = (CTF, FB)
 LABELS = {CTF: "Capture the Flag", FB: "Flagball", TDM: "Team Deathmatch", DM: "Deathmatch"}
 TEAM_NAMES = {1: "Joint Ops", 2: "Rebels"}
-CHAT_LIMIT = 62
+CHAT_LIMIT = MAX_CHAT_LEN   # 59: JO cuts every line there
 HOLD_SECONDS = {TDM: 30.0, DM: 30.0}
 MIN_GAP_SECONDS = {TDM: 60.0, DM: 60.0}
 
@@ -124,8 +125,8 @@ def announce(events, first_on: bool, lead_on: bool) -> list:
 
 
 def pick_line(templates, event, mode: str, rng: random.Random) -> str:
-    """A random template that fits 62 characters once filled; the shortest,
-    cut to 62, if none does (a very long player name)."""
+    """A random template that fits 59 characters once filled; the shortest,
+    cut to 59, if none does (a very long player name)."""
     filled = [fill(t, event, mode) for t in templates if t.strip()]
     if not filled:
         return ""

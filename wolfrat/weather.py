@@ -675,8 +675,8 @@ DYNAMIC_FREQUENCY_WORDS = {
     "always": "constant", "constant": "constant", "almostalways": "constant",
     "custom": "custom",
 }
-# replies go out as one chat line: 62 characters at most
-DYNAMIC_USAGE = "!weather on rare|normal|frequent|always|custom / !weather off"
+# replies go out as one chat line: 59 characters at most (JO's cut)
+DYNAMIC_USAGE = "!weather on rare|normal|frequent|always|custom, or off"
 
 
 def _parse_dynamic(switch: str, args: list) -> ChatRequest:

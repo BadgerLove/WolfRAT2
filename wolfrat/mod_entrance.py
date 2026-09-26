@@ -27,8 +27,10 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, Optional
+from wolfrat import chat_markup
+from wolfrat.admin_commands import MAX_CHAT_LEN, MAX_CHAT_TOKENS, chat_limit, extended_chat
 
-CHAT_MAX_LEN = 62
+CHAT_MAX_LEN = MAX_CHAT_LEN   # 59: JO cuts every line there
 
 DEFAULT_LINES = (
     "Please welcome {player}, your server moderator!",
@@ -92,15 +94,18 @@ def _clamp_int(value, low, high, default):
         return default
 
 
-def render_line(template: str, player: str, limit: int = CHAT_MAX_LEN) -> str:
+def render_line(template: str, player: str, limit: Optional[int] = None) -> str:
     """Fill in {player} and make the result fit one chat line.
 
     The name is never cut - a clipped name reads like a different player.
     If the line is too long with this name, fall back to the shortest honest
-    form rather than send half a sentence.
+    form rather than send half a sentence.  The limit follows the Chat tab's
+    long-chat tick box (59, or 118 on a server with the patch).
     """
+    limit = chat_limit() if limit is None else limit
+    player = chat_markup.safe_name(player)
     text = template.replace("{player}", player).strip()
-    if len(text) <= limit:
+    if len(text) <= limit and len(text.split()) <= MAX_CHAT_TOKENS:
         return text
     fallback = f"Welcome {player}!"
     if len(fallback) <= limit:
@@ -108,17 +113,30 @@ def render_line(template: str, player: str, limit: int = CHAT_MAX_LEN) -> str:
     return player[:limit]
 
 
-def line_problem(template: str, longest_name: int = 16, limit: int = CHAT_MAX_LEN) -> Optional[str]:
+def line_problem(template: str, longest_name: int = 16, limit: Optional[int] = None) -> Optional[str]:
     """Plain-words warning for the settings page, or None if the line is fine."""
+    limit = chat_limit() if limit is None else limit
     template = template.strip()
     if not template:
         return "Empty line."
     if "{player}" not in template:
         return "No {player} in this line, so nobody will know who joined."
+    bad_tag = chat_markup.tag_problem(template.replace("{player}", ""))
+    if bad_tag:
+        return bad_tag
     worst = len(template.replace("{player}", "x" * longest_name))
     if worst > limit:
+        hint = ("" if extended_chat() else
+                " If your server has the long chat patch, tick it on the Chat tab.")
         return (f"Too long for one chat line with a {longest_name}-letter name "
-                f"({worst} of {limit}); a short welcome will be sent instead.")
+                f"({worst} of {limit}, colour codes count); a short welcome will be "
+                f"sent instead.{hint}")
+    if len(template.split()) > MAX_CHAT_TOKENS:
+        return (f"{len(template.split())} words - the server takes {MAX_CHAT_TOKENS} "
+                "at most; a short welcome will be sent instead.")
+    if not extended_chat() and chat_markup.TAG_RE.search(template):
+        return ("Colour codes only show on a server with the long chat patch "
+                "(tick it on the Chat tab); here they are taken out.")
     return None
 
 

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Iterable, Optional
+from wolfrat.admin_commands import MAX_CHAT_LEN
 
 TEAM_NAMES = {1: "Joint Ops", 2: "Rebels"}
 NATO = ["Alpha", "Bravo", "Charlie", "Delta", "Echo", "Foxtrot", "Golf", "Hotel", "India", "Juliet",
@@ -135,7 +136,7 @@ class ZoneWatch:
 def lead_line(event: LeadEvent, template: str) -> str:
     return (template.replace("{team}", team_name(event.team))
                     .replace("{owned}", str(event.owned))
-                    .replace("{total}", str(event.total)))[:62]
+                    .replace("{total}", str(event.total)))[:MAX_CHAT_LEN]
 
 
 def capture_line(event: CaptureEvent, template_with_player: str, template_without: str) -> str:
@@ -143,4 +144,4 @@ def capture_line(event: CaptureEvent, template_with_player: str, template_withou
     template = template_with_player if event.player else template_without
     return (template.replace("{team}", team_name(event.team))
                     .replace("{zone}", event.name)
-                    .replace("{player}", event.player))[:62]
+                    .replace("{player}", event.player))[:MAX_CHAT_LEN]

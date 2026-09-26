@@ -372,3 +372,57 @@ def hold_for_players(players: int, minimum: int) -> str | None:
     else:
         who = f"only {players} players are on the server"
     return f"Status: Paused - {who}. Votes start with {minimum} or more."
+
+
+# ---- the join grace ---------------------------------------------------------
+#
+# A player shows up in the PLAYER list while still on the loading screen. When
+# that join is what lets a held vote start, the map list used to go out at
+# once and scroll past before the joiner could read it (Dale 2026-09-26: his
+# own join released a held vote on an empty server). So a vote the gate held
+# back waits this long once enough players are on.
+
+JOIN_GRACE_SECS = 40
+
+
+class JoinGrace:
+    """Remembers a vote the player gate held back and releases it
+    JOIN_GRACE_SECS after enough players are on.
+
+    The held decision is kept because some rules fire only once per map (the
+    AAS zone rule, co-op) - the vote must not be lost if that rule has gone
+    quiet by the time the grace runs out. A vote that was never held starts
+    straight away, as before.
+    """
+
+    def __init__(self, secs: float = JOIN_GRACE_SECS):
+        self.secs = secs
+        self.reset()
+
+    def reset(self) -> None:
+        self.held: Decision | None = None
+        self.release_at: float | None = None
+
+    @property
+    def waiting(self) -> bool:
+        return self.release_at is not None
+
+    def hold(self, decision: Decision) -> None:
+        """The gate is closed. Players who left again restart the clock."""
+        if decision.fire:
+            self.held = decision
+        self.release_at = None
+
+    def step(self, decision: Decision, now: float) -> tuple[Decision | None, int | None]:
+        """Enough players are on. Returns (the decision to start now or None,
+        whole seconds still to wait or None)."""
+        if self.held is None:
+            return (decision if decision.fire else None), None
+        if self.release_at is None:
+            self.release_at = now + self.secs
+        left = self.release_at - now
+        if left > 0:
+            return None, int(-(-left // 1))
+        start = decision if decision.fire else self.held
+        self.reset()
+        return start, None

@@ -10,7 +10,7 @@ Rules (Dale, 2026-09-23):
   * VPN / proxy / hosting addresses: silent by default - Russian regulars can
     only play through one - or an optional "joined on a VPN" line instead;
   * UK players by nation (Scotland, England, Wales, Northern Ireland), others
-    "Region, Country" when it fits the 62-character chat line, else country.
+    "Region, Country" when it fits the 59-character chat line, else country.
 """
 
 from __future__ import annotations
@@ -21,8 +21,9 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from wolfrat.ip_checks import Verdict, is_private
+from wolfrat.admin_commands import MAX_CHAT_LEN
 
-CHAT_MAX_LEN = 62
+CHAT_MAX_LEN = MAX_CHAT_LEN   # 59: JO cuts every line there
 DEFAULT_TEMPLATE = "{player} joined from {place}"
 DEFAULT_VPN_TEMPLATE = "{player} joined on a VPN"
 GIVE_UP_SECONDS = 60          # no answer this long after the welcome: say nothing

@@ -254,3 +254,62 @@ def test_held_status_says_why(players, minimum, text):
 ])
 def test_min_players_is_clamped(junk, expected):
     assert vr.clamp_min_players(junk) == expected
+
+
+# ---- the join grace (Dale 2026-09-26) ---------------------------------------
+
+FIRE = vr.Decision(True, "3m remaining (vote starts 3m before the end)")
+QUIET = vr.Decision(False, status="Status: 5m / 30m remaining.")
+
+
+def test_a_vote_that_was_never_held_starts_at_once():
+    g = vr.JoinGrace()
+    assert g.step(FIRE, 100.0) == (FIRE, None)
+    assert g.step(QUIET, 105.0) == (None, None)
+
+
+def test_join_after_a_held_vote_waits_40s_then_starts():
+    # 19:47 replay: rule firing on an empty server, Dale appears while loading.
+    g = vr.JoinGrace()
+    g.hold(FIRE)
+    g.hold(FIRE)
+    assert g.step(FIRE, 1000.0) == (None, 40)
+    assert g.step(FIRE, 1005.0) == (None, 35)
+    assert g.step(FIRE, 1039.5) == (None, 1)
+    assert g.step(FIRE, 1040.0) == (FIRE, None)
+    assert not g.waiting and g.held is None
+
+
+def test_one_shot_rule_is_not_lost_while_waiting():
+    # The AAS zone rule fires once per map - it has gone quiet by the time
+    # the grace runs out, so the held decision is used.
+    zone = vr.Decision(True, "AAS: one zone left")
+    g = vr.JoinGrace()
+    g.hold(zone)
+    g.hold(QUIET)
+    assert g.step(QUIET, 0.0) == (None, 40)
+    assert g.step(QUIET, 41.0) == (zone, None)
+
+
+def test_joiner_leaving_again_restarts_the_clock():
+    g = vr.JoinGrace()
+    g.hold(FIRE)
+    assert g.step(FIRE, 0.0) == (None, 40)
+    g.hold(FIRE)                       # back below the minimum
+    assert not g.waiting
+    assert g.step(FIRE, 30.0) == (None, 40)
+    assert g.step(FIRE, 70.0) == (FIRE, None)
+
+
+def test_nothing_held_means_no_wait_when_players_arrive():
+    g = vr.JoinGrace()
+    g.hold(QUIET)                      # empty, but no rule wanted a vote yet
+    assert g.step(QUIET, 0.0) == (None, None)
+    assert g.step(FIRE, 5.0) == (FIRE, None)
+
+
+def test_reset_on_new_map_drops_the_held_vote():
+    g = vr.JoinGrace()
+    g.hold(FIRE)
+    g.reset()
+    assert g.step(QUIET, 0.0) == (None, None)

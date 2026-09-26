@@ -1,0 +1,44 @@
+<c00FFFF>The storm answers to <cFFFFFF>{player}<co>. Welcome to the battlefield.
+<c8080FF>The heavens have spoken.<co> <cFFFFFF>{player}<co> has arrived.
+<cFFFF00>Lightning announces the arrival of <cFFFFFF>{player}<co>. Behave yourselves.
+<c00FFFF>Thunder rolls. The storm approaches.<co> <cFFFFFF>{player}<co> is now watching.
+<cFF0000>WARNING:<co> <cFFFFFF>{player}<co> has entered the server. You have been warned.
+<cFF8000>ATTENTION:<co> <cFFFFFF>{player}<co> has arrived. Choose your next move carefully.
+<cFF0000>Everybody behave.<co> <cFFFFFF>{player}<co> is now watching.
+<cFF0000>You have been warned.<co> <cFFFFFF>{player}<co> has entered the battlefield.
+<cFF8000>Think twice before you pull that trigger.<co> <cFFFFFF>{player}<co> is watching.
+<cFF0000>The eyes of the server are upon you.<co> <cFFFFFF>{player}<co> has arrived.
+<cFF8000>Your actions are now being observed by <cFFFFFF>{player}<co>. Play nice.
+<cFF0000>Make good choices.<co> <cFFFFFF>{player}<co> has joined the battlefield.
+<c00FF00>COMMAND PRESENCE DETECTED:<co> <cFFFFFF>{player}<co> has entered the AO.
+<c00FF00>ALL UNITS, STAND BY.<co> <cFFFFFF>{player}<co> is now in the AO.
+<c00FF00>COMMAND HAS ARRIVED.<co> <cFFFFFF>{player}<co> is watching the battlefield.
+<cFFFF00>MODERATOR ON STATION:<co> <cFFFFFF>{player}<co> has entered the AO.
+<c00FF00>COMMANDER'S PRESENCE DETECTED.<co> <cFFFFFF>{player}<co> is now on station.
+<c00FF00>EYES UP, SOLDIERS.<co> <cFFFFFF>{player}<co> has arrived on the battlefield.
+<cFFFF00>THE CHAIN OF COMMAND HAS ARRIVED.<co> Welcome, <cFFFFFF>{player}<co>.
+<c00FF00>MODERATOR DEPLOYED.<co> <cFFFFFF>{player}<co> is now on station.
+<cFFFF00>EVERYBODY LOOK BUSY.<co> <cFFFFFF>{player}<co> just joined the server.
+<cFF8000>Quick, hide the evidence!<co> <cFFFFFF>{player}<co> is here.
+<cFFFF00>Act natural.<co> <cFFFFFF>{player}<co> has entered the server.
+<cFF8000>Oh shit...<co> <cFFFFFF>{player}<co> is here. Behave yourselves.
+<cFFFF00>Nobody panic.<co> It's only <cFFFFFF>{player}<co>.
+<cFF8000>Who invited the adult supervision?<co> Welcome, <cFFFFFF>{player}<co>.
+<cFFFF00>The fun police have arrived.<co> Welcome, <cFFFFFF>{player}<co>.
+<cFF8000>You were having fun...<co> Then <cFFFFFF>{player}<co> joined.
+<cFFFF00>Congratulations.<co> You are now being supervised by <cFFFFFF>{player}<co>.
+<c8080FF>The heavens fall silent...<co> <cFFFFFF>{player}<co> has entered the battlefield.
+<c00FFFF>The skies darken.<co> <cFFFFFF>{player}<co> has arrived. Prepare yourselves.
+<cFFFF00>Thunder rolls across the battlefield.<co> <cFFFFFF>{player}<co> has arrived.
+<c8080FF>From the darkness comes thunder...<co> <cFFFFFF>{player}<co> has entered the AO.
+<c00FFFF>Lightning strikes. Thunder follows.<co> <cFFFFFF>{player}<co> has arrived.
+<cFFFF00>The storm has awakened.<co> <cFFFFFF>{player}<co> now walks among you.
+<c8080FF>The skies have chosen their champion.<co> <cFFFFFF>{player}<co> has arrived.
+<c00FFFF>The storm obeys <cFFFFFF>{player}<co>. Welcome to the battlefield.
+<cFFFF00>The thunder announces <cFFFFFF>{player}<co>. All units, proceed accordingly.
+<c8080FF>The sky answers to <cFFFFFF>{player}<co>. You have been warned.
+<cFF0000>SERVER ALERT:<co> <cFFFFFF>{player}<co>, your moderator, has entered the battlefield. Behave yourselves.
+<c00FF00>Please welcome <cFFFFFF>{player}<co>, your server moderator. The battlefield is now under supervision.
+<cFFFF00>ALL RISE FOR <cFFFFFF>{player}<co>.<c00FFFF> The moderator has entered the battlefield.
+<cFF8000>MAKE WAY!<co> <cFFFFFF>{player}<co>, server moderator, has entered the battlefield.
+<c00FFFF>THE WATCH BEGINS.<co> <cFFFFFF>{player}<co> has arrived. Play nice, soldiers.

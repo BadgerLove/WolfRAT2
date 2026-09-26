@@ -33,6 +33,7 @@ from wolfrat.ban_rules import BanEntry, BanList, Enforcer, KIND_IP, KIND_NAME
 from wolfrat import coop_guard
 from wolfrat.jo_players import LocalServerPlayers, ips_by_name, positions_by_name
 from wolfrat.player_history import PlayerHistory, describe_when
+from wolfrat.admin_commands import MAX_CHAT_LEN
 
 BANS_FILE = "wolfrat_bans.json"
 HISTORY_FILE = "wolfrat_player_history.json"
@@ -665,7 +666,7 @@ class BansTab(QWidget):
             except Exception as exc:
                 self.log(f"Punt failed for {name}: {exc}")
             if self.announce_cb.isChecked():
-                self._announce(f"{name} removed - {outcome.reason}"[:62])
+                self._announce(f"{name} removed - {outcome.reason}"[:MAX_CHAT_LEN])
         self._check_acted = {k: t for k, t in self._check_acted.items() if k in present}
 
     def _build_whitelist_page(self):
@@ -760,7 +761,7 @@ class BansTab(QWidget):
                 text = f"{removal.name} removed - banned"
                 if removal.entry.reason:
                     text += f": {removal.entry.reason}"
-                self._announce(text[:62])
+                self._announce(text[:MAX_CHAT_LEN])
             self._dirty = True
 
     def on_chat(self, messages: list) -> None:

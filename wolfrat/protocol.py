@@ -23,6 +23,7 @@ from .admin_commands import (
     GameSettings,
     MAX_CHAT_LEN,
     MAX_CHAT_TOKENS,
+    chat_limit,
     MissionEntry,
     PlayerEntry,
     SETTING_SCHEMA,
@@ -2042,20 +2043,21 @@ def _split_chat_message(message: str) -> tuple[str, ...]:
     except UnicodeEncodeError as error:
         raise ValueError("retail command arguments are ASCII only") from error
 
+    limit = chat_limit()
     chunks: list[str] = []
     words: list[str] = []
     length = 0
     for word in message.split():
-        if len(word) > MAX_CHAT_LEN:
+        if len(word) > limit:
             raise ValueError(
-                f"chat word cannot exceed {MAX_CHAT_LEN} characters"
+                f"chat word cannot exceed {limit} characters"
             )
         added_length = len(word) + (1 if words else 0)
         if (
             words
             and (
                 len(words) >= MAX_CHAT_TOKENS
-                or length + added_length > MAX_CHAT_LEN
+                or length + added_length > limit
             )
         ):
             chunks.append(" ".join(words))

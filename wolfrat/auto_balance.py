@@ -9,7 +9,7 @@ No exemptions: an owner who turns this on wants it automatic.
 Joint Ops has its own balance (``AutoBalanceOnRecycle``) but it only runs as a
 new map starts, never mid-round.  The panel offers one or the other.
 
-Every line WolfRAT says fits the 62-character chat limit.
+Every line WolfRAT says fits the 59-character chat limit.
 """
 
 from __future__ import annotations
@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 
 from wolfrat import coop_guard, vote_rules
+from wolfrat.admin_commands import MAX_CHAT_LEN
 
 MODE_OFF, MODE_JOINTOPS, MODE_WOLFRAT = "off", "jointops", "wolfrat"
 MODE_LABELS = {
@@ -33,7 +34,7 @@ DEFAULT_GAP = 2
 SETTLE_SECONDS = 20        # the gap must hold this long first (someone may be rejoining)
 COUNTDOWN_SECONDS = 30     # warning -> move, as Dale asked
 COOLDOWN_SECONDS = 120     # after a balance, let the moves settle before looking again
-CHAT_LIMIT = 62
+CHAT_LIMIT = MAX_CHAT_LEN   # 59: JO cuts every line there
 CANCEL_LINE = "Teams are even again - auto-balance cancelled"
 TEAM_FAMILIES = (vote_rules.MODE_AS, vote_rules.MODE_TDM, vote_rules.MODE_TKOTH,
                  vote_rules.MODE_CTF, vote_rules.MODE_FB)
@@ -81,7 +82,7 @@ def warning_lines(bigger: int, gap: int, seconds: int = COUNTDOWN_SECONDS) -> li
 
 
 def moved_lines(names, to_team: int) -> list:
-    """'Moved to Rebels: A, B' split over as many 62-char lines as it takes."""
+    """'Moved to Rebels: A, B' split over as many 59-char lines as it takes."""
     prefix = f"Moved to {TEAM_NAMES[to_team]}: "
     lines, current = [], ""
     for name in names:

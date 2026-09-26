@@ -29,11 +29,18 @@ import re
 from dataclasses import dataclass
 from typing import Optional
 
+from wolfrat import chat_markup
+
 FILENAME = "server.wac"
 BEGIN = "// >>> WolfRAT private welcome (written by WolfRAT - change it in WolfRAT, not here)"
 END = "// <<< WolfRAT private welcome"
 
-MAX_TEXT = 100          # comfortably inside one chat line on screen
+# The game's script compiler reads a quoted string into a 72-byte buffer and
+# stops at 64 characters counting the opening quote, so a ptext line holds 63
+# (colour codes included).  Past that the rest of the line is read as script
+# and the whole server.wac fails to compile - lightning and whispers with it.
+WAC_STRING_MAX = 63
+MAX_TEXT = WAC_STRING_MAX
 MIN_SECONDS, MAX_SECONDS = 3, 300
 DEFAULT_SECONDS = 20
 DEFAULT_COLOUR = "00ff00"
@@ -68,11 +75,13 @@ def text_problem(text: str) -> Optional[str]:
     if not text.strip():
         return "Type the welcome message first."
     if len(text) > MAX_TEXT:
-        return f"Too long: {len(text)} characters, the limit is {MAX_TEXT}."
+        return (f"Too long: {len(text)} of {MAX_TEXT} characters, colour codes count "
+                "(the game's script cannot hold more).")
     if '"' in text:
         return 'The message cannot contain a double quote ("). Use \' instead.'
-    if "<" in text or ">" in text:
-        return "The message cannot contain < or > (the game reads them as colour codes)."
+    bad_code = chat_markup.tag_problem(text)
+    if bad_code:
+        return bad_code
     bad = sorted({ch for ch in text if not (32 <= ord(ch) < 127)})
     if bad:
         return ("Plain English letters, numbers and punctuation only - the game's script "
@@ -80,32 +89,50 @@ def text_problem(text: str) -> Optional[str]:
     return None
 
 
+def compose(text: str, colour: str = "") -> str:
+    """The ptext string exactly as it goes in the script.  Colour codes typed
+    in the text (<cRRGGBB>, <co>) go in as typed - Dale 2026-09-26: admins
+    type the codes, a Colours... box lists them."""
+    return _code(colour) + text.strip()
+
+
+def line_problem(text: str, colour: str = "") -> Optional[str]:
+    """Why this line cannot go in the script, or None if it is fine."""
+    problem = text_problem(text)
+    if problem:
+        return problem
+    if colour and not _COLOUR_RE.match(colour):
+        return "The colour must be six hex digits, like 00ff00."
+    length = len(compose(text, colour))
+    if length > WAC_STRING_MAX:
+        return (f"Too long: {length} of {WAC_STRING_MAX} characters, colour codes count "
+                "(the game's script cannot hold more).")
+    return None
+
+
 def build_section(welcome: Welcome) -> str:
-    problem = text_problem(welcome.text)
+    problem = line_problem(welcome.text, welcome.colour)
     if problem:
         raise ServerWacError(problem)
     second = welcome.text2.strip()
     if second:
-        problem = text_problem(second)
+        problem = line_problem(second, welcome.colour2)
         if problem:
             raise ServerWacError(f"Second line: {problem}")
-    for colour in (welcome.colour, welcome.colour2 if second else ""):
-        if colour and not _COLOUR_RE.match(colour):
-            raise ServerWacError("The colour must be six hex digits, like 00ff00.")
     seconds = max(MIN_SECONDS, min(MAX_SECONDS, int(welcome.seconds)))
     lines = [
         BEGIN,
         "// Only the player who just joined sees these lines.",
         "PLOOP",
         f"if onptick({seconds}) then",
-        f'ptext("{_code(welcome.colour)}{welcome.text.strip()}")',
+        f'ptext("{compose(welcome.text, welcome.colour)}")',
         "endif",
     ]
     if second:
         gap = max(MIN_GAP, min(MAX_GAP, int(welcome.gap)))
         lines += [
             f"if onptick({seconds + gap}) then",
-            f'ptext("{_code(welcome.colour2)}{second}")',
+            f'ptext("{compose(second, welcome.colour2)}")',
             "endif",
         ]
     return "\n".join(lines + ["END", END]) + "\n"

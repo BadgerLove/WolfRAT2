@@ -6,6 +6,7 @@ from wolfrat.admin_commands import (
     AdminSnapshot,
     CANONICAL_SETTING_KEYS,
     IdentityCollection,
+    MAX_CHAT_LEN,
     MissionEntry,
     PlayerEntry,
     ReplyPolicy,
@@ -193,7 +194,7 @@ class CommandCatalogTests(unittest.TestCase):
         self.assertEqual(AdminCommands.tod_rate(5).text, "CMD TODRATE 5")
         for message in (
             "",
-            "x" * 63,
+            "x" * (MAX_CHAT_LEN + 1),
             " ".join(["x"] * 24),
             "line\nbreak",
             "snowman \N{SNOWMAN}",
@@ -259,7 +260,7 @@ class CommandCatalogTests(unittest.TestCase):
 
     def test_raw_console_enforces_known_retail_buffer_limits_and_host_guard(self):
         unsafe = (
-            "CHAT SEND " + "x" * 63,
+            "CHAT SEND " + "x" * (MAX_CHAT_LEN + 1),
             "CHAT SEND " + " ".join(["x"] * 24),
             "CMD " + "x" * 99,
             "CMD " + " ".join(["x"] * 25),
@@ -331,8 +332,8 @@ class CommandCatalogTests(unittest.TestCase):
                     raw_command(command)
 
         self.assertEqual(
-            raw_command("CHAT SEND " + "x" * 62).text,
-            "CHAT SEND " + "x" * 62,
+            raw_command("CHAT SEND " + "x" * MAX_CHAT_LEN).text,
+            "CHAT SEND " + "x" * MAX_CHAT_LEN,
         )
         self.assertEqual(
             raw_command("SET ServerPassword").text,

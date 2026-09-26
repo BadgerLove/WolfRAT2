@@ -17,7 +17,13 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 MAX_COMMAND_LEN = 1015
 MAX_COMMAND_TOKENS = 25
-MAX_CHAT_LEN = 62
+# Joint Ops cuts every chat line at 59 bytes, colour tags included (its flood
+# check, proven live 2026-09-26).  A server running the long-chat patch
+# (jo-server-patches 15) takes 118 and keeps colour tags; the Chat tab's tick
+# box says which one this server is.  Off by default.
+STOCK_CHAT_LEN = 59
+EXTENDED_CHAT_LEN = 118
+MAX_CHAT_LEN = STOCK_CHAT_LEN   # WolfRAT's own automatic lines always fit a stock server
 MAX_CHAT_TOKENS = 23
 MAX_CMD_ARGUMENT_LEN = 98
 
@@ -516,6 +522,36 @@ def _setting_value(key: str, value: Any) -> str:
     return str(number)
 
 
+_extended_chat = False
+_chat_limit_listeners: list[Callable[[int], None]] = []
+
+
+def extended_chat() -> bool:
+    return _extended_chat
+
+
+def chat_limit() -> int:
+    """Longest line WolfRAT may send right now."""
+    return EXTENDED_CHAT_LEN if _extended_chat else STOCK_CHAT_LEN
+
+
+def set_extended_chat(enabled: bool) -> None:
+    global _extended_chat
+    enabled = bool(enabled)
+    if enabled == _extended_chat:
+        return
+    _extended_chat = enabled
+    for listener in list(_chat_limit_listeners):
+        try:
+            listener(chat_limit())
+        except Exception:
+            pass
+
+
+def on_chat_limit_changed(listener: Callable[[int], None]) -> None:
+    _chat_limit_listeners.append(listener)
+
+
 def _validate_argument(text: str, *, allow_empty: bool = False) -> str:
     if not text and not allow_empty:
         raise ValueError("command argument cannot be empty")
@@ -689,8 +725,8 @@ class AdminCommands:
     @staticmethod
     def send_chat(message: str) -> CommandSpec:
         message = _validate_argument(message)
-        if len(message) > MAX_CHAT_LEN:
-            raise ValueError(f"chat message cannot exceed {MAX_CHAT_LEN} characters")
+        if len(message) > chat_limit():
+            raise ValueError(f"chat message cannot exceed {chat_limit()} characters")
         if len(message.split()) > MAX_CHAT_TOKENS:
             raise ValueError(
                 f"chat message cannot exceed {MAX_CHAT_TOKENS} retail tokens"
@@ -954,6 +990,8 @@ __all__ = [
     "AdminCommands", "AdminOperation", "AdminSnapshot", "AvailableMission",
     "CANONICAL_SETTING_KEYS", "CommandSpec", "GameSettings",
     "IdentityCollection", "IdentityRef", "MAX_CHAT_LEN", "MAX_CHAT_TOKENS",
+    "STOCK_CHAT_LEN", "EXTENDED_CHAT_LEN", "chat_limit", "extended_chat",
+    "set_extended_chat", "on_chat_limit_changed",
     "MAX_COMMAND_TOKENS", "MissionEntry",
     "PlayerEntry", "ReplyPolicy", "SETTING_SCHEMA", "WeaponEntry", "WeaponMode",
     "parse_available_missions", "parse_chat", "parse_game_settings",

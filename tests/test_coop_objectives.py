@@ -143,13 +143,23 @@ def test_no_game_time_from_the_server_does_not_stop_it(votes):
     assert votes.fired == ["CO-Harbour.bms"]
 
 
-def test_held_for_players_then_starts_when_they_arrive(votes):
+def test_held_for_players_then_starts_when_they_arrive(votes, monkeypatch):
+    import time
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(time, "time", lambda: clock["now"])
     new_map(votes, "CO-Harbour.bms")
     votes.server.players = [{"id": 1}]
     votes.progress["now"] = (3, 4)
     votes._tick()
     assert votes.fired == [] and "Paused" in votes.status_lbl.text()
+    # The join that opens the gate is still loading: the vote waits for them.
     votes.server.players = [{"id": 1}, {"id": 2}]
+    votes._tick()
+    assert votes.fired == [] and "just joined" in votes.status_lbl.text()
+    clock["now"] += 39
+    votes._tick()
+    assert votes.fired == []
+    clock["now"] += 1
     votes._tick()
     assert votes.fired == ["CO-Harbour.bms"]
 

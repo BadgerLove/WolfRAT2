@@ -1,5 +1,5 @@
 """
-WolfRAT 2.8.5 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.8.6 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -36,7 +36,14 @@ from wolfrat.protocol import (
     player_entry_from_legacy,
     wire_log,
 )
-from wolfrat.admin_commands import WeaponMode
+from wolfrat.admin_commands import (
+    WeaponMode, EXTENDED_CHAT_LEN, STOCK_CHAT_LEN,
+    chat_limit, extended_chat, set_extended_chat, on_chat_limit_changed,
+)
+
+# The server side of the Chat tab's "long chat" tick box.
+LONG_CHAT_URL = ("https://github.com/BadgerLove/jo-server-patches/blob/main/"
+                 "docs/patches/15-long-chat-server.md")
 from wolfrat.sounds import generate_all_sounds
 from wolfrat.web_server import WolfWebServer, generate_token
 from wolfrat.runtime import DesktopRuntime, parse_launch_args
@@ -3367,6 +3374,9 @@ class ChatBotTab(QWidget):
         self._spam_kick_cooldowns = {}  # player_name -> timestamp of last kick
         self._spam_kick_pending = set()
         self._chat_config = self._load_chat_config()
+        # Long chat is only for servers running the long-chat exe patch; a
+        # stock server cuts every line at 59 (Dale 2026-09-26: off by default).
+        set_extended_chat(self._chat_config.get('extended_chat', False))
         # No team swaps on co-op maps (the other team is the bots). The main
         # window points game_type_source at the Bans tab's memory reader.
         self.coop_guard = coop_guard.CoopGuard(
@@ -3410,6 +3420,7 @@ class ChatBotTab(QWidget):
                 cfg['swap_trigger'] = self.trigger_input.text()
             if hasattr(self, 'coop_block_cb'):
                 cfg['coop_block_swaps'] = self.coop_block_cb.isChecked()
+            cfg['extended_chat'] = extended_chat()
             if hasattr(self, 'spam_cb'):
                 cfg['spam_enabled'] = self.spam_cb.isChecked()
             if hasattr(self, 'spam_msg_spin'):
@@ -3422,6 +3433,15 @@ class ChatBotTab(QWidget):
                 json.dump(cfg, f, indent=2)
         except Exception:
             pass
+
+    def _long_chat_toggled(self, on):
+        set_extended_chat(on)
+        self._save_chat_config()
+
+    def _show_chat_limit(self, limit):
+        self.chat_input.setMaxLength(limit)
+        self.chat_input.setPlaceholderText(f"Type a message (max {limit} chars)...")
+        self.char_count.setText(f"{len(self.chat_input.text())}/{limit}")
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -3436,13 +3456,11 @@ class ChatBotTab(QWidget):
         # Send chat
         send_layout = QHBoxLayout()
         self.chat_input = QLineEdit()
-        self.chat_input.setPlaceholderText(f"Type a message (max {CHAT_MAX_LEN} chars)...")
-        self.chat_input.setMaxLength(CHAT_MAX_LEN)
         self.chat_input.textChanged.connect(
-            lambda t: self.char_count.setText(f"{len(t)}/{CHAT_MAX_LEN}"))
+            lambda t: self.char_count.setText(f"{len(t)}/{chat_limit()}"))
         self.chat_input.returnPressed.connect(self._send_chat)
         send_layout.addWidget(self.chat_input)
-        self.char_count = QLabel(f"0/{CHAT_MAX_LEN}")
+        self.char_count = QLabel()
         self.char_count.setStyleSheet("color: #666;")
         send_layout.addWidget(self.char_count)
 
@@ -3450,6 +3468,25 @@ class ChatBotTab(QWidget):
         send_btn.clicked.connect(self._send_chat)
         send_layout.addWidget(send_btn)
         chat_layout.addLayout(send_layout)
+
+        long_layout = QHBoxLayout()
+        self.long_chat_cb = QCheckBox(
+            f"My server has the long chat patch ({EXTENDED_CHAT_LEN} characters + colours)")
+        self.long_chat_cb.setToolTip(
+            f"Joint Ops cuts every chat line at {STOCK_CHAT_LEN} characters and takes the colour\n"
+            f"codes out. Only tick this if your game server exe carries the long chat patch:\n"
+            f"then WolfRAT lets you type up to {EXTENDED_CHAT_LEN} characters and <cRRGGBB> colours\n"
+            f"reach the players. On a normal server, leave it off.")
+        self.long_chat_cb.setChecked(extended_chat())
+        self.long_chat_cb.toggled.connect(self._long_chat_toggled)
+        long_layout.addWidget(self.long_chat_cb)
+        long_link = QLabel(f'<a href="{LONG_CHAT_URL}">What is this?</a>')
+        long_link.setOpenExternalLinks(True)
+        long_layout.addWidget(long_link)
+        long_layout.addStretch()
+        chat_layout.addLayout(long_layout)
+        self._show_chat_limit(chat_limit())
+        on_chat_limit_changed(self._show_chat_limit)
 
         chat_group.setLayout(chat_layout)
         layout.addWidget(chat_group)
@@ -4074,8 +4111,6 @@ class MessagesTab(QWidget):
         # Add/remove
         add_layout = QHBoxLayout()
         self.recur_input = QLineEdit()
-        self.recur_input.setPlaceholderText(f"Add a recurring message (max {CHAT_MAX_LEN} chars)...")
-        self.recur_input.setMaxLength(CHAT_MAX_LEN)
         add_layout.addWidget(self.recur_input)
         add_btn = QPushButton("Add")
         add_btn.clicked.connect(self._add_recurring)
@@ -4117,9 +4152,11 @@ class MessagesTab(QWidget):
 
         welcome_layout.addWidget(QLabel("Welcome message ({player} = player name):"))
         self.welcome_input = QLineEdit(self._welcome_message)
-        self.welcome_input.setMaxLength(CHAT_MAX_LEN)
         self.welcome_input.textChanged.connect(self._update_welcome_msg)
         welcome_layout.addWidget(self.welcome_input)
+        # The two lines Dale types follow the Chat tab's long-chat tick box.
+        self._follow_chat_limit(chat_limit())
+        on_chat_limit_changed(self._follow_chat_limit)
 
         # Second line: where they're from, read from the Bans tab's connection checks.
         self.country_cb = QCheckBox("Then say where they're from (a second line everyone sees)")
@@ -4267,6 +4304,14 @@ class MessagesTab(QWidget):
     def _toggle_welcome(self, checked):
         self._welcome_enabled = checked
         self._save_config()
+
+    def _follow_chat_limit(self, limit):
+        # Never below what the box already holds: Qt cuts the text to a new
+        # max length, and that would save a chopped welcome. Longer lines are
+        # split into lines that fit when they are sent.
+        self.recur_input.setMaxLength(max(limit, len(self.recur_input.text())))
+        self.recur_input.setPlaceholderText(f"Add a recurring message (max {limit} chars)...")
+        self.welcome_input.setMaxLength(max(limit, len(self.welcome_input.text())))
 
     def _update_welcome_msg(self, text):
         self._welcome_message = text
@@ -4751,7 +4796,7 @@ class SpreeTab(QWidget):
         self._score_first_edits = {}
         for mode in score_lead.CAPS_MODES:
             edit = QLineEdit(self._score_first_lines[mode])
-            edit.setMaxLength(62)
+            edit.setMaxLength(score_lead.CHAT_LIMIT)
             edit.editingFinished.connect(self._score_lines_changed)
             first_row.addWidget(edit, 1)
             self._score_first_edits[mode] = edit
@@ -4773,7 +4818,7 @@ class SpreeTab(QWidget):
         self._show_score_lines()
         hint = QLabel("One line per row, picked at random. {team} = Joint Ops / Rebels ({player} in "
                       "Deathmatch), {score} = the leader's score, {other} = the next best. Lines longer "
-                      "than 62 characters once filled in are skipped. A tie is nobody's lead. Team "
+                      f"than {score_lead.CHAT_LIMIT} characters once filled in are skipped. A tie is nobody's lead. Team "
                       "Deathmatch and Deathmatch wait until a new leader has held it for 30 seconds "
                       "and say at most one lead line a minute.")
         hint.setWordWrap(True)
@@ -6505,6 +6550,7 @@ class MapVotingTab(QWidget):
         self.game_type_now = lambda: None       # g_GameType, wired by the main window
         self.caps_to_go = lambda: None          # CTF/FB flags or goals still needed, wired likewise
         self._hold_logged = False
+        self._join_grace = vote_rules.JoinGrace()
         self._zone_rule = False
         self._coop_rule = True                  # co-op has no timer: without this it never votes
         self._coop_objectives_left = 1
@@ -6686,7 +6732,10 @@ class MapVotingTab(QWidget):
         min_tip = (
             "Nobody on the server, or fewer than this? The automatic vote waits "
             "and the status line says so. Counts the players the Server tab "
-            "shows. 'Start Vote Now' and a mod's !startvote are not affected."
+            f"shows. When a join lets a waiting vote start, it starts "
+            f"{vote_rules.JOIN_GRACE_SECS} seconds later so they have loaded in "
+            "and can see the maps. "
+            "'Start Vote Now' and a mod's !startvote are not affected."
         )
         min_title.setToolTip(min_tip)
         config_layout.addWidget(min_title, 4, 0)
@@ -7070,6 +7119,7 @@ class MapVotingTab(QWidget):
             self._caps_watch.reset()
             self._ai_watch.reset()
             self._hold_logged = False
+            self._join_grace.reset()
             self._zone_fired_map = None
             self._coop_fired_map = None
 
@@ -7263,25 +7313,42 @@ class MapVotingTab(QWidget):
         return vote_rules.Decision(False, status=status)
 
     def _act_on_auto_decision(self, decision) -> bool:
-        """Player gate, status line and start - the same for every rule.
-        True when the vote was started."""
+        """Player gate, join grace, status line and start - the same for
+        every rule. True when the vote was started."""
+        import time
+        enabled = self.enable_cb.isChecked()
         players = len(self.server.players or ())
         held = vote_rules.hold_for_players(players, self.min_players_spin.value())
-        if held is None:
-            self.status_lbl.setText(decision.status)
-            self._hold_logged = False
-        else:
+        if held is not None:
             # Say WHY nothing is happening - a held vote used to sit on
             # 'Auto-vote pending...' with no clue in the log either.
             self.status_lbl.setText(held)
+            if enabled:
+                self._join_grace.hold(decision)
             if decision.fire and not self._hold_logged:
                 self._hold_logged = True
                 self.log(f"Auto-vote held: {held[len('Status: '):]}")
                 wire_log(f"[VOTE] auto-start held: {players} players, need {self.min_players_spin.value()}")
+            return False
 
-        if self.enable_cb.isChecked() and decision.fire and held is None:
-            self.log(f"Auto-vote: {decision.reason}")
-            wire_log(f"[VOTE] auto-start: {decision.reason}")
+        self._hold_logged = False
+        was_waiting = self._join_grace.waiting
+        start, wait = self._join_grace.step(decision, time.time())
+        if wait is not None:
+            # The join that opened the gate is still loading in: give them
+            # time to see the map list (Dale 2026-09-26).
+            self.status_lbl.setText(
+                f"Status: A player just joined - vote starts in {wait}s so they can load in.")
+            if not was_waiting:
+                self.log(f"Auto-vote: {players} on now - starting in "
+                         f"{vote_rules.JOIN_GRACE_SECS}s so they can load in.")
+                wire_log(f"[VOTE] join grace: {players} players, vote in {vote_rules.JOIN_GRACE_SECS}s")
+            return False
+
+        self.status_lbl.setText(decision.status)
+        if enabled and start is not None:
+            self.log(f"Auto-vote: {start.reason}")
+            wire_log(f"[VOTE] auto-start: {start.reason}")
             self._start_vote()
             return True
         return False
@@ -8153,7 +8220,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.8.5 Main Window."""
+    """WolfRAT 2.8.6 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -8172,7 +8239,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.8.5 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.8.6 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -8246,7 +8313,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.5 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.6 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -8264,9 +8331,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.8.5 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.8.6 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.8.5 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.8.6 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -8274,7 +8341,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.8.5")
+        header = QLabel("WolfRAT 2.8.6")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -8523,7 +8590,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.8.5 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.8.6 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -8579,7 +8646,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.8.5"
+    _CURRENT_VERSION = "2.8.6"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -8823,7 +8890,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.8.5")
+    app.setApplicationName("WolfRAT 2.8.6")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -8932,7 +8999,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.8.5 STARTED ===")
+    wire_log("=== WolfRAT 2.8.6 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -8985,7 +9052,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.8.5",
+                "2.8.6",
                 data_dir=runtime.data_dir,
             )
         except Exception:

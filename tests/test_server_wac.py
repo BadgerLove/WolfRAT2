@@ -68,7 +68,7 @@ def test_remove_takes_out_only_our_section(tmp_path):
     ("", "Type the welcome"),
     ("   ", "Type the welcome"),
     ('Say "hi"', "double quote"),
-    ("<cff0000>red", "colour codes"),
+    ("a <b> c", "not a colour code"),
     ("café", "Plain English"),
     ("line\nbreak", "Plain English"),
     ("x" * 101, "Too long"),
@@ -128,3 +128,36 @@ def test_a_bad_second_line_is_refused_and_named(tmp_path):
         sw.write_welcome(tmp_path, sw.Welcome("Hi", text2='type "!kd"'))
     assert "Second line" in str(err.value)
     assert not os.path.exists(os.path.join(str(tmp_path), sw.FILENAME))
+
+
+# ---- typed colour codes and the script's 63-character string (2026-09-26) ----
+
+def test_typed_codes_go_in_as_typed_and_read_back(tmp_path):
+    typed = "<c40c0ff>Welcome<co> to Badger's 125hz server!"
+    sw.write_welcome(tmp_path, sw.Welcome(typed, 20, ""))
+    text = open(os.path.join(str(tmp_path), sw.FILENAME), encoding="latin-1").read()
+    assert "ptext(\"<c40c0ff>Welcome<co> to Badger's 125hz server!\")" in text
+    back = sw.read_welcome(tmp_path)
+    assert sw.compose(back.text, back.colour) == typed
+
+
+def test_several_colours_on_one_line(tmp_path):
+    typed = "<cffff00>Chat:<co> <c00ff00>!kd<co> <c40c0ff>!switch"
+    sw.write_welcome(tmp_path, sw.Welcome("Hi", 20, "", typed, "", 3))
+    back = sw.read_welcome(tmp_path)
+    assert sw.compose(back.text2, back.colour2) == typed
+
+
+def test_63_fits_64_is_refused_with_colour_codes_counted(tmp_path):
+    ok = "<c00ff00>" + "x" * (63 - 9)
+    assert sw.line_problem(ok) is None
+    assert "Too long: 64 of 63" in sw.line_problem(ok + "y")
+    with pytest.raises(sw.ServerWacError):
+        sw.write_welcome(tmp_path, sw.Welcome(ok + "y", 20, ""))
+    assert not os.path.exists(os.path.join(str(tmp_path), sw.FILENAME))
+
+
+def test_the_live_welcome_lines_still_pass():
+    for line in ("<c40c0ff>Welcome to Badger's 125hz server!",
+                 "<cffff00>Chat commands: !ping !kd  !switch  !vote !skip"):
+        assert sw.line_problem(line) is None
