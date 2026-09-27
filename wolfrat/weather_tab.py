@@ -697,11 +697,22 @@ class WeatherTab(QWidget):
                     wire_log(f"[WEATHER] map is now {current}")
                 return
 
-    def _server_dir(self) -> str:
+    def server_exe(self) -> str:
+        """Full path of the running server's exe, "" if WolfRAT has none."""
         try:
-            path = self._memory.exe_path() if self._memory is not None else ""
+            return self._memory.exe_path() if self._memory is not None else ""
         except Exception:
-            path = ""
+            return ""
+
+    def read_server(self, address: int, size: int) -> Optional[bytes]:
+        """Read-only peek at the running server, None if WolfRAT has none."""
+        try:
+            return self._memory.read(address, size) if self._memory is not None else None
+        except Exception:
+            return None
+
+    def _server_dir(self) -> str:
+        path = self.server_exe()
         return os.path.dirname(path) if path else ""
 
     def _lightning_state(self, can_flash: bool, answered: bool = True) -> tuple[str, bool]:

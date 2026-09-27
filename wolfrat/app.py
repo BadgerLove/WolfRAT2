@@ -1,5 +1,5 @@
 """
-WolfRAT 2.8.6 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.8.7 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -51,6 +51,9 @@ from wolfrat.qt_dispatcher import CompletionPolicy, QtAdminDispatcher
 from wolfrat.bans_tab import BansTab
 from wolfrat.auto_balance_panel import AutoBalancePanel
 from wolfrat.server_link_panel import ServerLinkPanel
+from wolfrat.server_patches_panel import ServerPatchesPanel
+from wolfrat.server_patcher_panel import ServerPatcherPanel
+from wolfrat.client_patcher_panel import ClientPatcherPanel
 from PyQt6.QtMultimedia import QSoundEffect
 from PyQt6.QtCore import QUrl
 
@@ -652,13 +655,32 @@ class ServerTab(QWidget):
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
-        # Connection + status on the left; 'Game server on this PC' on the right
+        # Four pages (Dale 2026-09-26/27): the connection page as it was,
+        # Patches (what the server has), Server patcher and Client patcher.
+        self.pages = QTabWidget()
+        layout.addWidget(self.pages)
+        conn_page = QWidget()
+        page_layout = QVBoxLayout(conn_page)
+        # Connection + status on the left; 'Game server on this PC' and a
+        # smaller Saved Servers on the right
         top = QHBoxLayout()
         left = QVBoxLayout()
         top.addLayout(left, 3)
+        right = QVBoxLayout()
         self._link_slot = QVBoxLayout()
-        top.addLayout(self._link_slot, 2)
-        layout.addLayout(top)
+        right.addLayout(self._link_slot)
+        top.addLayout(right, 2)
+        page_layout.addLayout(top)
+        self.pages.addTab(conn_page, "Server connection")
+        patches_page = QWidget()
+        self._patches_slot = QVBoxLayout(patches_page)
+        self.pages.addTab(patches_page, "Patches")
+        patcher_page = QWidget()
+        self._patcher_slot = QVBoxLayout(patcher_page)
+        self.pages.addTab(patcher_page, "Server patcher")
+        client_page = QWidget()
+        self._client_patcher_slot = QVBoxLayout(client_page)
+        self.pages.addTab(client_page, "Client patcher")
 
         # Connection group
         conn_group = QGroupBox("Server Connection")
@@ -752,7 +774,7 @@ class ServerTab(QWidget):
         saved_layout.addLayout(save_btn_layout)
 
         saved_group.setLayout(saved_layout)
-        layout.addWidget(saved_group)
+        right.addWidget(saved_group, 1)
 
         # Load saved servers
         self._load_saved_servers()
@@ -760,6 +782,18 @@ class ServerTab(QWidget):
     def add_link_panel(self, panel: QWidget) -> None:
         """'Game server on this PC' sits beside Connection and Status."""
         self._link_slot.addWidget(panel)
+
+    def add_patches_panel(self, panel: QWidget) -> None:
+        """'Server patches' has the Patches page to itself."""
+        self._patches_slot.addWidget(panel)
+
+    def add_patcher_panel(self, panel: QWidget) -> None:
+        """The server patcher has the Server patcher page to itself."""
+        self._patcher_slot.addWidget(panel)
+
+    def add_client_patcher_panel(self, panel: QWidget) -> None:
+        """Players' exes: the Client patcher page."""
+        self._client_patcher_slot.addWidget(panel)
 
     def _do_connect(self):
         if self._closing:
@@ -8220,7 +8254,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.8.6 Main Window."""
+    """WolfRAT 2.8.7 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -8239,7 +8273,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.8.6 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.8.7 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -8313,7 +8347,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.6 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.7 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -8331,9 +8365,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.8.6 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.8.7 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.8.6 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.8.7 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -8341,7 +8375,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.8.6")
+        header = QLabel("WolfRAT 2.8.7")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -8404,6 +8438,14 @@ class MainWindow(QMainWindow):
         )
         self.weather_tab.link_changed.connect(self.server_link_panel.refresh)
         self.server_tab.add_link_panel(self.server_link_panel)
+        self.server_patches_panel = ServerPatchesPanel(self.weather_tab.server_exe, self.weather_tab.read_server)
+        self.weather_tab.link_changed.connect(self.server_patches_panel.refresh)
+        self.server_tab.add_patches_panel(self.server_patches_panel)
+        self.server_patcher_panel = ServerPatcherPanel(self.weather_tab.server_exe, self.weather_tab.read_server)
+        self.weather_tab.link_changed.connect(lambda *_: self.server_patcher_panel.refresh())
+        self.server_tab.add_patcher_panel(self.server_patcher_panel)
+        self.client_patcher_panel = ClientPatcherPanel(self.runtime.path("wolfrat_client_patcher.json"))
+        self.server_tab.add_client_patcher_panel(self.client_patcher_panel)
         # "checks it once you are connected" must turn over the moment you are
         self.signals.connected_signal.connect(self.server_link_panel.refresh)
         self.signals.disconnected_signal.connect(self.server_link_panel.refresh)
@@ -8590,7 +8632,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.8.6 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.8.7 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -8646,7 +8688,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.8.6"
+    _CURRENT_VERSION = "2.8.7"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -8890,7 +8932,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.8.6")
+    app.setApplicationName("WolfRAT 2.8.7")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -8999,7 +9041,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.8.6 STARTED ===")
+    wire_log("=== WolfRAT 2.8.7 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -9052,7 +9094,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.8.6",
+                "2.8.7",
                 data_dir=runtime.data_dir,
             )
         except Exception:
