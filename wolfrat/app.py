@@ -4482,11 +4482,20 @@ class SpreeTab(QWidget):
             10: ">>> {player} is GODLIKE! (10 Kills) <<<"
         }
         self._first_blood_enabled = True
+        # Dale 2026-09-27: dark grey words, red BLOOD, yellow name, no white.
+        # Colour tags only reach players on a long-chat server (a stock one
+        # strips them and cuts at 59), so stock servers get the plain words.
+        grey, red, yellow = "<c808080>", "<cFF0000>", "<cFFFF00>"
+        head = f"{grey}FIRST {red}BLOOD{grey}: "
         self._first_blood_templates = [
-            "{player} drew first blood",
-            "First blood to {player}",
-            "{player} secured first blood",
-            "{player} claims first blood"
+            (f"{head}{yellow}{{player}}{grey} drew first blood",
+             "FIRST BLOOD: {player} drew first blood"),
+            (f"{head}First blood to {yellow}{{player}}",
+             "FIRST BLOOD: First blood to {player}"),
+            (f"{head}{yellow}{{player}}{grey} secured first blood",
+             "FIRST BLOOD: {player} secured first blood"),
+            (f"{head}{yellow}{{player}}{grey} claims first blood",
+             "FIRST BLOOD: {player} claims first blood"),
         ]
         self._first_blood_ready = True
         self._first_blood_pending = False
@@ -4983,7 +4992,7 @@ class SpreeTab(QWidget):
                     and not self._first_blood_pending
                     and new_streak >= 1
                 ):
-                    fb_msg = random.choice(self._first_blood_templates).replace('{player}', name)
+                    fb_msg = self._first_blood_line(name)
                     self._first_blood_pending = True
                     submit_admin(
                         self,
@@ -5019,6 +5028,13 @@ class SpreeTab(QWidget):
 
             if kd_enabled and getattr(self.messages_tab, 'stats_store', None):
                 self.messages_tab.stats_store.update_player(name, kills, deaths, prev.get('streak', 0))
+
+    def _first_blood_line(self, name):
+        colour, plain = random.choice(self._first_blood_templates)
+        line = (colour if extended_chat() else plain).replace('{player}', name)
+        if len(line) > chat_limit():
+            line = f"FIRST BLOOD: {name}"
+        return line
 
     def _first_blood_sent(self, message):
         self._first_blood_pending = False

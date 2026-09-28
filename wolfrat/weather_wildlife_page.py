@@ -31,9 +31,11 @@ BANNER = (
 _HELP = (
     "<b>What this does.</b> The TAC mod's sharks are placed as a neutral team with a "
     "100 m attack distance, so they have nobody to hunt and, when poked, lunge from far "
-    "away and miss. Tick <b>Hunting sharks</b> and WolfRAT sets every shark on the server "
-    "to be <b>hostile to everyone</b> with a short attack distance, so they circle, charge "
-    "and bite swimmers. Nobody downloads anything; it is a change inside the running server."
+    "away and miss. Tick <b>Hunting sharks</b> and WolfRAT makes every shark on the server "
+    "<b>berserk</b> (attacks anyone, the same as a map's Berserk tick) with a short attack "
+    "distance, so they circle, charge and bite swimmers. They keep their own team, so "
+    "players who join later see them swim normally. Nobody downloads anything; it is a "
+    "change inside the running server."
     "<br><br><b>Needs:</b> WolfRAT linked to the game server on this PC (Server tab). Over a "
     "remote connection the page stays greyed out."
     "<br><br><b>Good to know</b>"
@@ -43,8 +45,17 @@ _HELP = (
     "<br>• <b>Attack distance 10 m</b> is the tested sweet spot: the bite lands a few metres "
     "into the lunge. At 25 m sharks lunge and miss; at 4-6 m you have to be right on top "
     "of them."
-    "<br>• Sharks do not chase from range. They patrol as normal and only act once you are "
-    "inside the attack distance."
+    "<br>• <b>Chasing swimmers</b> also needs the shark fix in the server: jo-server-patches "
+    "patch 16, or onHook with the water-creature chase. With it, sharks turn and come for "
+    "you in deep water and never follow you onto land; without it they patrol and only act "
+    "once you are inside the attack distance. WolfRAT also gives them a 4 m 'start "
+    "chasing' distance where the map left none, which the game needs before any chase."
+    "<br>• <b>Sharks ignore each other.</b> A berserk creature normally attacks its own "
+    "kind too, so before the first shark goes berserk WolfRAT adds a small fix to the "
+    "running server: berserk sharks hunt players, never each other. It stays until the "
+    "server restarts (a map load keeps it). If the server already has it (onHook's "
+    "BerserkIgnoresOwnKind, or the same exe patch) WolfRAT leaves it alone; on a server "
+    "exe it does not recognise, the sharks are not set to hunt at all."
     "<br>• Untick the box and the sharks keep hunting until the next map load; WolfRAT "
     "does not put them back."
 )
@@ -85,7 +96,7 @@ class WildlifePage(QWidget):
 
         group = QGroupBox("🦈 Sharks")
         box = QVBoxLayout()
-        self.enabled_cb = QCheckBox("Hunting sharks - hostile to everyone, short attack distance")
+        self.enabled_cb = QCheckBox("Hunting sharks - berserk (attack anyone), short attack distance")
         self.enabled_cb.setChecked(enabled)
         box.addWidget(self.enabled_cb)
 

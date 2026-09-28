@@ -740,7 +740,9 @@ def parse_chat_command(cmd: str, args: list[str]) -> ChatRequest:
 _PROCESS_VM_OPERATION = 0x0008
 _PROCESS_VM_READ = 0x0010
 _PROCESS_VM_WRITE = 0x0020
+_PROCESS_SUSPEND_RESUME = 0x0800
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_PAGE_EXECUTE_READWRITE = 0x40
 _TH32CS_SNAPPROCESS = 0x00000002
 
 
@@ -820,6 +822,44 @@ class ProcessMemory:
         if not self._k.WriteProcessMemory(self._handle, ctypes.c_void_p(address), data,
                                           len(data), ctypes.byref(done)) or done.value != len(data):
             raise WeatherError("Could not write to the server's memory (has it closed?).")
+
+    def write_code(self, writes: list) -> None:
+        """Write game code (``[(address, bytes), ...]`` in order) with the server
+        paused for the moment it takes, so it never runs a half-written
+        instruction.  Uses its own short-lived handle."""
+        k = self._k
+        k.VirtualProtectEx.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                       ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32))
+        k.FlushInstructionCache.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t)
+        nt = ctypes.WinDLL("ntdll")
+        nt.NtSuspendProcess.argtypes = (ctypes.c_void_p,)
+        nt.NtResumeProcess.argtypes = (ctypes.c_void_p,)
+        handle = k.OpenProcess(_PROCESS_SUSPEND_RESUME | _PROCESS_VM_OPERATION
+                               | _PROCESS_VM_WRITE | _PROCESS_VM_READ, False, self.pid)
+        if not handle:
+            raise WeatherError("Windows would not let WolfRAT change the server's code "
+                               "(run WolfRAT as administrator?).")
+        try:
+            if nt.NtSuspendProcess(handle) != 0:
+                raise WeatherError("Could not pause the server to change its code.")
+            try:
+                for address, data in writes:
+                    old = ctypes.c_uint32()
+                    if not k.VirtualProtectEx(handle, ctypes.c_void_p(address), len(data),
+                                              _PAGE_EXECUTE_READWRITE, ctypes.byref(old)):
+                        raise WeatherError("Could not unlock the server's code for writing.")
+                    done = ctypes.c_size_t()
+                    ok = (k.WriteProcessMemory(handle, ctypes.c_void_p(address), data, len(data),
+                                               ctypes.byref(done)) and done.value == len(data))
+                    k.VirtualProtectEx(handle, ctypes.c_void_p(address), len(data), old.value,
+                                       ctypes.byref(ctypes.c_uint32()))
+                    k.FlushInstructionCache(handle, ctypes.c_void_p(address), len(data))
+                    if not ok:
+                        raise WeatherError("Could not write the server's code.")
+            finally:
+                nt.NtResumeProcess(handle)
+        finally:
+            k.CloseHandle(handle)
 
     def exe_path(self) -> str:
         """Full path of the server's exe - its folder is where server.wac goes."""

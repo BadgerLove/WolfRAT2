@@ -514,6 +514,8 @@ class WeatherTab(QWidget):
             self.wildlife_page.set_status(f"⚪ Wildlife check failed: {exc}")
             wire_log(f"[WILDLIFE] {exc}")
             return
+        if status.note:
+            self.log(status.note)
         if status.reapplied != getattr(self, "_sharks_logged", 0):
             self._sharks_logged = status.reapplied
             self.log(f"Sharks: {len(status.sharks)} set to hunt "
