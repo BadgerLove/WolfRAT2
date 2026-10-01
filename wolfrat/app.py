@@ -1,5 +1,5 @@
 """
-WolfRAT 2.8.8 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.8.9 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -614,6 +614,18 @@ def submit_team_workflow(owner, operation, on_success, context):
         context=context,
         on_success=on_success,
     )
+
+
+def _forget_chat_ids_outside(tab, messages):
+    """Keep only the seen ids still in the server's chat window.
+
+    The old trim, set(list(seen)[-500:]), kept a random 500 (set order is
+    not insertion order). Recent ids it dropped came back as new on the next
+    poll, so old chat - and old !skip/!switch/!ping commands - ran again.
+    Ids only grow, so a message that has left the window never returns.
+    """
+    window = {m.get('id', m.get('raw', '')) for m in messages}
+    tab._seen_chat_ids &= window
 
 
 def schedule_once(owner: QObject, delay_ms: int, callback):
@@ -1287,8 +1299,6 @@ class PlayerTableModel(QAbstractTableModel):
                     changed += 1
                     idx = self.index(row, col)
                     self.dataChanged.emit(idx, idx, [Qt.ItemDataRole.DisplayRole])
-        if changed:
-            wire_log(f"PlayerTable: {changed} cells changed (no reset)")
 
     def _cell_value(self, p, col):
         """Get display value for a player dict at a given column."""
@@ -3651,6 +3661,9 @@ class ChatBotTab(QWidget):
             self.bad_words_list.takeItem(row)
             self._save_chat_config()
 
+    def _forget_chat_ids_outside(self, messages):
+        _forget_chat_ids_outside(self, messages)
+
     def update_chat(self, messages: list):
         # Skip the first batch - those are old messages from before we connected
         if not self._chat_initialized:
@@ -3667,11 +3680,8 @@ class ChatBotTab(QWidget):
                 self._seen_chat_ids.add(msg_id)
                 new_messages.append(msg)
 
-        wire_log(f'CHAT: {len(messages)} total, {len(new_messages)} new, {len(self.bad_words)} bad words registered')
 
-        # Trim seen set to prevent memory growth
-        if len(self._seen_chat_ids) > 1000:
-            self._seen_chat_ids = set(list(self._seen_chat_ids)[-500:])
+        self._forget_chat_ids_outside(messages)
 
         for msg in new_messages:
             text = msg.get('text', '')
@@ -5729,10 +5739,12 @@ class ModsTab(QWidget):
         )
 
 
+    def _forget_chat_ids_outside(self, messages):
+        _forget_chat_ids_outside(self, messages)
+
     def update_chat(self, messages):
         """Monitor chat for mod commands. Skips first batch, then processes new messages.
         Permanent dedup - same message never fires twice (prevents re-firing on reconnect)."""
-        wire_log(f"[MODS] update_chat called: {len(messages)} messages, initialized={self._chat_initialized}")
         if not self._chat_initialized:
             self._chat_initialized = True
             self._seen_chat_ids = {m.get('id', m.get('raw', '')) for m in messages}
@@ -5746,19 +5758,18 @@ class ModsTab(QWidget):
                 continue
             self._seen_chat_ids.add(msg_id)
             text = msg.get('text', '')
-            wire_log(f"[MODS] New chat: {text[:100]}")
+            if text.strip():
+                wire_log(f"[MODS] New chat: {text[:200]}")
             self._check_mod_command(text)
             processed += 1
 
         if processed:
             wire_log(f"[MODS] Processed {processed} messages")
 
-        if len(self._seen_chat_ids) > 1000:
-            self._seen_chat_ids = set(list(self._seen_chat_ids)[-500:])
+        self._forget_chat_ids_outside(messages)
 
     def _check_mod_command(self, text):
         """Check if a chat message is a mod command and execute it."""
-        wire_log(f"[MODS] _check_mod_command: text={text[:80]!r}")
         if '!' not in text:
             return
 
@@ -8270,7 +8281,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.8.8 Main Window."""
+    """WolfRAT 2.8.9 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -8289,7 +8300,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.8.8 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.8.9 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -8326,7 +8337,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
 
         # Connect signals
-        self.signals.log_signal.connect(self.server_tab.log)
+        # Not to server_tab.log: ServerManager already wrote these lines to
+        # the wire log, and that second write doubled every line.
         self.signals.log_signal.connect(self.console_tab.log)
         self.signals.players_signal.connect(self.players_tab.update_players)
         self.signals.players_signal.connect(lambda p: self.server_tab.update_player_count(p))
@@ -8363,7 +8375,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.8 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.8.9 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -8381,9 +8393,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.8.8 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.8.9 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.8.8 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.8.9 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -8391,7 +8403,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.8.8")
+        header = QLabel("WolfRAT 2.8.9")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -8648,7 +8660,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.8.8 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.8.9 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -8704,7 +8716,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.8.8"
+    _CURRENT_VERSION = "2.8.9"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -8948,7 +8960,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.8.8")
+    app.setApplicationName("WolfRAT 2.8.9")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -9057,7 +9069,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.8.8 STARTED ===")
+    wire_log("=== WolfRAT 2.8.9 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -9110,7 +9122,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.8.8",
+                "2.8.9",
                 data_dir=runtime.data_dir,
             )
         except Exception:

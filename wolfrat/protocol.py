@@ -64,27 +64,58 @@ import os
 import sys
 import time as _time
 
-# Wire log - dead simple, no locks, no lazy init
+# Wire log. Appends for ever (never wiped on start) - the admin deletes the
+# file when they want a fresh one. It stays small because the 5 s poll
+# replies are only written when they change (ServerManager._wire_changed)
+# and a line repeated back to back is folded into one "repeated" note.
+_wire_lock = threading.Lock()
+_wire_day = None          # date of the last line written, for day headers
+_wire_last = None         # last message written (without its time stamp)
+_wire_repeats = 0         # how many times _wire_last repeated since
+_wire_repeat_time = ""    # time of the latest repeat
+
+
 def _wire_log_path():
     if getattr(sys, 'frozen', False):
         return os.path.join(os.path.dirname(sys.executable), 'wolfrat_wire.log')
     return os.path.join(os.getcwd(), 'wolfrat_wire.log')
 
-# Write startup marker immediately on import
-try:
-    with open(_wire_log_path(), 'w', encoding='utf-8') as f:
-        f.write(f"[{_time.strftime('%H:%M:%S')}] === protocol.py module loaded ===\n")
-except Exception as e:
-    print(f"WIRE LOG INIT ERROR: {e}")
 
 def wire_log(message: str) -> None:
-    """Compatibility logging hook — writes to wolfrat_wire.log."""
+    """Append one line to wolfrat_wire.log."""
+    global _wire_day, _wire_last, _wire_repeats, _wire_repeat_time
+    now = _time.localtime()
+    stamp = _time.strftime('%H:%M:%S', now)
     try:
-        with open(_wire_log_path(), 'a', encoding='utf-8') as f:
-            f.write(f"[{_time.strftime('%H:%M:%S')}] {message}\n")
+        with _wire_lock:
+            if message == _wire_last:
+                _wire_repeats += 1
+                _wire_repeat_time = stamp
+                return
+            lines = []
+            if _wire_repeats:
+                times = "once more" if _wire_repeats == 1 else f"{_wire_repeats} more times"
+                lines.append(f"[{_wire_repeat_time}] (line above repeated {times})")
+            day = _time.strftime('%Y-%m-%d', now)
+            if day != _wire_day:
+                lines.append(f"---------- {_time.strftime('%A %d %B %Y', now)} ----------")
+                _wire_day = day
+            lines.append(f"[{stamp}] {message}")
+            _wire_last, _wire_repeats = message, 0
+            with open(_wire_log_path(), 'a', encoding='utf-8') as f:
+                f.write("\n".join(lines) + "\n")
     except Exception as e:
         print(f"WIRE LOG ERROR: {e}")
     _LOGGER.debug("%s", message)
+
+
+# Startup marker. A blank line first so each run stands out in the file.
+try:
+    with open(_wire_log_path(), 'a', encoding='utf-8') as _f:
+        _f.write("\n")
+except Exception as e:
+    print(f"WIRE LOG INIT ERROR: {e}")
+wire_log("=== protocol.py module loaded ===")
 
 
 class _ProtocolView:
@@ -136,6 +167,8 @@ class ServerManager:
         self._closed = False
         self._connection_generation = 0
         self._last_poll_success: float = 0.0
+        # Last quiet poll reply written to the wire log, per operation.
+        self._wire_seen: dict = {}
         self._stale_watchdog_timer: Optional[threading.Timer] = None
         # Must survive several failed poll cycles. The socket timeout is 15s
         # and JO freezes 5-15s during map loads, so 20s tripped on ordinary
@@ -258,6 +291,9 @@ class ServerManager:
             if not self._connection_is_current(session, generation):
                 session.close()
                 return False, "Connection failed: connection was cancelled"
+            with self._lock:
+                # Log the full picture once per connection.
+                self._wire_seen.clear()
             self._apply_result(first)
             self._log(f"Connected to {host}:{port}")
             if (
@@ -375,7 +411,9 @@ class ServerManager:
                 "confirmed mutations require an operation-specific verifier"
             )
         prefix = "__QUIET__" if quiet else ""
-        self._log(f"{prefix}>> {spec.operation.value}")
+        # The 5 s poll commands go to the console only; their replies reach
+        # the wire log when something changed (_apply_result).
+        self._log(f"{prefix}>> {spec.operation.value}", to_file=not quiet)
         is_background_read = quiet and not spec.mutating
         with self._lock:
             session = self._require_session(expected_session)
@@ -1792,8 +1830,10 @@ class ServerManager:
         log_prefix = "__QUIET__" if quiet else ""
         if not result.accepted:
             for reply in result.replies:
+                text = _redact_setting_lines(reply)
                 self._log(
-                    f"{log_prefix}<< {_redact_setting_lines(reply)}"
+                    f"{log_prefix}<< {text}",
+                    to_file=not quiet or self._wire_changed(result.operation, text),
                 )
             return
         value = result.value
@@ -1840,7 +1880,60 @@ class ServerManager:
             if self._on_weapons:
                 self._on_weapons(list(self.weapon_entries))
         for reply in result.replies:
-            self._log(f"{log_prefix}<< {_redact_setting_lines(reply)}")
+            text = _redact_setting_lines(reply)
+            if quiet and operation is AdminOperation.CHAT_GET:
+                # New chat lines are logged one by one by the Mods tab.
+                to_file = False
+            elif quiet and operation is AdminOperation.MISSION_LIST:
+                to_file = self._wire_mission_list(text)
+            else:
+                to_file = not quiet or self._wire_changed(operation, text)
+            self._log(f"{log_prefix}<< {text}", to_file=to_file)
+
+    def _wire_changed(self, operation, text: str) -> bool:
+        """True when a quiet reply differs from the last one written."""
+        key = text
+        if operation is AdminOperation.PLAYER_LIST:
+            # Kills, deaths and ping move every poll; the roster (name,
+            # slot, team) is what matters in the log.
+            key = "\n".join(
+                "\t".join(field.strip() for field in line.split("\t")[:3])
+                for line in text.splitlines()
+            )
+        elif operation is AdminOperation.GET_GAMESETTINGS:
+            # "GameTime = 23/30" counts down every minute; only the time
+            # limit after the slash is a setting.
+            key = "\n".join(
+                "GameTime /" + line.partition("/")[2]
+                if line.startswith("GameTime ") else line
+                for line in text.splitlines()
+            )
+        with self._lock:
+            if self._wire_seen.get(operation) == key:
+                return False
+            self._wire_seen[operation] = key
+            return True
+
+    def _wire_mission_list(self, text: str) -> bool:
+        """Write a changed queue in full; a new current map as one line."""
+        marker = "<CURRENT MISSION>"
+        queue = text.replace(marker, "<>")
+        with self._lock:
+            last_queue, last_text = self._wire_seen.get(
+                AdminOperation.MISSION_LIST, (None, None)
+            )
+            if text == last_text:
+                return False
+            self._wire_seen[AdminOperation.MISSION_LIST] = (queue, text)
+        if queue != last_queue:
+            return True
+        current = next(
+            (line.split(" - ")[0] for line in text.splitlines() if marker in line),
+            "none",
+        )
+        count = len([line for line in text.splitlines() if line.strip()])
+        wire_log(f"Mission queue unchanged ({count} maps), current is now {current}")
+        return False
 
     def _apply_chat(self, lines: tuple[str, ...]) -> None:
         raw = "\n".join(lines)
@@ -1881,8 +1974,9 @@ class ServerManager:
             )
         return session
 
-    def _log(self, message: str) -> None:
-        wire_log(message)
+    def _log(self, message: str, *, to_file: bool = True) -> None:
+        if to_file:
+            wire_log(message)
         if self._on_log:
             self._on_log(message)
 
