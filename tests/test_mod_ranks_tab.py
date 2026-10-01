@@ -164,12 +164,41 @@ def test_add_and_remove_people(tmp_path):
     panel.mod_input.setText("  Ham ")
     panel.new_rank_combo.setCurrentText(MODERATOR)
     panel._add_typed()
-    panel._add_typed()  # empty box: nothing
+    panel._add_typed()  # empty box: told, nothing added
+    assert rig.warned == ["Type the player's name in the box first."]
     assert rig.saved()["mod_ranks"] == {"Dale": ADMIN, "Ham": MODERATOR}
     assert rig.tab.mods == {"dale": "Dale", "ham": "Ham"}  # entrance panel still fed
     panel.people_table.selectRow(1)
     panel._remove_selected()
     assert rig.saved()["mods"] == ["Dale"]
+
+
+def test_quick_add_says_why_when_it_cannot_add(tmp_path):
+    """Up to 2.8.8 +Add did nothing at all with no player picked (the box
+    still reads 'Select online player...'), nobody online, or someone
+    already on the list - an admin took it for a broken button."""
+    rig = Rig(tmp_path, {"mods": ["Ham"]})
+    panel = rig.tab.ranks_panel
+    panel._add_online()
+    assert "Nobody is online" in rig.warned[-1]
+
+    panel.set_online_players(["JustAPlayer", "Ham"])
+    assert panel.player_combo.currentIndex() == -1
+    panel._add_online()
+    assert rig.warned[-1] == "Pick a player from the Quick add list first."
+
+    panel.player_combo.setCurrentText("Ham")
+    panel._add_online()
+    assert rig.warned[-1].startswith("Ham is already on the list as Moderator.")
+    panel.mod_input.setText("ham")
+    panel._add_typed()
+    assert rig.warned[-1].startswith("ham is already on the list as Moderator.")
+    assert panel.mod_input.text() == "ham"  # kept so they can fix it
+
+    panel.player_combo.setCurrentText("JustAPlayer")
+    panel._add_online()
+    assert len(rig.warned) == 4
+    assert rig.tab.roster.rank_of("justaplayer").name == MODERATOR
 
 
 def test_rank_column_is_wide_enough_for_the_longest_rank_name(tmp_path):

@@ -272,6 +272,13 @@ class ModRanksPanel(QTabWidget):
 
     def _add(self, name: str) -> bool:
         rank = self.new_rank_combo.currentText() or MODERATOR
+        existing = self.roster.rank_of(name)
+        if existing is not None:
+            self._warn(
+                f"{name.strip()} is already on the list as {existing.name}.\n\n"
+                "To change their rank, use the drop-down beside their name."
+            )
+            return False
         if not self.roster.add_member(name, rank):
             return False
         self._log(f"Mod added: {name.strip()} ({rank})")
@@ -279,10 +286,25 @@ class ModRanksPanel(QTabWidget):
         return True
 
     def _add_typed(self) -> None:
+        if not self.mod_input.text().strip():
+            self._warn("Type the player's name in the box first.")
+            return
         if self._add(self.mod_input.text()):
             self.mod_input.clear()
 
     def _add_online(self) -> None:
+        # Every add used to fail silently: with no pick the box still reads
+        # "Select online player...", which looks like a choice (2026-09-30).
+        if self.player_combo.count() == 0:
+            self._warn(
+                "Nobody is online to pick from.\n\n"
+                "The list fills in when WolfRAT is connected and players are "
+                "on the server. You can also type a name in the box above."
+            )
+            return
+        if self.player_combo.currentIndex() < 0:
+            self._warn("Pick a player from the Quick add list first.")
+            return
         self._add(self.player_combo.currentText())
 
     def _remove_selected(self) -> None:
