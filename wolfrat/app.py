@@ -1,5 +1,5 @@
 """
-WolfRAT 2.9.0 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.9.1 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -3685,6 +3685,10 @@ class ChatBotTab(QWidget):
 
         for msg in new_messages:
             text = msg.get('text', '')
+            # A line of only spaces has no sender to read (the name guess
+            # below crashed on it, abandoning the rest of the batch).
+            if not text.strip():
+                continue
             time_str = msg.get('time', '')
             formatted = f"[{time_str}] {text}"
             self.chat_display.append(f"<span style='color: #a89830'>{formatted}</span>")
@@ -3695,7 +3699,7 @@ class ChatBotTab(QWidget):
                 if trigger and trigger in text.lower():
                     # Try to extract player name from chat message
                     # Format is usually: "PlayerName: message" or "PlayerName message"
-                    player_name = text.split(':')[0].strip() if ':' in text else text.split()[0].strip()
+                    player_name = text.split(':')[0].strip() if ':' in text else (text.split() or [''])[0].strip()
                     # Find player in current player list
                     found = False
                     for p in self.server.players:
@@ -3740,7 +3744,7 @@ class ChatBotTab(QWidget):
             for word, action in self.bad_words.items():
                 if word in text.lower():
                     # Extract player name from chat message
-                    player_name = text.split(':')[0].strip() if ':' in text else text.split()[0].strip()
+                    player_name = text.split(':')[0].strip() if ':' in text else (text.split() or [''])[0].strip()
                     # Find player in player list
                     player_target = None
                     display_name = player_name
@@ -3792,7 +3796,7 @@ class ChatBotTab(QWidget):
 
             # Anti-Spam Check
             if self.spam_cb.isChecked():
-                player_name = text.split(':')[0].strip() if ':' in text else text.split()[0].strip()
+                player_name = text.split(':')[0].strip() if ':' in text else (text.split() or [''])[0].strip()
                 if player_name and player_name != 'Server':
                     now = time.time()
                     # Cooldown: skip if this player was kicked in the last 30 seconds.
@@ -8281,7 +8285,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.9.0 Main Window."""
+    """WolfRAT 2.9.1 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -8300,7 +8304,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.9.0 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.9.1 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -8375,7 +8379,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.9.0 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.9.1 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -8393,9 +8397,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.9.0 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.9.1 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.9.0 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.9.1 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -8403,7 +8407,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.9.0")
+        header = QLabel("WolfRAT 2.9.1")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -8660,7 +8664,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.9.0 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.9.1 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -8716,7 +8720,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.9.0"
+    _CURRENT_VERSION = "2.9.1"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -8960,7 +8964,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.9.0")
+    app.setApplicationName("WolfRAT 2.9.1")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -9069,7 +9073,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.9.0 STARTED ===")
+    wire_log("=== WolfRAT 2.9.1 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -9122,7 +9126,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.9.0",
+                "2.9.1",
                 data_dir=runtime.data_dir,
             )
         except Exception:
