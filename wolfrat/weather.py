@@ -34,7 +34,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Callable, Optional, Protocol
 
-SERVER_IMAGE_NAME = "jointops.exe"
+from wolfrat import server_process
 
 # The game simulates at 62 ticks a second as far as the script setters are
 # concerned ("seconds * 62" is how the engine turns a fade time into a step).
@@ -772,25 +772,15 @@ def _kernel32():
     return k
 
 
-def find_process_ids(image_name: str = SERVER_IMAGE_NAME) -> list[int]:
+def find_process_ids() -> list[int]:
+    """The process of the server WolfRAT is connected to, if it runs on this PC.
+
+    Found through WolfRAT's own admin connection (server_process), never by
+    exe name: two servers on one PC each get their own WolfRAT's server.
+    """
     if sys.platform != "win32":
         return []
-    k = _kernel32()
-    snapshot = k.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
-    if not snapshot or snapshot == ctypes.c_void_p(-1).value:
-        return []
-    found = []
-    try:
-        entry = _ProcessEntry32()
-        entry.dwSize = ctypes.sizeof(_ProcessEntry32)
-        ok = k.Process32First(snapshot, ctypes.byref(entry))
-        while ok:
-            if entry.szExeFile.decode("mbcs", "replace").lower() == image_name.lower():
-                found.append(int(entry.th32ProcessID))
-            ok = k.Process32Next(snapshot, ctypes.byref(entry))
-    finally:
-        k.CloseHandle(snapshot)
-    return found
+    return server_process.server_pids()
 
 
 class ProcessMemory:
@@ -884,10 +874,7 @@ def attach_local_server(writable: bool = True) -> tuple[WeatherController, Proce
         raise WeatherError("Weather control needs Windows.")
     pids = find_process_ids()
     if not pids:
-        raise ServerNotRunning(
-            "No jointops.exe is running on this PC. Weather works when WolfRAT "
-            "runs on the same machine as the game server."
-        )
+        raise ServerNotRunning(server_process.why_not())
     last: Optional[WeatherError] = None
     for pid in pids:
         try:

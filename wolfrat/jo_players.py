@@ -21,7 +21,7 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from wolfrat import weather
+from wolfrat import server_process, weather
 
 CAPACITY_VA = 0x24C0CA4
 SLOTPTR_VA = 0x24C0CA8
@@ -33,6 +33,7 @@ ENTITY_OFFSET = 0
 POSITION_OFFSET = 4          # three int32: X, Y, Z(height)
 MAX_CAPACITY = 256
 RETRY_SECONDS = 10
+CHECK_SECONDS = 2            # how often a held process is re-matched to the connection
 ZONE_CHAIN_VA = 0x24D1EBC
 ZONE_TEAM_OFFSET, ZONE_TIER_OFFSET = 354, 538
 MAX_ZONES = 64
@@ -76,13 +77,27 @@ class LocalServerPlayers:
         self._memory = None
         self._pid: Optional[int] = None
         self._next_try = 0.0
+        self._next_check = 0.0
         self.status = "Not looked yet."
         self.available = False
 
     def _attach(self) -> bool:
         now = self._clock()
         if self._memory is not None:
-            return True
+            if now < self._next_check:
+                return True
+            self._next_check = now + CHECK_SECONDS
+            try:
+                current = self._find()
+            except Exception:                    # pragma: no cover - OS oddities
+                return True
+            # No match right now (map change, reconnecting): keep the process
+            # we already had.  A DIFFERENT process means WolfRAT is now talking
+            # to another server - never keep reading the old one.
+            if not current or current[0] == self._pid:
+                return True
+            self._drop("Connected to a different server - switching.")
+            self._next_try = 0.0
         if now < self._next_try:
             return False
         self._next_try = now + RETRY_SECONDS
@@ -95,8 +110,7 @@ class LocalServerPlayers:
             self.status = f"Could not list processes: {exc}"
             return False
         if not pids:
-            self.status = ("jointops.exe is not running on this PC - IPs need the server "
-                           "on the same machine as WolfRAT.")
+            self.status = server_process.why_not()
             return False
         try:
             self._memory = self._open(pids[0])
@@ -167,7 +181,7 @@ class LocalServerPlayers:
                     pos = None
             found.append(SlotInfo(index, name, ip, pos))
         self.available = True
-        self.status = f"Reading IPs from jointops.exe (pid {self._pid})."
+        self.status = f"Reading IPs from the connected server (process {self._pid})."
         return found
 
 

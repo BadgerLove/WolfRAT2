@@ -91,12 +91,14 @@ class WeatherTab(QWidget):
         attach: Callable[..., tuple] = weather.attach_local_server,
         context: Optional[Callable[[], dict]] = None,
         map_list: Optional[Callable[[], list]] = None,
+        server_pids: Callable[[], list] = weather.find_process_ids,
     ):
         super().__init__()
         self.runtime = runtime or DesktopRuntime.production()
         self._send_chat = send_chat
         self._button_cls = button_cls
         self._attach = attach
+        self._server_pids = server_pids
         # context() -> {"connected": bool, "map": str | None, "players": int}
         self._context = context
         self._map_list = map_list
@@ -420,6 +422,8 @@ class WeatherTab(QWidget):
     def _ensure(self, writable: bool) -> Optional[weather.WeatherController]:
         """Status polling only ever holds a read-only handle; the first real
         action swaps it for one that can write."""
+        if self._controller is not None and self._switched_server():
+            self._detach()
         if self._controller is not None and (self._writable or not writable):
             return self._controller
         self._detach()
@@ -433,6 +437,21 @@ class WeatherTab(QWidget):
             self._server_missing = isinstance(exc, weather.ServerNotRunning)
             self._problem(str(exc))
         return self._controller
+
+    def _switched_server(self) -> bool:
+        """True when WolfRAT's connection now leads to a DIFFERENT server process
+        than the one held - weather must never write into the old one.  No match
+        right now (map change, reconnecting) keeps the held process."""
+        try:
+            current = self._server_pids()
+        except Exception:                        # pragma: no cover - OS oddities
+            return False
+        held = getattr(self._memory, "pid", None)
+        if current and held is not None and current[0] != held:
+            wire_log(f"[WEATHER] connected server is now process {current[0]} "
+                     f"(was {held}) - switching")
+            return True
+        return False
 
     def _problem(self, text: str):
         self._detach()

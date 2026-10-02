@@ -16,6 +16,7 @@ import struct
 import threading
 from typing import Callable, Protocol
 
+from . import server_process
 from .admin_commands import (
     AdminOperation,
     AdminSnapshot,
@@ -125,6 +126,8 @@ class SocketTransport:
         if interrupted:
             sock.close()
             raise ConnectionError("transport was closed during connect")
+        # Memory features find the server process through this connection.
+        server_process.note_connection(sock)
 
     def sendall(self, data: bytes) -> None:
         with self._lock:
