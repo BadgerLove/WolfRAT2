@@ -277,9 +277,12 @@ def _table_with_no_sharks(server):
     return server
 
 
-def test_wildlife_is_the_third_page_and_says_tac_only(qtbot, tmp_path):
+def test_wildlife_is_the_last_page_and_says_tac_only(qtbot, tmp_path):
     tab, _, _ = make(qtbot, tmp_path, _table_with_no_sharks(FakeServer()))
-    assert tab.pages.tabText(2) == "🦈 Wildlife" and tab.pages.widget(2) is tab.wildlife_page
+    # Manual, Dynamic, Sky (Dale 2026-10-09: after Dynamic, before Wildlife), Wildlife
+    assert [tab.pages.tabText(i) for i in range(tab.pages.count())] == [
+        "Manual", "Dynamic", "🎨 Sky", "🦈 Wildlife"]
+    assert tab.pages.widget(3) is tab.wildlife_page and tab.pages.widget(2) is tab.sky_page
     assert "OscarMike247" in tab.wildlife_page.banner_lbl.text()
     assert "TAC mod only" in tab.wildlife_page.banner_lbl.text()
     assert tab.wildlife_page.status_lbl.text().startswith("No sharks")

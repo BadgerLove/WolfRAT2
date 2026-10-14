@@ -118,6 +118,44 @@ def test_mod_without_minutes_uses_the_manual_hold_time(qtbot, tmp_path):
     assert tab._schedule.active is None
 
 
+def test_mod_clear_30_holds_a_dry_sky_then_gives_the_map_its_sky_back(qtbot, tmp_path):
+    """Dale 2026-10-09: '!clear 30' did not last - the minutes were dropped."""
+    server = FakeServer()
+    server.poke(Addr.PRECIP_MAP, w.FIXED_ONE)          # a map built rainy
+    tab, said, _ = make(qtbot, tmp_path, server)
+    tab.mods_cb.setChecked(True)
+    now = [1000.0]
+    tab._schedule._clock = lambda: now[0]
+
+    tab.on_mod_command("Mod", "!storm", ["10"])
+    assert tab.on_mod_command("Mod", "!clear", ["30"]) is None
+    assert said[-1] == "Clear skies for 30 min."
+    assert tab._schedule.seconds_left() == 30 * 60
+    server.tick(400)
+    assert server.client_sees()["precip"] == 0 and server.client_sees()["overcast"] == 0
+    tab._poll()
+    assert "dry sky" in tab.active_lbl.text()
+
+    # the map's script rains again; the next poll puts it out
+    server.poke(Addr.PRECIP_TARGET, w.FIXED_ONE)
+    now[0] += 60
+    tab._poll()
+    server.tick(400)
+    assert server.client_sees()["precip"] == 0
+
+    now[0] += 30 * 60
+    tab._poll()
+    assert tab._schedule.active is None
+    assert said[-1] == "The map's own weather is back."
+    server.tick(400)
+    assert server.client_sees()["precip"] == 255
+
+    # a bare !clear gets the Manual page time like any other mod weather
+    tab.minutes_spin.setValue(0)
+    tab.on_mod_command("Mod", "!clear", [])
+    assert tab._schedule.seconds_left() == MOD_FALLBACK_MINUTES * 60
+
+
 def test_mod_chat_and_server_restart(qtbot, tmp_path):
     server = FakeServer()
     tab, said, attaches = make(qtbot, tmp_path, server)

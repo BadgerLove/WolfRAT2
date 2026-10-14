@@ -43,6 +43,9 @@ PERMISSION_GROUPS = (
         ("lightning", "!lightning - flash and thunder", ("!lightning",)),
         ("weather_dynamic", "!weather on / off - the changing weather", ("!weather",)),
     )),
+    ("Sky", (
+        ("sky", "!sky - sky colours, scenes and the demo", ("!sky",)),
+    )),
     ("Teams", (
         ("swap", "!swap - move a player to the other team", ("!swap",)),
         ("mixteams", "!mixteams - shuffle everyone", ("!mixteams",)),
@@ -73,7 +76,7 @@ _COMMAND_PERMISSION = {
 # What a Moderator can do out of the box: run the match day to day, but not
 # ban, force a map, change the game time or edit the rotation.
 DEFAULT_MODERATOR = frozenset({
-    "startvote", "next", "weather", "quake", "lightning", "weather_dynamic",
+    "startvote", "next", "weather", "quake", "lightning", "weather_dynamic", "sky",
     "swap", "mixteams", "balanceteams", "warn", "kill", "kick",
 })
 

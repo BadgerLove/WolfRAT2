@@ -238,6 +238,47 @@ def test_timed_storm_survives_a_map_change_then_clears_itself():
     assert server.client_sees()["precip"] == 0
 
 
+def test_clear_30_holds_a_dry_sky_over_a_rainy_map_then_hands_it_back():
+    # Dale 2026-10-09: "!clear 30" did not last - it was a one-off hand-back
+    # to the map's own sky, and a rainy map's script rained on it again.
+    now = [0.0]
+    server = FakeServer()
+    server.poke(Addr.PRECIP_MAP, w.FIXED_ONE)            # map built with full rain
+    server.poke(Addr.OVERCAST_MAP, w.FIXED_ONE)
+    for addr in (Addr.PRECIP_TARGET, Addr.PRECIP_CURRENT, Addr.OVERCAST_TARGET, Addr.OVERCAST_CURRENT):
+        server.poke(addr, w.FIXED_ONE)
+    control = WeatherController(server)
+    schedule = WeatherSchedule(clock=lambda: now[0])
+    request = w.parse_chat_command("!clear", ["30"])
+    schedule.start(control, request.weather, request.minutes)
+    server.tick(400)
+    assert server.client_sees()["precip"] == 0
+    assert server.client_sees()["overcast"] == 0
+
+    # the map's script turns the rain back on: the hold puts it out again
+    server.poke(Addr.PRECIP_TARGET, w.FIXED_ONE)
+    now[0] = 600
+    assert schedule.tick(control) is None
+    server.tick(400)
+    assert server.client_sees()["precip"] == 0
+    assert schedule.seconds_left() == 1200
+
+    now[0] = 1801
+    assert schedule.tick(control) == "ended"
+    server.tick(400)
+    assert server.client_sees()["precip"] == 255           # the map's own rain is back
+
+
+def test_dry_keeps_the_maps_fog_and_says_what_it_is():
+    server = FakeServer(map_fog_m=800)
+    WeatherController(server).apply(w.PRESETS["fog"])
+    server.tick(400)
+    WeatherController(server).apply(w.DRY)
+    assert server.peek(Addr.FOG_TARGET) == 800 << 16
+    assert w.DRY.describe() == "dry sky"
+    assert w.CLEAR.describe() == "clear"
+
+
 def test_untimed_weather_holds_until_cleared():
     now = [0.0]
     server, schedule = FakeServer(), WeatherSchedule(clock=lambda: now[0])
@@ -256,11 +297,12 @@ def test_untimed_weather_holds_until_cleared():
     ("!STORM", [], "storm", None),
     ("!weather", ["blizzard", "5"], "blizzard", 5),
     ("!clear", [], "clear", None),
+    ("!clear", ["30"], "clear", 30),
 ])
 def test_chat_weather(cmd, args, name, minutes):
     request = w.parse_chat_command(cmd, args)
     assert (request.kind, request.name, request.minutes) == ("weather", name, minutes)
-    assert request.weather is w.PRESETS[name]
+    assert request.weather is (w.DRY if name == "clear" else w.PRESETS[name])
 
 
 @pytest.mark.parametrize("cmd, args", [

@@ -404,6 +404,65 @@ def check_long_chat(exe: Exe) -> Finding:
     return Finding("long_chat", "Long chat", level, text, doc)
 
 
+# ---- live patches: in the RUNNING server, not the exe (Dale 2026-10-09) ---------
+
+class _LiveMemory:
+    """``read`` that raises instead of returning None (what the live-patch
+    checks expect)."""
+
+    def __init__(self, live: LiveRead):
+        self._live = live
+
+    def read(self, address: int, size: int) -> bytes:
+        data = self._live(address, size)
+        if data is None or len(data) != size:
+            raise OSError("cannot read the server")
+        return data
+
+
+LIVE_MARK = "⚡ LIVE"
+
+
+def check_live_parachute(live: Optional[LiveRead]) -> Optional[Finding]:
+    """None when WolfRAT has no running server to look at."""
+    from wolfrat import live_patches as lp
+    if live is None or _live(live, lp.CHUTE_SITE, 1) is None:
+        return None
+    title = "Spacebar parachute"
+    state = lp.chute_state(_LiveMemory(live))
+    if state.on:
+        return Finding("parachute", title, GOOD,
+                       f"{LIVE_MARK}: players open it with space. "
+                       "Gone when the server restarts (Live patches page).")
+    if state.kind == lp.STOCK:
+        return Finding("parachute", title, INFO,
+                       "Not on (optional): the game's normal parachute. A live patch - "
+                       "see the Live patches page.")
+    return Finding("parachute", title, INFO,
+                   "Changed by something else in this server (onHook / TAC?) - WolfRAT leaves it alone.")
+
+
+def check_live_sharks(exe: Exe, live: Optional[LiveRead]) -> Optional[Finding]:
+    """'Berserk sharks ignore each other': in the exe file, or added live."""
+    from wolfrat import wildlife
+    if live is None or _live(live, wildlife.KIN_LEG, 1) is None:
+        return None
+    title = "Sharks ignore each other"
+    state = wildlife.kin_state(_LiveMemory(live))
+    in_file = exe.is_(wildlife.KIN_LEG, wildlife.KIN_LEG_FIXED.hex())
+    if state == wildlife.KIN_FIXED:
+        if in_file:
+            return Finding("sharks", title, GOOD, "In the exe.")
+        return Finding("sharks", title, GOOD,
+                       f"{LIVE_MARK}: added by the Wildlife sharks. Gone when the server restarts.")
+    if state == wildlife.KIN_ONHOOK:
+        return Finding("sharks", title, GOOD, "In (onHook).")
+    if state == wildlife.KIN_RETAIL:
+        return Finding("sharks", title, INFO,
+                       "Not in (only needed for hunting sharks; the Wildlife page adds it live).")
+    return Finding("sharks", title, UNKNOWN, "Cannot tell on this build.")
+
+
 # ---- the whole report ----------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -416,8 +475,10 @@ class Report:
 
 def live_stamp(live: Optional[LiveRead]) -> tuple:
     """The live values check() reads, so a restart is noticed without a file change."""
+    from wolfrat import live_patches as lp, wildlife
     return (_live(live, SPEED_VA, 1), _live(live, ARENA_SIZE_VA, 4),
-            _live(live, ADMIN_FIX_VA, 4), _live(live, SPAWN_VA, 10))
+            _live(live, ADMIN_FIX_VA, 4), _live(live, SPAWN_VA, 10),
+            _live(live, lp.CHUTE_SITE, 5), _live(live, wildlife.KIN_LEG, 8))
 
 
 def check(exe_path: str, live: Optional[LiveRead] = None, cfg: Optional[dict] = None) -> Report:
@@ -438,6 +499,8 @@ def check(exe_path: str, live: Optional[LiveRead] = None, cfg: Optional[dict] = 
         check_memory(exe, folder, live), check_laa(exe),
     )
     known = sum(f.level != UNKNOWN for f in findings) >= 6
+    # what was written into the running server (shown only when WolfRAT can read it)
+    findings += tuple(f for f in (check_live_parachute(live), check_live_sharks(exe, live)) if f)
     return Report(exe_path, known, findings, headline(findings, known))
 
 

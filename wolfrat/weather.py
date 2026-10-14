@@ -247,8 +247,13 @@ class Weather:
     fog_metres: Optional[int] = None     # None = the map's own distance
     cloud_speed: Optional[int] = None    # wind, 0-255 (WAC 'skyspeed'); None = the map's own
     fade_seconds: int = 20
+    # True = really dry: no rain, no cloud, even on a map built rainy.
+    # False with nothing else set = the map's own sky (CLEAR).
+    dry: bool = False
 
     def describe(self) -> str:
+        if self.dry:
+            return "dry sky"
         if self.precip_percent <= 0 and self.overcast_percent <= 0 and self.fog_metres is None \
                 and self.cloud_speed is None:
             return "clear"
@@ -265,6 +270,10 @@ class Weather:
 
 
 CLEAR = Weather()
+# "!clear 30": hold a dry sky for 30 minutes, then hand the map its own sky back.
+# Held like any other weather, so the map's script and the changing weather
+# cannot rain on it.  Fog stays at the map's own distance.
+DRY = Weather(dry=True)
 
 PRESETS: dict[str, Weather] = {
     "clear": CLEAR,
@@ -400,7 +409,7 @@ class WeatherController:
             self.verify()
         seconds = max(0, weather.fade_seconds)
         clear = weather.precip_percent <= 0 and weather.overcast_percent <= 0 \
-            and weather.fog_metres is None
+            and weather.fog_metres is None and not weather.dry
         precip_target = percent_to_fixed(weather.precip_percent)
         overcast_target = percent_to_fixed(weather.overcast_percent)
         if clear:
@@ -649,14 +658,14 @@ class WeatherSchedule:
 # ---------------------------------------------------------------------------
 
 CHAT_COMMANDS = ("!weather", "!storm", "!rain", "!snow", "!blizzard", "!fog",
-                 "!drizzle", "!overcast", "!clear", "!quake", "!lightning")
+                 "!drizzle", "!overcast", "!clear", "!quake", "!lightning", "!sky")
 
 MAX_MINUTES = 240
 
 
 @dataclass(frozen=True)
 class ChatRequest:
-    kind: str                      # 'weather' | 'quake' | 'lightning' | 'dynamic' | 'usage'
+    kind: str                      # 'weather' | 'quake' | 'lightning' | 'dynamic' | 'sky' | 'usage'
     weather: Optional[Weather] = None
     name: str = ""
     minutes: Optional[int] = None
@@ -714,8 +723,11 @@ def parse_chat_command(cmd: str, args: list[str]) -> ChatRequest:
             return _parse_dynamic(first, args)
         cmd = "!" + first
     name = cmd[1:]
+    if name == "sky":
+        return ChatRequest("sky")          # the Sky page reads the rest (sky.parse_chat)
     if name == "lightning":
-        return ChatRequest("lightning")
+        # "!lightning red far": the words are read by the Sky page (sky.parse_lightning)
+        return ChatRequest("lightning", name=" ".join(str(a) for a in args))
     if name == "quake":
         seconds = 5
         if args:
@@ -730,7 +742,10 @@ def parse_chat_command(cmd: str, args: list[str]) -> ChatRequest:
         if not args[0].isdigit() or not 1 <= int(args[0]) <= MAX_MINUTES:
             return ChatRequest("usage", message=f"Usage: !{name} [1-{MAX_MINUTES} minutes]")
         minutes = int(args[0])
-    return ChatRequest("weather", weather=PRESETS[name], name=name, minutes=minutes)
+    # chat "!clear" holds a dry sky for a while (Dale 2026-10-09); a one-off
+    # hand-back would be rained on again by the map's script within seconds.
+    sky = DRY if name == "clear" else PRESETS[name]
+    return ChatRequest("weather", weather=sky, name=name, minutes=minutes)
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +758,7 @@ _PROCESS_VM_WRITE = 0x0020
 _PROCESS_SUSPEND_RESUME = 0x0800
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 _PAGE_EXECUTE_READWRITE = 0x40
+_MEM_COMMIT_RESERVE = 0x3000
 _TH32CS_SNAPPROCESS = 0x00000002
 
 
@@ -850,6 +866,20 @@ class ProcessMemory:
                 nt.NtResumeProcess(handle)
         finally:
             k.CloseHandle(handle)
+
+    def alloc_code(self, size: int) -> int:
+        """Fresh memory in the server that can hold code (live patches).
+        Needs the writable handle.  Returns its address."""
+        k = self._k
+        k.VirtualAllocEx.restype = ctypes.c_void_p
+        k.VirtualAllocEx.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                                     ctypes.c_uint32, ctypes.c_uint32)
+        address = k.VirtualAllocEx(self._handle, None, size, _MEM_COMMIT_RESERVE,
+                                   _PAGE_EXECUTE_READWRITE)
+        if not address:
+            raise WeatherError("Could not make room in the server's memory "
+                               "(run WolfRAT as administrator?).")
+        return int(address)
 
     def exe_path(self) -> str:
         """Full path of the server's exe - its folder is where server.wac goes."""

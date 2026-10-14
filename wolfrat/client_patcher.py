@@ -4,7 +4,8 @@ Same rules as the server patcher (see server_patcher): the chosen exe is only
 read, the copy is written beside it, every site is checked before anything is
 written, and patches already in are left alone.  The bytes are the ones in the
 jo-server-patches client scripts (02 vehicle weapon, 05 LAA, 10 grass, 13
-spectator mode).
+spectator mode), plus the spectator fast camera (2026-10-12), which is not in
+the public script yet.
 
 Dale 2026-09-27: the admin picks the exe with Choose exe..., whatever it is
 called.  No mission memory here (a server thing).  Grass is offered, off by
@@ -69,6 +70,10 @@ _SPEC_A_VA = 0x42E410
 _SPEC_A_OFF, _SPEC_A_ON = (bytes.fromhex("6a03c705bc204d0203000000"),
                            bytes.fromhex("6a00c705bc204d0200000000"))
 _SPEC_GUARDS = (0x49A6CA, 0x49A91A, 0x49B991)                       # chat senders + talk key
+# Fast camera (Dale 2026-10-12, proven on his client): the spectator free camera
+# flies at 10 m/s; the game's own 80 / 40 / 10 (stand / crouch / prone) speeds
+# sat behind an admin flag.  je -> two nops gives them to every spectator.
+_SPEC_FAST_VA, _SPEC_FAST_OFF, _SPEC_FAST_ON = 0x4B2A49, bytes.fromhex("7424"), bytes.fromhex("9090")
 
 
 def _rel(src: int, dst: int) -> bytes:
@@ -80,7 +85,7 @@ def spectator_room(img: Image) -> bool:
 
 
 def _spectator(img: Image) -> None:                                   # 13
-    what = "Spectator mode"
+    what = "Spectator mode 2"
     if not spectator_room(img):
         raise PatchError(f"{what}: the space it needs in the exe is already used.")
     _map_cave_tail(img, what)
@@ -91,6 +96,11 @@ def _spectator(img: Image) -> None:                                   # 13
     img.put(0x5A426D, bytes.fromhex("83c41885ed"), b"\xe9" + _rel(0x5A426D, _SPEC_BAR_VA), what)
     for va in _SPEC_GUARDS:
         img.put(va, bytes.fromhex("740d833d28194c02"), bytes.fromhex("eb0d833d28194c02"), what)
+    _spectator_fast(img)
+
+
+def _spectator_fast(img: Image) -> None:                              # 13, fast camera
+    img.put(_SPEC_FAST_VA, _SPEC_FAST_OFF, _SPEC_FAST_ON, "Spectator mode 2 (update: adds the fast camera)")
 
 
 _GRASS_RADIUS_VA, _GRASS_HOOK, _GRASS_BACK, _GRASS_CAVE = 0x7DEA3C, 0x601BC5, 0x601BD0, 0x7472D0
@@ -150,10 +160,20 @@ class State:
     grass_room: bool
     server_spectator_chat: bool = False   # server patches sharing that space
     server_spawn_config: bool = False
+    spectator_fast: Optional[bool] = None
 
     @property
     def known(self) -> bool:
         return self.vehicle is not None and self.spectator is not None
+
+    @property
+    def spectator_needs_fast(self) -> bool:
+        """Spectator mode from before the fast camera: building adds just that."""
+        return bool(self.spectator) and self.spectator_fast is False
+
+    @property
+    def spectator_complete(self) -> bool:
+        return bool(self.spectator) and not self.spectator_needs_fast
 
 
 def _two_way(img: Image, va: int, off: bytes, on: bytes) -> Optional[bool]:
@@ -169,7 +189,8 @@ def state_of(exe_path: str, data: bytes) -> State:
                  spectator=_two_way(img, _SPEC_A_VA, _SPEC_A_OFF, _SPEC_A_ON),
                  grass=grass, spectator_room=spectator_room(img), grass_room=grass_room(img),
                  server_spectator_chat=img.is_(0x5137C7, bytes.fromhex("e9")),
-                 server_spawn_config=img.is_(0x516BBA, bytes.fromhex("e8")))
+                 server_spawn_config=img.is_(0x516BBA, bytes.fromhex("e8")),
+                 spectator_fast=_two_way(img, _SPEC_FAST_VA, _SPEC_FAST_OFF, _SPEC_FAST_ON))
 
 
 def read_state(exe_path: str) -> State:
@@ -233,9 +254,12 @@ def plan_exe(data: bytes, state: State, choice: Choice) -> tuple:
         changed.append("Vehicle weapon fix")
     if choice.spectator and state.spectator is False:
         if why_not(state, "spectator"):
-            raise PatchError("Spectator mode: " + why_not(state, "spectator"))
+            raise PatchError("Spectator mode 2: " + why_not(state, "spectator"))
         _spectator(img)
-        changed.append("Spectator mode")
+        changed.append("Spectator mode 2")
+    elif choice.spectator and state.spectator_needs_fast:
+        _spectator_fast(img)
+        changed.append("Spectator mode 2 (update: adds the fast camera)")
     if choice.grass and state.grass is False:
         if why_not(state, "grass"):
             raise PatchError("Longer grass: " + why_not(state, "grass"))

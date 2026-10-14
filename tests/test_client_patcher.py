@@ -21,6 +21,7 @@ CLIENT.update({
     0x5CAB95: "e806f9e7ff", 0x5A426D: "83c41885ed",                  # 13 B, C
     0x49A6CA: "740d833d28194c02", 0x49A91A: "740d833d28194c02",      # 13 D
     0x49B991: "740d833d28194c02",
+    0x4B2A49: "7424",                                                # 13 fast camera
     0x7DEA3C: struct.pack("<f", 42.0).hex(),                         # 10 grass
     0x7C3DD0: struct.pack("<f", 64.0).hex(),
     0x60A45D: "d905608e7d00",
@@ -59,7 +60,7 @@ def test_everything_on_any_exe_name(tmp_path):
     result = C.build(path, all_on())
     assert open(path, "rb").read() == before                        # never touched
     assert result.exe_path == str(tmp_path / "My JO Game_wolfrat.exe")
-    assert result.changed == ["4 GB fix (Large Address Aware)", "Vehicle weapon fix", "Spectator mode",
+    assert result.changed == ["4 GB fix (Large Address Aware)", "Vehicle weapon fix", "Spectator mode 2",
                               "Longer grass (128 m)"]
     assert result.steps == ["Close the game.",
                             "Rename My JO Game.exe to My JO Game_before_wolfrat.exe (your backup).",
@@ -67,6 +68,32 @@ def test_everything_on_any_exe_name(tmp_path):
                             "Start the game."]
     after = C.read_state(result.exe_path)
     assert after.laa and after.vehicle and after.spectator and after.grass
+    assert after.spectator_fast and after.spectator_complete
+
+
+def test_spectator_from_before_the_fast_camera_gets_just_that(tmp_path):
+    """Dale 2026-10-12: his spectator exe (9dbd748b) + the two bytes at
+    0x4B2A49 = the fast-camera exe he proved in game (2e4859d4)."""
+    first = C.build(game(tmp_path), all_on(grass=False))
+    data = bytearray(open(first.exe_path, "rb").read())
+    img = P.Image(bytes(data))
+    data[img.offset(0x4B2A49):img.offset(0x4B2A49) + 2] = bytes.fromhex("7424")   # an older spectator exe
+    folder = tmp_path / "old"
+    folder.mkdir()
+    path = game(folder, data=bytes(data))
+    state = C.read_state(path)
+    assert state.spectator and state.spectator_needs_fast and not state.spectator_complete
+    assert C.default_choice(state).spectator
+    result = C.build(path, all_on(grass=False))
+    assert result.changed == ["Spectator mode 2 (update: adds the fast camera)"]
+    assert open(result.exe_path, "rb").read() == open(first.exe_path, "rb").read()
+
+
+def test_fast_camera_refuses_bytes_it_does_not_know(tmp_path):
+    path = game(tmp_path, data=fake_exe({**CLIENT, 0x4B2A49: "7524"}, laa=False))
+    with pytest.raises(P.PatchError, match="Spectator mode 2"):
+        C.build(path, all_on(grass=False))
+    assert not (tmp_path / "jointops_wolfrat.exe").exists()
 
 
 def test_building_again_changes_nothing(tmp_path):
@@ -122,7 +149,7 @@ def test_a_server_exe_takes_the_client_patches_that_fit(tmp_path):
     assert not choice.spectator and not choice.grass
     result = C.build(path, choice)
     assert result.changed == ["Vehicle weapon fix"]
-    with pytest.raises(P.PatchError, match="Spectator mode: This exe has the server's spectator chat"):
+    with pytest.raises(P.PatchError, match="Spectator mode 2: This exe has the server's spectator chat"):
         C.build(path, all_on(grass=False))
 
 
@@ -200,6 +227,22 @@ def test_page_lets_grass_be_unticked(qapp, tmp_path):
     grass.setChecked(False)
     panel.build()
     assert panel.result.changed == ["Longer grass removed"]
+
+
+def test_page_offers_the_fast_camera_on_an_older_spectator_exe(qapp, tmp_path):
+    from wolfrat.client_patcher_panel import ClientPatcherPanel
+    first = C.build(game(tmp_path), all_on(grass=False))
+    data = bytearray(open(first.exe_path, "rb").read())
+    off = P.Image(bytes(data)).offset(0x4B2A49)
+    data[off:off + 2] = bytes.fromhex("7424")
+    folder = tmp_path / "old"
+    folder.mkdir()
+    panel = ClientPatcherPanel(None)
+    panel.choose(game(folder, data=bytes(data)))
+    spec = panel.boxes["spectator"]
+    assert spec.isChecked() and spec.isEnabled() and "fast camera" in spec.text()
+    panel.build()
+    assert panel.result.changed == ["Spectator mode 2 (update: adds the fast camera)"]
 
 
 def test_page_explains_what_cannot_go_in(qapp, tmp_path):

@@ -380,3 +380,56 @@ def test_rows_are_escaped():
     from wolfrat.server_patches_panel import rows_html
     out = rows_html([f])
     assert "A &lt;b&gt; &amp; C" in out and "say &lt;co&gt;" in out and "a=1&amp;b=2" in out
+
+
+# ---- live patches on the Patches page (2026-10-09) -----------------------------
+
+def _running(server):
+    """LiveRead over test_live_patches.FakeServer (None where unmapped)."""
+    def read(address, size):
+        try:
+            return server.read(address, size)
+        except OSError:
+            return None
+    return read
+
+
+def _fake_server(kin_leg=None):
+    from tests.test_live_patches import FakeServer
+    from wolfrat import wildlife
+    server = FakeServer()
+    server._put(wildlife.KIN_LEG, kin_leg or wildlife.KIN_LEG_RETAIL)
+    server._put(wildlife.KIN_CAVE, wildlife.KIN_CAVE_FREE if kin_leg is None
+                else wildlife.KIN_CAVE_FIXED)
+    return server
+
+
+def test_live_rows_only_with_a_running_server(tmp_path):
+    keys = {f.key for f in sp.check(write(tmp_path, LIVE)).findings}
+    assert "parachute" not in keys and "sharks" not in keys
+
+
+def test_spacebar_parachute_row(tmp_path):
+    from wolfrat import live_patches as lp
+    path = write(tmp_path, LIVE)
+    server = _fake_server()
+    by = {f.key: f for f in sp.check(path, _running(server)).findings}
+    assert by["parachute"].level == sp.INFO and "Not on" in by["parachute"].detail
+    lp.chute_on(server)
+    r = sp.check(path, _running(server))
+    row = {f.key: f for f in r.findings}["parachute"]
+    assert row.level == sp.GOOD and row.detail.startswith(sp.LIVE_MARK)
+    assert "restarts" in row.detail
+    assert r.headline == sp.check(path).headline          # live rows never change the headline
+
+
+def test_shark_fix_row_says_live_or_exe(tmp_path):
+    from wolfrat import wildlife
+    server = _fake_server(kin_leg=wildlife.KIN_LEG_FIXED)
+    live = {f.key: f for f in sp.check(write(tmp_path, LIVE), _running(server)).findings}
+    assert live["sharks"].detail.startswith(sp.LIVE_MARK)
+    in_exe = {**LIVE, wildlife.KIN_LEG: wildlife.KIN_LEG_FIXED.hex()}
+    row = {f.key: f for f in sp.check(write(tmp_path, in_exe), _running(server)).findings}["sharks"]
+    assert row.detail == "In the exe."
+    stock = {f.key: f for f in sp.check(write(tmp_path, LIVE), _running(_fake_server())).findings}
+    assert stock["sharks"].level == sp.INFO

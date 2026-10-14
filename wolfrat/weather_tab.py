@@ -21,6 +21,8 @@ from wolfrat import weather_dynamic
 from wolfrat.weather_dynamic_page import DynamicPage
 from wolfrat import wildlife
 from wolfrat.weather_wildlife_page import WildlifePage
+from wolfrat.sky_page import SkyPage
+from wolfrat import sky
 from wolfrat.protocol import wire_log
 from wolfrat.runtime import DesktopRuntime
 from wolfrat.admin_commands import MAX_CHAT_LEN
@@ -28,6 +30,28 @@ from wolfrat.admin_commands import MAX_CHAT_LEN
 # A mod who types no minutes gets the Manual page's "hold for" time; when that
 # is "until I clear it", this instead - only the tab itself can hold forever.
 MOD_FALLBACK_MINUTES = 10
+
+# Every chat command a mod can use on this tab (Dale 2026-10-09: "add all the
+# commands into there").  [minutes] left out = the Manual page's time.
+ALL_COMMANDS_HELP = (
+    "<b>Weather</b> - add minutes, e.g. !storm 10<br>"
+    "!storm &nbsp;!rain &nbsp;!drizzle &nbsp;!overcast &nbsp;!fog &nbsp;!snow &nbsp;!blizzard<br>"
+    "!clear 30 &nbsp;- dry sky for 30 min, then the map's own<br>"
+    "!weather storm 10 &nbsp;- same as !storm 10<br>"
+    "<b>Changing weather</b><br>"
+    "!weather on &nbsp;/ &nbsp;!weather off<br>"
+    "!weather on rare / normal / frequent / always<br>"
+    "!weather on custom 5 20 &nbsp;- 5-20 min clear between fronts<br>"
+    "<b>Effects</b><br>"
+    "!quake 5 &nbsp;- earthquake, 5 s (40 at most)<br>"
+    "!lightning &nbsp;- a lightning flash &nbsp; !lightning far &nbsp;- distant<br>"
+    "!lightning red &nbsp;- red flash (yellow, green, blue, purple, pink, #ff00ff...;"
+    " needs the Sky page set up)<br>"
+    "<b>Sky colours</b> - switched on on the Sky page<br>"
+    "!sky toxic &nbsp;- until the map changes<br>"
+    "!sky toxic 10 &nbsp;- for 10 minutes<br>"
+    "!sky off &nbsp; !sky demo &nbsp; !sky list"
+)
 
 _PRESET_BUTTONS = (
     ("storm", "⛈️ Storm"), ("rain", "🌧️ Rain"), ("drizzle", "🌦️ Drizzle"),
@@ -128,6 +152,9 @@ class WeatherTab(QWidget):
             "wildlife": {},
         }
         self._sharks = wildlife.SharkKeeper()
+        # Other pages that work on the same server handle (the Live patches
+        # page): wants_write() / server_tick(memory, writable) / no_server(text)
+        self._server_tickers = []
         try:
             if self._settings_file.exists():
                 saved = json.loads(self._settings_file.read_text(encoding="utf-8"))
@@ -169,6 +196,18 @@ class WeatherTab(QWidget):
         self.dynamic_page.changed.connect(self._dynamic_changed)
         self.pages.addTab(self.dynamic_page, "Dynamic")
         self._dynamic_was_on = self.dynamic_page.config().enabled
+        # Sky colours (Dale 2026-10-09): after Dynamic, before Wildlife
+        self.sky_page = SkyPage(
+            self.runtime.path("wolfrat_sky.json"),
+            log=lambda text: self.log(text),
+            send_chat=self._send_chat,
+            flash=lambda far=False: self._flash("Sky", far),
+            poll_now=self.poll_now,
+            map_list=self._map_list,
+            server_dir=self._server_dir,
+            button_cls=self._button_cls,
+        )
+        self.pages.addTab(self.sky_page, "🎨 Sky")
         self.wildlife_page = WildlifePage(self._settings.get("wildlife"))
         self.wildlife_page.changed.connect(self._wildlife_changed)
         self.pages.addTab(self.wildlife_page, "🦈 Wildlife")
@@ -330,7 +369,8 @@ class WeatherTab(QWidget):
         self.mods_cb.setChecked(bool(self._settings["mods_enabled"]))
         self.mods_cb.setToolTip(
             "!storm 10   !rain   !snow   !blizzard   !fog   !drizzle   !overcast\n"
-            "!clear   !quake 5   !weather <name> [minutes]\n"
+            "!clear 30   !quake 5   !weather <name> [minutes]\n"
+            "!clear 30 = no rain or cloud for 30 min, then the map's own sky.\n"
             "No minutes typed = the 'Keep it for' time on the Manual page "
             f"({MOD_FALLBACK_MINUTES} min when that says 'until I clear it')."
         )
@@ -340,8 +380,7 @@ class WeatherTab(QWidget):
         self.announce_cb.setChecked(bool(self._settings["announce"]))
         self.announce_cb.toggled.connect(self._save)
         chat_box.addWidget(self.announce_cb)
-        cmds = QLabel("!storm 10 &nbsp; !rain &nbsp; !drizzle &nbsp; !fog &nbsp; !overcast<br>"
-                      "!snow &nbsp; !blizzard &nbsp; !clear &nbsp; !quake 5")
+        cmds = QLabel(ALL_COMMANDS_HELP)
         cmds.setTextFormat(Qt.TextFormat.RichText)
         cmds.setWordWrap(True)
         cmds.setStyleSheet("font-size: 9pt; color: #a89830;")
@@ -459,6 +498,12 @@ class WeatherTab(QWidget):
         self.status_lbl.setText("⚪ " + text)
         self.sky_lbl.setText("")
         self.wildlife_page.set_status("⚪ " + text)
+        self.sky_page.no_server(text)
+        for ticker in self._server_tickers:
+            try:
+                ticker.no_server(text)
+            except Exception as exc:                  # pragma: no cover - belt and braces
+                wire_log(f"[LIVE] {exc}")
         if text != self._last_problem:
             self._last_problem = text
             wire_log(f"[WEATHER] unavailable: {text}")
@@ -476,17 +521,23 @@ class WeatherTab(QWidget):
         controller = self._ensure(
             writable=bool(self._writable or self._schedule.active is not None
                           or self.dynamic_page.config().enabled or self._settings.get("linked")
-                          or self.wildlife_page.enabled())
+                          or self.wildlife_page.enabled()
+                          or self.sky_page.wants_write()
+                          or any(t.wants_write() for t in self._server_tickers))
         )
         if controller is None:
             return
+        held = self._schedule.active
         try:
             outcome = self._schedule.tick(controller) if self._writable else None
             reading = controller.read()
         except weather.WeatherError as exc:
             self._problem(str(exc))
             return
-        if outcome == "ended":
+        if outcome == "ended" and held is not None and held.dry:
+            self.log("Dry spell finished - the map's own weather is back.")
+            self._announce("The map's own weather is back.")
+        elif outcome == "ended":
             self.log("Timed weather finished - clearing.")
             self._announce("The weather is clearing.")
         self._set_available(True)
@@ -514,6 +565,23 @@ class WeatherTab(QWidget):
             self.active_lbl.setText(f"Holding: {active.describe()}  -  {tail}")
         self._dynamic_tick(controller, reading)
         self._wildlife_tick(controller)
+        try:
+            map_name, players, settled = self._server_context()
+            self.sky_page.server_tick(self._memory, self._writable, map_name, players, settled)
+        except Exception as exc:                      # never takes the weather down
+            wire_log(f"[SKY] {exc}")
+        for ticker in self._server_tickers:
+            try:
+                ticker.server_tick(self._memory, self._writable)
+            except Exception as exc:                  # never takes the weather down
+                wire_log(f"[LIVE] {exc}")
+
+    def add_server_ticker(self, ticker) -> None:
+        """A page that works on the same server handle (see ``_server_tickers``)."""
+        self._server_tickers.append(ticker)
+
+    def poll_now(self) -> None:
+        self._poll()
 
     # ------------------------------------------------------------ wildlife
     def _wildlife_tick(self, controller):
@@ -676,6 +744,10 @@ class WeatherTab(QWidget):
         if sky == weather.CLEAR:
             self.log(f"{who} cleared the weather.")
             self._announce("The weather is clearing.")
+        elif sky.dry:
+            span = f" for {minutes} min" if minutes else ""
+            self.log(f"{who} cleared the sky{span} (no rain or cloud).")
+            self._announce(f"Clear skies{span}.")
         else:
             span = f" for {minutes} min" if minutes else ""
             self.log(f"{who} set {label}{span} ({sky.describe()}).")
@@ -704,6 +776,7 @@ class WeatherTab(QWidget):
 
     def refresh_maps(self, *_):
         self.dynamic_page.refresh_maps()
+        self.sky_page.refresh_maps()
 
     def on_missions_updated(self, missions):
         """Same <CURRENT MISSION> parse the Sprees tab uses."""
@@ -907,6 +980,8 @@ class WeatherTab(QWidget):
     def on_mod_command(self, sender: str, cmd: str, args: list[str]) -> Optional[str]:
         """Called by the Mods tab for an authorised mod.  Returns a chat reply
         for the mod, or None when the public announcement already says it."""
+        if cmd.lower() == "!sky":
+            return self.sky_page.on_chat(sender, args)      # its own switch, on the Sky page
         if not self.mods_cb.isChecked():
             return "Weather commands are switched off in WolfRAT."
         request = weather.parse_chat_command(cmd, args)
@@ -915,11 +990,24 @@ class WeatherTab(QWidget):
         if request.kind == "dynamic":
             return self._dynamic_from_chat(sender, request)
         if request.kind == "lightning":
-            return None if self._flash(sender) else "Lightning is not set up on this server."
+            strike = sky.parse_lightning(request.name.split())
+            if strike.message:
+                return strike.message
+            if strike.colour is None:
+                return None if self._flash(sender, strike.far) else \
+                    "Lightning is not set up on this server."
+            controller = self._ensure(writable=True)
+            try:
+                can_flash = controller is not None and controller.lightning_available()
+            except weather.WeatherError:
+                can_flash = False
+            if not can_flash:
+                return "Lightning is not set up on this server."
+            return self.sky_page.coloured_strike(sender, strike.colour, strike.far)
         if request.kind == "quake":
             ok = self._quake(request.seconds, sender)
         else:
-            if request.weather == weather.CLEAR:
+            if request.name == "clear":
                 self._dynamic.end_front_now()
             minutes = request.minutes or self.minutes_spin.value() or MOD_FALLBACK_MINUTES
             ok = self._start(request.weather, request.name, minutes, sender)

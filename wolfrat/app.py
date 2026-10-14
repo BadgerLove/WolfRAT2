@@ -1,5 +1,5 @@
 """
-WolfRAT 2.9.2 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.9.3 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -25,6 +25,7 @@ from wolfrat import coop_guard
 from wolfrat import score_lead
 from wolfrat import whisper
 from wolfrat import join_country
+from wolfrat import map_weapons
 from wolfrat.weather_tab import WeatherTab, scroll_column
 from wolfrat.mod_entrance_panel import ModEntrancePanel
 from wolfrat.mod_ranks import ModRoster
@@ -53,6 +54,7 @@ from wolfrat.auto_balance_panel import AutoBalancePanel
 from wolfrat.server_link_panel import ServerLinkPanel
 from wolfrat.server_patches_panel import ServerPatchesPanel
 from wolfrat.server_patcher_panel import ServerPatcherPanel
+from wolfrat.live_patches_panel import LivePatchesPanel
 from wolfrat.client_patcher_panel import ClientPatcherPanel
 from PyQt6.QtMultimedia import QSoundEffect
 from PyQt6.QtCore import QUrl
@@ -687,6 +689,10 @@ class ServerTab(QWidget):
         patches_page = QWidget()
         self._patches_slot = QVBoxLayout(patches_page)
         self.pages.addTab(patches_page, "Patches")
+        # Live patches (Dale 2026-10-09): into the running server, gone on a restart
+        live_page = QWidget()
+        self._live_slot = QVBoxLayout(live_page)
+        self.pages.addTab(live_page, "⚡ Live patches")
         patcher_page = QWidget()
         self._patcher_slot = QVBoxLayout(patcher_page)
         self.pages.addTab(patcher_page, "Server patcher")
@@ -798,6 +804,10 @@ class ServerTab(QWidget):
     def add_patches_panel(self, panel: QWidget) -> None:
         """'Server patches' has the Patches page to itself."""
         self._patches_slot.addWidget(panel)
+
+    def add_live_panel(self, panel: QWidget) -> None:
+        """Live patches (into the running server) have their own page."""
+        self._live_slot.addWidget(panel)
 
     def add_patcher_panel(self, panel: QWidget) -> None:
         """The server patcher has the Server patcher page to itself."""
@@ -7759,18 +7769,24 @@ class MapVotingTab(QWidget):
 class WeaponsTab(QWidget):
     """Weapons Availability Matrix Tab"""
 
+    map_status_signal = pyqtSignal(str)
+
     def __init__(self, server):
         super().__init__()
         self.server = server
+        self.map_weapons = None              # map_weapons.MapWeaponsKeeper, attached by the main window
+        self._display_name = lambda filename: filename
         self._admin_futures = QtAdminDispatcher(
             parent=self, error_sink=self.server._log
         )
         self._weapons_by_row = []
+        self._row_groups = []
         self._loading = False
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
+        layout.addWidget(self._build_map_weapons())
 
         weapon_group = QGroupBox("Weapons Availability")
         weapon_layout = QVBoxLayout()
@@ -7807,16 +7823,15 @@ class WeaponsTab(QWidget):
         update_list_btn.clicked.connect(self.server.refresh_weapons)
         weapon_layout.addWidget(update_list_btn)
 
-        warn_label = QLabel(
-            "⚠️ Warning: Changing weapon/armoury settings live can crash your server.\n"
-            "Game corrupts memory pointers when weapon configs change at runtime."
-        )
-        warn_label.setWordWrap(True)
-        warn_label.setStyleSheet(
-            "background-color: #1a0000; color: #ff6040; padding: 8px; "
-            "border: 1px solid #ff4040; border-radius: 4px; font-size: 9pt; font-weight: bold;"
-        )
-        weapon_layout.addWidget(warn_label)
+
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Search:"))
+        self.weapon_search = QLineEdit()
+        self.weapon_search.setPlaceholderText("Type part of a weapon name, e.g. m4, sniper, 357, grenade")
+        self.weapon_search.setClearButtonEnabled(True)
+        self.weapon_search.textChanged.connect(self._apply_weapon_filter)
+        search_row.addWidget(self.weapon_search)
+        weapon_layout.addLayout(search_row)
 
         self.weapon_table = QTableWidget()
         self.weapon_table.setColumnCount(4)
@@ -7832,10 +7847,221 @@ class WeaponsTab(QWidget):
         weapon_group.setLayout(weapon_layout)
         layout.addWidget(weapon_group)
 
+    # ------------------------------------------------------------- map weapons
+    def _build_map_weapons(self):
+        box = QGroupBox("Map Weapons")
+        box.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Maximum)
+        col = QVBoxLayout(box)
+        self.map_enabled_cb = QCheckBox("Set the weapons for each map when it loads")
+        self.map_enabled_cb.setToolTip(
+            "When the server goes to a new map, WolfRAT sends that map's saved weapons\n"
+            "(within a few seconds, before the spawn timer runs out). Players already\n"
+            "holding a weapon keep it until they die.")
+        self.map_enabled_cb.toggled.connect(self._on_map_enabled)
+        col.addWidget(self.map_enabled_cb)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Maps without a rule:"))
+        self.map_no_rule_combo = QComboBox()
+        for key, label in map_weapons.NO_RULE_LABELS.items():
+            self.map_no_rule_combo.addItem(label, key)
+        self.map_no_rule_combo.currentIndexChanged.connect(self._on_map_no_rule)
+        row.addWidget(self.map_no_rule_combo)
+        row.addStretch()
+        col.addLayout(row)
+
+        self.map_rules_table = QTableWidget()
+        self.map_rules_table.setColumnCount(3)
+        self.map_rules_table.setHorizontalHeaderLabels(["Map", "Weapons", "Saved"])
+        self.map_rules_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.map_rules_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.map_rules_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.map_rules_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.map_rules_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.map_rules_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.map_rules_table.setMaximumHeight(130)
+        col.addWidget(self.map_rules_table)
+
+        buttons = QHBoxLayout()
+        save_btn = SatisfyingButton("Save for this map")
+        save_btn.setToolTip("Set the weapons below the way this map should have them, then click this:\n"
+                            "the current map gets those weapons every time it loads.")
+        save_btn.clicked.connect(self._save_map_rule)
+        buttons.addWidget(save_btn)
+        remove_btn = SatisfyingButton("Remove rule")
+        remove_btn.setToolTip("Delete the selected map's rule")
+        remove_btn.clicked.connect(self._remove_map_rule)
+        buttons.addWidget(remove_btn)
+        apply_btn = SatisfyingButton("Apply now")
+        apply_btn.setToolTip("Send the current map's weapons now (undoes any hand changes on this map)")
+        apply_btn.clicked.connect(self._apply_map_rule_now)
+        buttons.addWidget(apply_btn)
+        buttons.addStretch()
+        col.addLayout(buttons)
+
+        self.map_current_label = QLabel("Current map: not connected")
+        self.map_current_label.setWordWrap(True)
+        col.addWidget(self.map_current_label)
+        self.map_status_label = QLabel("Last: not run yet")
+        self.map_status_label.setWordWrap(True)
+        self.map_status_label.setStyleSheet("color: #c8c8c8;")
+        col.addWidget(self.map_status_label)
+        self.map_status_signal.connect(lambda text: self.map_status_label.setText(f"Last: {text}"))
+        return box
+
+    def attach_map_weapons(self, keeper, display_name=None):
+        self.map_weapons = keeper
+        if display_name is not None:
+            self._display_name = display_name
+        self.map_enabled_cb.blockSignals(True)
+        self.map_enabled_cb.setChecked(keeper.config.enabled)
+        self.map_enabled_cb.blockSignals(False)
+        index = self.map_no_rule_combo.findData(keeper.config.no_rule)
+        self.map_no_rule_combo.blockSignals(True)
+        self.map_no_rule_combo.setCurrentIndex(max(index, 0))
+        self.map_no_rule_combo.blockSignals(False)
+        self._refresh_map_rules()
+
+    def _refresh_map_rules(self):
+        keeper = self.map_weapons
+        rules = keeper.config.rules if keeper else []
+        self.map_rules_table.setRowCount(0)
+        for i, rule in enumerate(rules):
+            self.map_rules_table.insertRow(i)
+            shown = rule.match if not rule.label else f"{rule.label}  ({rule.match})"
+            self.map_rules_table.setItem(i, 0, QTableWidgetItem(shown))
+            self.map_rules_table.setItem(i, 1, QTableWidgetItem(rule.summary()))
+            self.map_rules_table.setItem(i, 2, QTableWidgetItem(rule.saved))
+        self._refresh_map_current()
+
+    def _refresh_map_current(self):
+        keeper = self.map_weapons
+        current = keeper.current_map if keeper else None
+        if not current:
+            self.map_current_label.setText("Current map: not known yet")
+            return
+        rule = map_weapons.rule_for(current, keeper.config.rules)
+        if rule is not None:
+            what = f"rule '{rule.match}' ({rule.summary()})"
+        else:
+            what = "no rule: " + map_weapons.NO_RULE_LABELS[keeper.config.no_rule].lower()
+        state = "" if keeper.config.enabled else "  [off]"
+        self.map_current_label.setText(f"Current map: {self._display_name(current)}  ->  {what}{state}")
+
+    def on_missions_updated(self, missions):
+        if self.map_weapons is None:
+            return
+        current = map_weapons.current_map_from_missions(missions)
+        before = self.map_weapons.current_map
+        self.map_weapons.on_map(current)
+        if current and current != before:
+            self._refresh_map_current()
+
+    def _on_map_enabled(self, checked):
+        if self.map_weapons is not None:
+            self.map_weapons.set_enabled(checked)
+            self.server._log(f"[MAP WEAPONS] {'on' if checked else 'off'}")
+            self._refresh_map_current()
+
+    def _on_map_no_rule(self, _index):
+        if self.map_weapons is not None:
+            self.map_weapons.set_no_rule(self.map_no_rule_combo.currentData())
+            self._refresh_map_current()
+
+    def _save_map_rule(self):
+        keeper = self.map_weapons
+        if keeper is None:
+            return
+        current = keeper.current_map
+        entries = list(self.server.weapon_entries)
+        if not current or not entries:
+            QMessageBox.information(self, "Map Weapons",
+                                    "Connect to the server first: WolfRAT needs the current map "
+                                    "and its weapon list.")
+            return
+        existing = map_weapons.rule_for(current, keeper.config.rules)
+        if existing is not None and map_weapons.map_key(existing.match) != map_weapons.map_key(current):
+            match = existing.match           # a partial rule (say "western") covers this map: update that one
+        else:
+            match = current
+        rule = keeper.save_rule(current, entries, label=self._display_name(current), match=match)
+        self.server._log(f"[MAP WEAPONS] saved rule '{rule.match}': {rule.summary()}")
+        self.map_status_label.setText(
+            f"Last: saved the weapons for {self._display_name(current)} ({rule.summary()})")
+        self._refresh_map_rules()
+
+    def _remove_map_rule(self):
+        keeper = self.map_weapons
+        row = self.map_rules_table.currentRow()
+        if keeper is None or row < 0 or row >= len(keeper.config.rules):
+            return
+        rule = keeper.config.rules[row]
+        answer = QMessageBox.question(self, "Map Weapons", f"Remove the weapons rule for '{rule.match}'?")
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        keeper.remove_rule(rule.match)
+        self.server._log(f"[MAP WEAPONS] removed rule '{rule.match}'")
+        self._refresh_map_rules()
+
+    def _apply_map_rule_now(self):
+        if self.map_weapons is not None:
+            self.map_weapons.apply_now()
+
+    def _note_manual_weapon_change(self):
+        if self.map_weapons is not None:
+            self.map_weapons.note_manual_change()
+
+    # Words a search can use beside the weapon's own name.
+    # Whole names after "WPN_" (so "m24" does not catch the M249).
+    _WEAPON_SEARCH_WORDS = {
+        "sniper": ("dragunov", "l115a", "sr25", "m21", "m24", "barret", "m14_aimpoint"),
+        "pistol": ("colt45", "m9beretta", "357", "mk23", "glock17"),
+        "shotgun": ("remmingtonsg",),
+        "machine gun": ("pkm", "rpk", "m249saw", "m60", "mag58"),
+    }
+
+    def _weapon_matches(self, weapon, text):
+        text = text.strip().lower()
+        if not text:
+            return True
+        name = weapon.name.lower()
+        if text in name or text.replace(" ", "") in name.replace("_", ""):
+            return True
+        for word, parts in self._WEAPON_SEARCH_WORDS.items():
+            if word.startswith(text) or text.startswith(word):
+                if name.removeprefix("wpn_") in parts:
+                    return True
+        return False
+
+    def _apply_weapon_filter(self, *_):
+        text = self.weapon_search.text()
+        for row, weapon in enumerate(self._weapons_by_row):
+            self.weapon_table.setRowHidden(row, not self._weapon_matches(weapon, text))
+
     def update_weapons(self, weapons):
         """Render the authoritative ADMDEF list returned by retail."""
+        weapons = list(weapons)
+        same_rows = (
+            self.weapon_table.rowCount() == len(weapons)
+            and len(getattr(self, "_row_groups", ())) == len(weapons)
+            and [(w.admdef_id, w.name) for w in weapons]
+            == [(w.admdef_id, w.name) for w in self._weapons_by_row]
+        )
+        if same_rows:
+            # Same weapons: move the ticks only, so the list stays where the admin scrolled it.
+            self._loading = True
+            self._weapons_by_row = weapons
+            column = {WeaponMode.ALWAYS: 1, WeaponMode.ARMORY: 2, WeaponMode.NEVER: 3}
+            for group, weapon in zip(self._row_groups, weapons):
+                button = group.button(column[weapon.mode])
+                if button is not None and not button.isChecked():
+                    button.setChecked(True)
+            self._loading = False
+            return
+        scroll = self.weapon_table.verticalScrollBar().value()
         self._loading = True
-        self._weapons_by_row = list(weapons)
+        self._weapons_by_row = weapons
+        self._row_groups = []
         self.weapon_table.setRowCount(0)
         for i, weapon in enumerate(self._weapons_by_row):
             self.weapon_table.insertRow(i)
@@ -7847,6 +8073,7 @@ class WeaponsTab(QWidget):
 
             bg_group = QButtonGroup(self)
             bg_group.setExclusive(True)
+            self._row_groups.append(bg_group)
 
             for col in range(1, 4):
                 cb = QRadioButton()
@@ -7869,6 +8096,8 @@ class WeaponsTab(QWidget):
 
                 cb.toggled.connect(lambda checked, r=i, c=col: self._on_weapon_toggled(checked, r, c))
         self._loading = False
+        self._apply_weapon_filter()
+        self.weapon_table.verticalScrollBar().setValue(scroll)
 
     def _on_weapon_toggled(self, checked, row, col):
         if self._loading or not checked or row >= len(self._weapons_by_row):
@@ -7879,6 +8108,7 @@ class WeaponsTab(QWidget):
             3: WeaponMode.NEVER,
         }[col]
         weapon = self._weapons_by_row[row]
+        self._note_manual_weapon_change()
         submit_admin(
             self,
             lambda: self.server.set_weapon(weapon.admdef_id, mode),
@@ -7890,6 +8120,7 @@ class WeaponsTab(QWidget):
         )
 
     def _set_all_weapons(self, mode):
+        self._note_manual_weapon_change()
         submit_admin(
             self,
             lambda: self.server.set_all_weapons(mode),
@@ -8285,7 +8516,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.9.2 Main Window."""
+    """WolfRAT 2.9.3 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -8304,7 +8535,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.9.2 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.9.3 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -8365,6 +8596,7 @@ class MainWindow(QMainWindow):
         self.signals.settings_signal.connect(self.settings_tab.update_settings)
         self.signals.settings_signal.connect(self.server_tab.update_settings)
         self.signals.weapons_signal.connect(self.weapons_tab.update_weapons)
+        self._start_map_weapons()
         # Link settings tab to map voting tab for GameTime sync
         self.settings_tab._map_voting_tab = self.map_voting_tab
         self.signals.settings_signal.connect(lambda s: self._update_title(s.get('servername', '')))
@@ -8379,7 +8611,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.9.2 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.9.3 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -8397,9 +8629,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.9.2 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.9.3 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.9.2 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.9.3 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -8407,7 +8639,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.9.2")
+        header = QLabel("WolfRAT 2.9.3")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -8461,6 +8693,18 @@ class MainWindow(QMainWindow):
             ],
         )
         self.server._weather_tab = self.weather_tab  # mods system forwards !storm etc.
+
+        def sky_minutes_left():
+            """Whole minutes left on the map from the server's game time (the Map
+            Voting tab keeps it), None when unknown, stale or untimed."""
+            tab = self.map_voting_tab
+            updated = getattr(tab, "_server_time_updated", 0) or 0
+            if not updated or time.time() - updated > 60:
+                return None
+            if not (getattr(tab, "_server_game_time_total", 0) or 0):
+                return None
+            return getattr(tab, "_server_game_time_remaining", None)
+        self.weather_tab.sky_page.time_left = sky_minutes_left
         self.server_link_panel = ServerLinkPanel(
             self.weather_tab.link_state,
             self.weather_tab.link_to_server,
@@ -8473,6 +8717,13 @@ class MainWindow(QMainWindow):
         self.server_patches_panel = ServerPatchesPanel(self.weather_tab.server_exe, self.weather_tab.read_server)
         self.weather_tab.link_changed.connect(self.server_patches_panel.refresh)
         self.server_tab.add_patches_panel(self.server_patches_panel)
+        self.live_patches_panel = LivePatchesPanel(
+            self.runtime.path("wolfrat_live_patches.json"),
+            log=self.server_tab.log,
+            poll_now=self.weather_tab.poll_now,
+        )
+        self.weather_tab.add_server_ticker(self.live_patches_panel)
+        self.server_tab.add_live_panel(self.live_patches_panel)
         self.server_patcher_panel = ServerPatcherPanel(self.weather_tab.server_exe, self.weather_tab.read_server)
         self.weather_tab.link_changed.connect(lambda *_: self.server_patcher_panel.refresh())
         self.server_tab.add_patcher_panel(self.server_patcher_panel)
@@ -8664,7 +8915,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.9.2 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.9.3 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -8720,7 +8971,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.9.2"
+    _CURRENT_VERSION = "2.9.3"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -8903,6 +9154,21 @@ class MainWindow(QMainWindow):
     def update_status_map(self, text):
         self.status_map_label.setText(text)
 
+    def _start_map_weapons(self):
+        """Map Weapons: each map loads with its own weapons (Weapons tab)."""
+        calls = map_weapons.ServerWeapons(self.server)
+        self.map_weapons = map_weapons.MapWeaponsKeeper(
+            self.runtime.path("wolfrat_map_weapons.json"),
+            list_weapons=calls.list_weapons,
+            set_all=calls.set_all,
+            set_one=calls.set_one,
+            log=lambda text: self.server._log(text),
+            status=lambda text: self.weapons_tab.map_status_signal.emit(text),
+        )
+        self.weapons_tab.attach_map_weapons(self.map_weapons, display_name=self.missions_tab._find_display_name)
+        self.signals.missions_signal.connect(self.weapons_tab.on_missions_updated)
+        self.signals.connected_signal.connect(self.map_weapons.on_connected)
+
     def _update_status_bar(self, state):
         mode = state.get("mode", "")
         self.status_mode_label.setText(f" Game: {mode} " if mode else " Game: - ")
@@ -8964,7 +9230,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.9.2")
+    app.setApplicationName("WolfRAT 2.9.3")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -9073,7 +9339,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.9.2 STARTED ===")
+    wire_log("=== WolfRAT 2.9.3 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -9126,7 +9392,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.9.2",
+                "2.9.3",
                 data_dir=runtime.data_dir,
             )
         except Exception:

@@ -36,7 +36,7 @@ def test_off_status_custom_range_and_nonsense():
 def test_the_old_weather_commands_still_parse_the_same():
     assert w.parse_chat_command("!weather", ["storm", "10"]).minutes == 10
     assert w.parse_chat_command("!storm", []).kind == "weather"
-    assert w.parse_chat_command("!weather", ["clear"]).weather == w.CLEAR
+    assert w.parse_chat_command("!weather", ["clear"]).weather == w.DRY
 
 
 # ------------------------------------------------------------- real widgets

@@ -30,9 +30,11 @@ TICKS = (   # key, label, doc page, what it does
     ("vehicle", "Vehicle weapon fix", "02-vehicle-weapon-restore.md",
      "Getting out of a vehicle gives you back the weapon you were holding, not the one you "
      "last died with."),
-    ("spectator", "Spectator mode", "13-spectator-hud-client.md",
+    ("spectator", "Spectator mode 2", "13-spectator-hud-client.md",
      "When spectating: chat, blue/red name tags and a health bar over every player, and T/Y "
-     "chat works. Your chat only reaches players on servers with the spectator chat patch."),
+     "chat works. Your chat only reaches players on servers with the spectator chat patch. "
+     "The free camera flies faster: standing is fast, crouch is medium, prone is the old slow "
+     "speed."),
     ("grass", "Longer grass (128 m)", "10-grass-128m.md",
      "Extends grass out to 128 m. If other players do not have it, it can put you at a "
      "disadvantage: they see past grass that you cannot."),
@@ -168,7 +170,7 @@ class ClientPatcherPanel(QWidget):
 
     def _show(self, state: C.State, choice: C.Choice):
         have = {"laa": state.laa, "vehicle": bool(state.vehicle),
-                "spectator": bool(state.spectator), "grass": bool(state.grass)}
+                "spectator": state.spectator_complete, "grass": bool(state.grass)}
         for key, label, _doc_page, what in TICKS:
             check, note = self.boxes[key], self.notes[key]
             blocked = C.why_not(state, key) if key in ("spectator", "grass") else ""
@@ -176,7 +178,9 @@ class ClientPatcherPanel(QWidget):
             check.setChecked(have[key] or (getattr(choice, key) and not blocked))
             check.setEnabled((removable or not have[key]) and not blocked)
             check.setText(label + ("  (already in - untick to remove)" if have[key] and removable
-                                   else "  (already in)" if have[key] else ""))
+                                   else "  (already in)" if have[key]
+                                   else "  (version 1 in - this updates it to 2: fast camera)"
+                                   if key == "spectator" and state.spectator_needs_fast else ""))
             note.setText(blocked or what)
             note.setStyleSheet(_WARN if blocked else _NOTE)
 
