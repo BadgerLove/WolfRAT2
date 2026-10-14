@@ -482,6 +482,61 @@ def check_revive(exe: Exe) -> Finding:
     return Finding("revive_fall", title, UNKNOWN, "Cannot tell on this build.", doc)
 
 
+# First person in vehicles from game.cfg (22).  The game saves
+# mp_3rdperson_driver but never uses it.  The host's rules-word load at each
+# map start jumps to a cave that sets the "force first person" bit when the
+# game.cfg value is 0, and every stock client obeys it.
+FP_SITE, FP_STOCK, FP_CAVE = 0x51E94D, "a1040a5502", 0x7BFF40
+FP_CODE = "a1040a550283e0bf833da00c550200750383c840e9f9e9d5ff"
+FP_KEY = "mp_3rdperson_driver"
+
+
+def first_person_driver(exe: Exe) -> Optional[bool]:
+    """True = patch 22 in, False = stock with room for it, None = it cannot go in."""
+    here = exe.read(FP_SITE, 5)
+    if here == bytes.fromhex(FP_STOCK):
+        return False if exe.read(FP_CAVE, len(FP_CODE) // 2) == bytes(len(FP_CODE) // 2) else None
+    if (here and here[0] == 0xE9 and FP_SITE + 5 + struct.unpack("<i", here[1:5])[0] == FP_CAVE
+            and exe.is_(FP_CAVE, FP_CODE)):
+        return True
+    return None
+
+
+def first_person_by_hook(live: Optional[LiveRead]) -> bool:
+    """A hook DLL (onHook's ThirdPersonDriver) took over the same load at start-up."""
+    here = _live(live, FP_SITE, 5)
+    return (here is not None and here[0] == 0xE9
+            and (FP_SITE + 5 + struct.unpack("<i", here[1:5])[0]) & 0xFFFFFFFF != FP_CAVE)
+
+
+def check_first_person(exe: Exe, cfg: dict, live: Optional[LiveRead] = None) -> Finding:
+    doc = DOCS + "22-first-person-driver.md"
+    title = "First person lock in vehicles"
+    value = _cfg_int(cfg, FP_KEY)
+    locked = value == 0                     # missing = 1, the game's normal
+    said = f"game.cfg: {FP_KEY} = {value if value is not None else '1 (not set)'}"
+    state = first_person_driver(exe)
+    if state or (state is False and first_person_by_hook(live)):
+        who = "In" if state else "In (the hook DLL, onHook, adds it at start-up)"
+        if locked:
+            return Finding("first_person", title, GOOD,
+                           f"{who}. {said}: players are locked to first person in vehicles.", doc)
+        return Finding("first_person", title, INFO,
+                       f"{who}. {said}: third person allowed. Set it to 0 (server stopped) to lock "
+                       "first person from the next map.", doc)
+    if state is False and locked:
+        return Finding("first_person", title, WARN,
+                       f"Not in: {said}, but the game ignores it without this patch - players can "
+                       "still use third person in vehicles.", doc)
+    if state is False:
+        return Finding("first_person", title, INFO,
+                       f"Not in (optional): {FP_KEY} in game.cfg does nothing without it.", doc)
+    if exe.read(FP_SITE, 5) == bytes.fromhex(FP_STOCK):
+        return Finding("first_person", title, INFO, "Not in. This exe has no room for it "
+                       "(another patch uses the space).", doc)
+    return Finding("first_person", title, UNKNOWN, "Cannot tell on this build.", doc)
+
+
 # ---- live patches: in the RUNNING server, not the exe (Dale 2026-10-09) ---------
 
 class _LiveMemory:
@@ -557,7 +612,7 @@ def live_stamp(live: Optional[LiveRead]) -> tuple:
     return (_live(live, SPEED_VA, 1), _live(live, ARENA_SIZE_VA, 4),
             _live(live, ADMIN_FIX_VA, 4), _live(live, SPAWN_VA, 10),
             _live(live, lp.CHUTE_SITE, 5), _live(live, wildlife.KIN_LEG, 8),
-            _live(live, KEEP_DEPLOY_CALL, 5))
+            _live(live, KEEP_DEPLOY_CALL, 5), _live(live, FP_SITE, 5))
 
 
 def check(exe_path: str, live: Optional[LiveRead] = None, cfg: Optional[dict] = None) -> Report:
@@ -577,6 +632,7 @@ def check(exe_path: str, live: Optional[LiveRead] = None, cfg: Optional[dict] = 
         check_kill_list(exe), check_long_chat(exe), check_spectator(exe), check_spawn(exe, cfg, live),
         check_memory(exe, folder, live), check_laa(exe),
         check_keep(exe, "claymore", live), check_keep(exe, "at_mine", live), check_revive(exe),
+        check_first_person(exe, cfg, live),
     )
     known = sum(f.level != UNKNOWN for f in findings) >= 6
     # what was written into the running server (shown only when WolfRAT can read it)

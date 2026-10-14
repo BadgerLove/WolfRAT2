@@ -44,6 +44,7 @@ STOCK = {
     0x5047A0: "8b44240855", 0x42B910: "0fb6442404", 0x51416D: "5f33cce806692500",
     0x49A93B: "e820e6ffff", 0x49A971: "e87adaffff", 0x49A9DC: "8d4c240451",
     0x546E8B: "3b15d07d4e02", 0x546EAE: "3b05c07d4e02",      # claymore / AT mine tests
+    0x51E94D: "a1040a5502",                                  # 22: rules word load
     0x4B7D43: "f7462400000004",                              # fall damage: Indestructible test
 }
 
@@ -99,7 +100,8 @@ def hook_dll(arena=0x20000000) -> bytes:
 def everything(**kw) -> P.Choice:
     choice = P.Choice(speed=64, memory=1024, laa=True, fps_lock=True, spawn=True,
                       kill_list=True, spectator=True, long_chat=True, chat_colour=True,
-                      keep_claymores=True, keep_at_mines=True, revive_fall=True)
+                      keep_claymores=True, keep_at_mines=True, revive_fall=True,
+                      first_person=True)
     for key, value in kw.items():
         setattr(choice, key, value)
     return choice
@@ -126,7 +128,8 @@ def test_everything_on_a_stock_exe_and_the_patches_page_agrees(tmp_path):
     assert by["spawn"].detail.startswith("Set in game.cfg")         # the time is the admin's, in game.cfg
     assert by["spectator"].level == sp.GOOD and "with colours" in by["long_chat"].detail
     assert result.report.headline.startswith("64 Hz · 1 GB · ~125 FPS")
-    cfg = [step for step in result.steps if "game.cfg in the server folder" in step]
+    assert P.FP_STEP in result.steps                                # first person: the admin picks 0 or 1
+    cfg = [step for step in result.steps if "game.cfg in the server folder" in step and step != P.FP_STEP]
     assert cfg == ["With the server still stopped (game.cfg cannot be changed while it runs), "
                    "open game.cfg in the server folder (next to jointops.exe) and set:  "
                    "lock_framerate = 7  (7 = ~125 FPS; without it one CPU core runs at 100%). "
@@ -461,6 +464,50 @@ def test_revive_patch_leaves_a_changed_site_alone(tmp_path):
     assert state.revive_fall is None
     data, changed = P.plan_exe(open(path, "rb").read(), state, P.Choice(speed=64, revive_fall=True))
     assert P.REVIVE_WORDS not in changed and sp.Exe(data).is_(0x4B7D43, "e9aabbccdd9090")
+
+
+def test_first_person_patch_and_its_game_cfg_step(tmp_path):
+    path = server(tmp_path, cfg="lock_framerate = 7\nmp_3rdperson_driver     = 1\n")
+    state = P.read_state(path)
+    assert state.first_person is False and not P.default_choice(state).first_person
+    result = P.build(path, P.Choice(speed=64, first_person=True))
+    data = open(result.exe_path, "rb").read()
+    assert len(data) == len(open(path, "rb").read())                # the exe never grows
+    exe = sp.Exe(data)
+    assert exe.read(sp.FP_CAVE, 25) == bytes.fromhex(sp.FP_CODE)
+    assert exe.read(sp.FP_SITE, 1) == b"\xe9" and sp.first_person_driver(exe)
+    assert P.FP_WORDS in result.changed and P.FP_STEP in result.steps
+    assert result.steps.index(P.FP_STEP) < len(result.steps) - 1     # before "Start the server"
+    by = {f.key: f for f in result.report.findings}
+    assert by["first_person"].level == sp.INFO and "third person allowed" in by["first_person"].detail
+
+
+def test_first_person_page_reads_game_cfg(tmp_path):
+    plain = server(tmp_path, cfg="mp_3rdperson_driver = 0\n")
+    finding = {f.key: f for f in sp.check(plain).findings}["first_person"]
+    assert finding.level == sp.WARN and "ignores it" in finding.detail      # set, but no patch
+    folder = tmp_path / "patched"
+    folder.mkdir()
+    data = open(P.build(plain, P.Choice(speed=64, first_person=True)).exe_path, "rb").read()
+    locked = server(folder, data, cfg="mp_3rdperson_driver = 0\n")
+    finding = {f.key: f for f in sp.check(locked).findings}["first_person"]
+    assert finding.level == sp.GOOD and "locked to first person" in finding.detail
+    result = P.build(locked, P.Choice(speed=64, first_person=True, kill_list=True))
+    assert P.FP_STEP not in result.steps                            # already 0: no step
+
+
+def test_first_person_needs_its_cave_free_and_sees_onhook(tmp_path):
+    sites = dict(STOCK)
+    sites[0x7BFF50] = "aa"
+    path = server(tmp_path, fake_exe(sites))
+    assert P.read_state(path).first_person is None
+    assert "no room" in {f.key: f for f in sp.check(path).findings}["first_person"].detail
+    folder = tmp_path / "hooked"
+    folder.mkdir()
+    path = server(folder, fake_exe(), cfg="mp_3rdperson_driver = 0\n")
+    hooked = b"\xe9" + struct.pack("<i", 0x10000000 - (sp.FP_SITE + 5))
+    by = {f.key: f for f in sp.check(path, lambda a, n: hooked[:n] if a == sp.FP_SITE else None).findings}
+    assert by["first_person"].level == sp.GOOD and "onHook" in by["first_person"].detail
 
 
 def test_dll_checksum_matches_pefile_style():
