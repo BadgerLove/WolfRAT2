@@ -303,6 +303,7 @@ def _long_chat(img: Image, colour: bool) -> None:                     # 15
 
 
 REVIVE_WORDS = "Revive after a fall"                                  # 21
+FP_WORDS = "First person lock in vehicles (game.cfg)"                # 22
 KEEP_WORDS = {"claymore": "Keep claymores after a respawn", "at_mine": "Keep AT mines after a respawn"}
 
 
@@ -314,6 +315,18 @@ def _keep_device(img: Image, device: str) -> None:                    # 19 / 20
     code = bytes.fromhex(code)
     img.put(cave, bytes(len(code)), code, what)
     img.put(site, bytes.fromhex(stock), _jmp(site, cave) + b"\x90", what)
+
+
+def _first_person(img: Image) -> None:                                # 22
+    _map_cave_tail(img, FP_WORDS)
+    code = bytes.fromhex(sp.FP_CODE)
+    img.put(sp.FP_CAVE, bytes(len(code)), code, FP_WORDS)
+    img.put(sp.FP_SITE, bytes.fromhex(sp.FP_STOCK), _jmp(sp.FP_SITE, sp.FP_CAVE), FP_WORDS)
+
+
+FP_STEP = ("With the server still stopped, open game.cfg in the server folder and set "
+           "mp_3rdperson_driver = 0 to lock players to first person in vehicles "
+           "(1 = third person allowed, the game's normal). It is read at each map start.")
 
 
 def _chat_colour(img: Image, colour: bool) -> None:
@@ -365,6 +378,7 @@ class State:
     keep_claymores: Optional[bool] = None
     keep_at_mines: Optional[bool] = None
     revive_fall: Optional[bool] = None
+    first_person: Optional[bool] = None
     cfg: dict = field(default_factory=dict)
     # the running server, when it differs from the file (a hook DLL at start-up)
     admin_fix_live: bool = False
@@ -422,7 +436,8 @@ def state_of(exe_path: str, exe: sp.Exe, cfg: dict, dll_value: Optional[int]) ->
         kill_list=sp._two_way(exe, 0x504C2B, "80e201", "80e200"),
         spectator={b"\xe9": True, b"\x80": False}.get(first),
         long_chat=sp.long_chat(exe), keep_claymores=sp.keep_device(exe, "claymore"),
-        keep_at_mines=sp.keep_device(exe, "at_mine"), revive_fall=sp.revive_after_fall(exe), cfg=cfg)
+        keep_at_mines=sp.keep_device(exe, "at_mine"), revive_fall=sp.revive_after_fall(exe),
+        first_person=sp.first_person_driver(exe), cfg=cfg)
 
 
 @dataclass
@@ -439,6 +454,7 @@ class Choice:
     keep_claymores: bool = False
     keep_at_mines: bool = False
     revive_fall: bool = False
+    first_person: bool = False
 
 
 def wants_fps_lock(choice: Choice) -> bool:
@@ -486,6 +502,7 @@ def default_choice(state: State) -> Choice:
         keep_at_mines=bool(state.keep_at_mines),
         # a fix, but not proven in game yet: only on request for now
         revive_fall=bool(state.revive_fall),
+        first_person=bool(state.first_person),
     )
 
 
@@ -556,6 +573,9 @@ def plan_exe(data: bytes, state: State, choice: Choice) -> tuple:
     if choice.revive_fall and state.revive_fall is False:
         img.put(sp.REVIVE_VA, bytes.fromhex(sp.REVIVE_OFF), bytes.fromhex(sp.REVIVE_ON), REVIVE_WORDS)
         changed.append(REVIVE_WORDS)
+    if choice.first_person and state.first_person is False:
+        _first_person(img)
+        changed.append(FP_WORDS)
     return bytes(img.data), changed
 
 
@@ -622,6 +642,8 @@ def build(exe_path: str, choice: Choice, live: Optional[sp.LiveRead] = None) -> 
         steps.append(f"With the server still stopped (game.cfg cannot be changed while it runs), "
                      f"open game.cfg in the server folder (next to {exe_name}) and set:  {said}. "
                      "Add a line if it is not there.")
+    if FP_WORDS in changed and sp._cfg_int(state.cfg, sp.FP_KEY) != 0:
+        steps.append(FP_STEP)                # the admin's choice, so a step, not a required line
     steps.append("Start the server. The Patches page will show the new patches.")
     return Result(out_exe, out_dll, changed, steps, report)
 

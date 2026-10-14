@@ -201,6 +201,11 @@ class ServerPatcherPanel(QWidget):
         self.revive_box = tick(P.REVIVE_WORDS, "21-revive-after-fall.md")
         self.revive_box.setToolTip("Medics can revive a player whose body fell after death "
                                    "(off a roof, or thrown by a blast).")
+        self.fp_box = tick(P.FP_WORDS, "22-first-person-driver.md")
+        self.fp_box.setToolTip("Makes mp_3rdperson_driver in game.cfg work. After swapping the exe "
+                               "in, set mp_3rdperson_driver = 0 to lock first person in vehicles "
+                               "(1 = third person allowed). Players need nothing.")
+        box.addWidget(_note("    then set mp_3rdperson_driver = 0 in game.cfg to lock it (1 = third person)"))
         self.extras_note = _note()
         box.addWidget(self.extras_note)
         right.addWidget(extras)
@@ -347,6 +352,11 @@ class ServerPatcherPanel(QWidget):
         if state.revive_fall is None:
             self.revive_box.setChecked(False)
             self.revive_box.setEnabled(False)
+        self.fp_box.setChecked(choice.first_person)
+        self._already(self.fp_box, P.FP_WORDS, bool(state.first_person))
+        if state.first_person is None:
+            self.fp_box.setChecked(False)
+            self.fp_box.setEnabled(False)
 
         self.spawn_box.setChecked(choice.spawn)
         self._already(self.spawn_box, SPAWN_TEXT, state.spawn == "config")
@@ -449,6 +459,7 @@ class ServerPatcherPanel(QWidget):
             keep_claymores=self.claymore_box.isChecked(),
             keep_at_mines=self.mine_box.isChecked(),
             revive_fall=self.revive_box.isChecked(),
+            first_person=self.fp_box.isChecked(),
         )
 
     # ------------------------------------------------------------------

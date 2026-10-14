@@ -29,6 +29,7 @@ STOCK = {
     0x5137C7: "80bed7880100",                      # 14 S: off
     0x49A93B: "e820e6ffff", 0x49A9DC: "8d4c240451",  # 15: off
     0x546E8B: "3b15d07d4e02", 0x546EAE: "3b05c07d4e02",  # 19 / 20: off
+    0x51E94D: "a1040a5502",                        # 22: off
     0x4B7D43: "f7462400000004",                    # 21: off
 }
 LIVE = dict(STOCK)
