@@ -29,6 +29,7 @@ STOCK = {
     0x5137C7: "80bed7880100",                      # 14 S: off
     0x49A93B: "e820e6ffff", 0x49A9DC: "8d4c240451",  # 15: off
     0x546E8B: "3b15d07d4e02", 0x546EAE: "3b05c07d4e02",  # 19 / 20: off
+    0x4B7D43: "f7462400000004",                    # 21: off
 }
 LIVE = dict(STOCK)
 LIVE.update({
@@ -100,6 +101,17 @@ def test_keep_claymores_and_at_mines_each_reported(tmp_path):
     assert by["keep_claymore"].level == sp.GOOD and "claymores stay" in by["keep_claymore"].detail
     assert by["keep_at_mine"].level == sp.INFO and "AT mines go" in by["keep_at_mine"].detail
     assert by["keep_claymore"].doc.endswith("19-keep-claymores.md")
+
+
+def test_revive_after_fall_reported(tmp_path):
+    by = {f.key: f for f in sp.check(write(tmp_path, STOCK)).findings}
+    assert by["revive_fall"].level == sp.INFO and "cannot be revived" in by["revive_fall"].detail
+    sites = dict(STOCK)
+    sites[0x4B7D43] = "f7462402000004"
+    by = {f.key: f for f in sp.check(write(tmp_path, sites)).findings}
+    assert by["revive_fall"].level == sp.GOOD and by["revive_fall"].doc.endswith("21-revive-after-fall.md")
+    sites[0x4B7D43] = "e9aabbccdd9090"                  # something else there
+    assert {f.key: f for f in sp.check(write(tmp_path, sites)).findings}["revive_fall"].level == sp.UNKNOWN
 
 
 def test_stock_server_is_missing_the_crash_fix(tmp_path):

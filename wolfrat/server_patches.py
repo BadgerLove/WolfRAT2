@@ -458,6 +458,30 @@ def check_keep(exe: Exe, device: str, live: Optional[LiveRead] = None) -> Findin
     return Finding(key, title, UNKNOWN, "Cannot tell on this build.", doc)
 
 
+# Revive after a fall (21).  One byte: fall damage also skips a body that is
+# already dead, so a body that lands hard after death is not recorded as its
+# own killer, which the medic revive refuses.
+REVIVE_VA, REVIVE_OFF, REVIVE_ON = 0x4B7D43, "f7462400000004", "f7462402000004"
+
+
+def revive_after_fall(exe: Exe) -> Optional[bool]:
+    return _two_way(exe, REVIVE_VA, REVIVE_OFF, REVIVE_ON)
+
+
+def check_revive(exe: Exe) -> Finding:
+    state = revive_after_fall(exe)
+    doc = DOCS + "21-revive-after-fall.md"
+    title = "Revive after a fall"
+    if state:
+        return Finding("revive_fall", title, GOOD,
+                       "In. Medics can revive a player whose body fell after death.", doc)
+    if state is False:
+        return Finding("revive_fall", title, INFO,
+                       "Not in: a player whose body falls a long way after death (off a roof, "
+                       "thrown by a blast) cannot be revived.", doc)
+    return Finding("revive_fall", title, UNKNOWN, "Cannot tell on this build.", doc)
+
+
 # ---- live patches: in the RUNNING server, not the exe (Dale 2026-10-09) ---------
 
 class _LiveMemory:
@@ -552,7 +576,7 @@ def check(exe_path: str, live: Optional[LiveRead] = None, cfg: Optional[dict] = 
         check_admin_crash(exe, live), check_speed(exe, live), check_hole_skip(exe), check_fps(exe, cfg),
         check_kill_list(exe), check_long_chat(exe), check_spectator(exe), check_spawn(exe, cfg, live),
         check_memory(exe, folder, live), check_laa(exe),
-        check_keep(exe, "claymore", live), check_keep(exe, "at_mine", live),
+        check_keep(exe, "claymore", live), check_keep(exe, "at_mine", live), check_revive(exe),
     )
     known = sum(f.level != UNKNOWN for f in findings) >= 6
     # what was written into the running server (shown only when WolfRAT can read it)

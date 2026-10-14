@@ -44,6 +44,7 @@ STOCK = {
     0x5047A0: "8b44240855", 0x42B910: "0fb6442404", 0x51416D: "5f33cce806692500",
     0x49A93B: "e820e6ffff", 0x49A971: "e87adaffff", 0x49A9DC: "8d4c240451",
     0x546E8B: "3b15d07d4e02", 0x546EAE: "3b05c07d4e02",      # claymore / AT mine tests
+    0x4B7D43: "f7462400000004",                              # fall damage: Indestructible test
 }
 
 
@@ -98,7 +99,7 @@ def hook_dll(arena=0x20000000) -> bytes:
 def everything(**kw) -> P.Choice:
     choice = P.Choice(speed=64, memory=1024, laa=True, fps_lock=True, spawn=True,
                       kill_list=True, spectator=True, long_chat=True, chat_colour=True,
-                      keep_claymores=True, keep_at_mines=True)
+                      keep_claymores=True, keep_at_mines=True, revive_fall=True)
     for key, value in kw.items():
         setattr(choice, key, value)
     return choice
@@ -432,6 +433,34 @@ def test_keep_page_sees_onhook_taking_over_the_redeploy(tmp_path):
         return hooked[:size] if address == sp.KEEP_DEPLOY_CALL else None
     by = {f.key: f for f in sp.check(path, live).findings}
     assert "onHook" in by["keep_claymore"].detail and by["keep_claymore"].level == sp.INFO
+
+
+def test_revive_after_fall_is_one_byte_and_off_by_default(tmp_path):
+    path = server(tmp_path)
+    state = P.read_state(path)
+    assert state.revive_fall is False and not P.default_choice(state).revive_fall
+    stock = open(path, "rb").read()
+    without, _ = P.plan_exe(stock, state, P.Choice(speed=state.speed or 64))
+    with_it, changed = P.plan_exe(stock, state, P.Choice(speed=state.speed or 64, revive_fall=True))
+    assert changed[-1] == P.REVIVE_WORDS and len(with_it) == len(stock)
+    diff = [i for i, (a, b) in enumerate(zip(without, with_it)) if a != b]
+    assert len(diff) == 1 and without[diff[0]] == 0x00 and with_it[diff[0]] == 0x02
+    result = P.build(path, P.Choice(speed=64, revive_fall=True))
+    assert {f.key: f for f in result.report.findings}["revive_fall"].level == sp.GOOD
+    again = P.read_state(result.exe_path)
+    assert again.revive_fall is True and P.default_choice(again).revive_fall
+    _data, changed = P.plan_exe(open(result.exe_path, "rb").read(), again, P.default_choice(again))
+    assert P.REVIVE_WORDS not in changed                        # already in: left alone
+
+
+def test_revive_patch_leaves_a_changed_site_alone(tmp_path):
+    sites = dict(STOCK)
+    sites[0x4B7D43] = "e9aabbccdd9090"
+    path = server(tmp_path, fake_exe(sites))
+    state = P.read_state(path)
+    assert state.revive_fall is None
+    data, changed = P.plan_exe(open(path, "rb").read(), state, P.Choice(speed=64, revive_fall=True))
+    assert P.REVIVE_WORDS not in changed and sp.Exe(data).is_(0x4B7D43, "e9aabbccdd9090")
 
 
 def test_dll_checksum_matches_pefile_style():
