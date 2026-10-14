@@ -198,6 +198,9 @@ class ServerPatcherPanel(QWidget):
         # two patches, not one: a server may want one and not the other (Dale 2026-10-14)
         self.claymore_box = tick(P.KEEP_WORDS["claymore"], "19-keep-claymores.md")
         self.mine_box = tick(P.KEEP_WORDS["at_mine"], "20-keep-at-mines.md")
+        self.revive_box = tick(P.REVIVE_WORDS, "21-revive-after-fall.md")
+        self.revive_box.setToolTip("Medics can revive a player whose body fell after death "
+                                   "(off a roof, or thrown by a blast).")
         self.extras_note = _note()
         box.addWidget(self.extras_note)
         right.addWidget(extras)
@@ -339,6 +342,12 @@ class ServerPatcherPanel(QWidget):
                 box.setToolTip("This exe has something else where this patch goes "
                                "(a client exe, or patched another way).")
 
+        self.revive_box.setChecked(choice.revive_fall)
+        self._already(self.revive_box, P.REVIVE_WORDS, bool(state.revive_fall))
+        if state.revive_fall is None:
+            self.revive_box.setChecked(False)
+            self.revive_box.setEnabled(False)
+
         self.spawn_box.setChecked(choice.spawn)
         self._already(self.spawn_box, SPAWN_TEXT, state.spawn == "config")
         if state.spawn == "config":
@@ -439,6 +448,7 @@ class ServerPatcherPanel(QWidget):
             chat_colour=self.colour_box.isChecked(),
             keep_claymores=self.claymore_box.isChecked(),
             keep_at_mines=self.mine_box.isChecked(),
+            revive_fall=self.revive_box.isChecked(),
         )
 
     # ------------------------------------------------------------------

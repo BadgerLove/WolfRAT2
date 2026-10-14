@@ -302,6 +302,7 @@ def _long_chat(img: Image, colour: bool) -> None:                     # 15
     img.put(_CHAT_SEND_VA, _CHAT_STRIPPED, _CHAT_COLOUR if colour else _CHAT_PLAIN, what)
 
 
+REVIVE_WORDS = "Revive after a fall"                                  # 21
 KEEP_WORDS = {"claymore": "Keep claymores after a respawn", "at_mine": "Keep AT mines after a respawn"}
 
 
@@ -363,6 +364,7 @@ class State:
     long_chat: Optional[str]        # "off" / "plain" / "colour"
     keep_claymores: Optional[bool] = None
     keep_at_mines: Optional[bool] = None
+    revive_fall: Optional[bool] = None
     cfg: dict = field(default_factory=dict)
     # the running server, when it differs from the file (a hook DLL at start-up)
     admin_fix_live: bool = False
@@ -420,7 +422,7 @@ def state_of(exe_path: str, exe: sp.Exe, cfg: dict, dll_value: Optional[int]) ->
         kill_list=sp._two_way(exe, 0x504C2B, "80e201", "80e200"),
         spectator={b"\xe9": True, b"\x80": False}.get(first),
         long_chat=sp.long_chat(exe), keep_claymores=sp.keep_device(exe, "claymore"),
-        keep_at_mines=sp.keep_device(exe, "at_mine"), cfg=cfg)
+        keep_at_mines=sp.keep_device(exe, "at_mine"), revive_fall=sp.revive_after_fall(exe), cfg=cfg)
 
 
 @dataclass
@@ -436,6 +438,7 @@ class Choice:
     chat_colour: bool = True
     keep_claymores: bool = False
     keep_at_mines: bool = False
+    revive_fall: bool = False
 
 
 def wants_fps_lock(choice: Choice) -> bool:
@@ -481,6 +484,8 @@ def default_choice(state: State) -> Choice:
         # they change the game, so only on request
         keep_claymores=bool(state.keep_claymores),
         keep_at_mines=bool(state.keep_at_mines),
+        # a fix, but not proven in game yet: only on request for now
+        revive_fall=bool(state.revive_fall),
     )
 
 
@@ -548,6 +553,9 @@ def plan_exe(data: bytes, state: State, choice: Choice) -> tuple:
         if wanted and have is False:
             _keep_device(img, device)
             changed.append(KEEP_WORDS[device])
+    if choice.revive_fall and state.revive_fall is False:
+        img.put(sp.REVIVE_VA, bytes.fromhex(sp.REVIVE_OFF), bytes.fromhex(sp.REVIVE_ON), REVIVE_WORDS)
+        changed.append(REVIVE_WORDS)
     return bytes(img.data), changed
 
 
