@@ -43,6 +43,7 @@ STOCK = {
     0x5137C7: "80bed788010000740d833d28194c02000f8488090000",
     0x5047A0: "8b44240855", 0x42B910: "0fb6442404", 0x51416D: "5f33cce806692500",
     0x49A93B: "e820e6ffff", 0x49A971: "e87adaffff", 0x49A9DC: "8d4c240451",
+    0x546E8B: "3b15d07d4e02", 0x546EAE: "3b05c07d4e02",      # claymore / AT mine tests
 }
 
 
@@ -96,7 +97,8 @@ def hook_dll(arena=0x20000000) -> bytes:
 
 def everything(**kw) -> P.Choice:
     choice = P.Choice(speed=64, memory=1024, laa=True, fps_lock=True, spawn=True,
-                      kill_list=True, spectator=True, long_chat=True, chat_colour=True)
+                      kill_list=True, spectator=True, long_chat=True, chat_colour=True,
+                      keep_claymores=True, keep_at_mines=True)
     for key, value in kw.items():
         setattr(choice, key, value)
     return choice
@@ -347,6 +349,89 @@ def test_old_unlimited_fps_hack_is_undone_by_the_lock(tmp_path):
     result = P.build(server(tmp_path, fake_exe(hacked)), everything())
     exe = sp.Exe(open(result.exe_path, "rb").read())
     assert exe.is_(0x52B8B0, "6a01ff15d4007c00") and exe.is_(0x52B8DF, "72c7")
+
+
+def keep_bytes(data: bytes, device: str) -> tuple:
+    site, _stock, cave, code = sp.KEEP[device][:4]
+    exe = sp.Exe(data)
+    return exe.read(site, 6), exe.read(cave, len(code) // 2)
+
+
+def test_keep_claymores_and_at_mines_are_separate_patches(tmp_path):
+    stock = fake_exe()
+    for want in (("claymore",), ("at_mine",), ("claymore", "at_mine")):
+        choice = P.Choice(speed=64, keep_claymores="claymore" in want, keep_at_mines="at_mine" in want)
+        state = P.state_of("x", sp.Exe(stock), {}, None)
+        data, changed = P.plan_exe(stock, state, choice)
+        assert len(data) == len(stock)                            # the exe never grows
+        for device in ("claymore", "at_mine"):
+            site, cave = keep_bytes(data, device)
+            if device in want:
+                assert P.KEEP_WORDS[device] in changed
+                assert cave == bytes.fromhex(sp.KEEP[device][3])
+                assert site[0] == 0xE9 and site[5] == 0x90
+            else:
+                assert P.KEEP_WORDS[device] not in changed
+                assert site == bytes.fromhex(sp.KEEP[device][1]) and cave == bytes(31)
+        after = P.state_of("x", sp.Exe(data), {}, None)
+        assert after.keep_claymores is ("claymore" in want) and after.keep_at_mines is ("at_mine" in want)
+
+
+def test_keep_patches_default_off_and_the_page_reports_them(tmp_path):
+    state = P.read_state(server(tmp_path))
+    assert state.keep_claymores is False and state.keep_at_mines is False
+    choice = P.default_choice(state)
+    assert not choice.keep_claymores and not choice.keep_at_mines   # they change the game: ask first
+    by = {f.key: f for f in sp.check(server(tmp_path)).findings}
+    assert by["keep_claymore"].level == sp.INFO and by["keep_at_mine"].level == sp.INFO
+    result = P.build(server(tmp_path), P.Choice(speed=64, keep_at_mines=True))
+    by = {f.key: f for f in result.report.findings}
+    assert by["keep_at_mine"].level == sp.GOOD and by["keep_claymore"].level == sp.INFO
+    again = P.read_state(result.exe_path)
+    assert P.default_choice(again).keep_at_mines and not P.default_choice(again).keep_claymores
+
+
+def test_keep_patches_sit_with_spectator_and_long_chat(tmp_path):
+    data = open(P.build(server(tmp_path), everything()).exe_path, "rb").read()
+    exe = sp.Exe(data)
+    assert sp.long_chat(exe) == "colour" and exe.read(0x5137C7, 1) == b"\xe9"
+    assert sp.keep_device(exe, "claymore") and sp.keep_device(exe, "at_mine")
+
+
+def test_keep_patch_leaves_a_changed_site_alone(tmp_path):
+    sites = dict(STOCK)
+    sites[0x546E8B] = "e9aabbccdd90"                               # someone else's jump
+    path = server(tmp_path, fake_exe(sites))
+    state = P.read_state(path)
+    assert state.keep_claymores is None and state.keep_at_mines is False
+    data, changed = P.plan_exe(open(path, "rb").read(), state,
+                               P.Choice(speed=64, keep_claymores=True, keep_at_mines=True))
+    assert changed[-1] == P.KEEP_WORDS["at_mine"] and P.KEEP_WORDS["claymore"] not in changed
+    assert sp.Exe(data).read(0x546E8B, 6) == bytes.fromhex("e9aabbccdd90")
+    assert {f.key: f for f in sp.check(path).findings}["keep_claymore"].level == sp.UNKNOWN
+
+
+def test_keep_patch_needs_its_cave_free(tmp_path):
+    sites = dict(STOCK)
+    sites[0x7BFF00] = "aa"                                         # e.g. a client exe's spectator code
+    path = server(tmp_path, fake_exe(sites))
+    state = P.read_state(path)
+    assert state.keep_claymores is None and state.keep_at_mines is False
+    choice = P.default_choice(state)
+    choice.keep_claymores = choice.keep_at_mines = True
+    _data, changed = P.plan_exe(open(path, "rb").read(), state, choice)  # the rest still builds
+    assert P.KEEP_WORDS["at_mine"] in changed and P.KEEP_WORDS["claymore"] not in changed
+    assert "no room" in {f.key: f for f in sp.check(path).findings}["keep_claymore"].detail
+
+
+def test_keep_page_sees_onhook_taking_over_the_redeploy(tmp_path):
+    path = server(tmp_path)
+    hooked = b"\xe8" + struct.pack("<i", 0x10000000 - (sp.KEEP_DEPLOY_CALL + 5))
+
+    def live(address, size):
+        return hooked[:size] if address == sp.KEEP_DEPLOY_CALL else None
+    by = {f.key: f for f in sp.check(path, live).findings}
+    assert "onHook" in by["keep_claymore"].detail and by["keep_claymore"].level == sp.INFO
 
 
 def test_dll_checksum_matches_pefile_style():

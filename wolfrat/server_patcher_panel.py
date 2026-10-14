@@ -195,6 +195,9 @@ class ServerPatcherPanel(QWidget):
         line.addStretch(1)
         box.addLayout(line)
         self.chat_box.toggled.connect(self.colour_box.setEnabled)
+        # two patches, not one: a server may want one and not the other (Dale 2026-10-14)
+        self.claymore_box = tick(P.KEEP_WORDS["claymore"], "19-keep-claymores.md")
+        self.mine_box = tick(P.KEEP_WORDS["at_mine"], "20-keep-at-mines.md")
         self.extras_note = _note()
         box.addWidget(self.extras_note)
         right.addWidget(extras)
@@ -325,6 +328,16 @@ class ServerPatcherPanel(QWidget):
         self._already(self.chat_box, "Long chat (118 characters)", state.long_chat in ("plain", "colour"))
         self.colour_box.setChecked(choice.chat_colour)
         self.colour_box.setEnabled(choice.long_chat)
+        for box, device, have in ((self.claymore_box, "claymore", state.keep_claymores),
+                                  (self.mine_box, "at_mine", state.keep_at_mines)):
+            box.setChecked(choice.keep_claymores if device == "claymore" else choice.keep_at_mines)
+            self._already(box, P.KEEP_WORDS[device], bool(have))
+            box.setToolTip("")
+            if have is None:
+                box.setChecked(False)
+                box.setEnabled(False)
+                box.setToolTip("This exe has something else where this patch goes "
+                               "(a client exe, or patched another way).")
 
         self.spawn_box.setChecked(choice.spawn)
         self._already(self.spawn_box, SPAWN_TEXT, state.spawn == "config")
@@ -424,6 +437,8 @@ class ServerPatcherPanel(QWidget):
             spectator=self.spectator_box.isChecked(),
             long_chat=self.chat_box.isChecked(),
             chat_colour=self.colour_box.isChecked(),
+            keep_claymores=self.claymore_box.isChecked(),
+            keep_at_mines=self.mine_box.isChecked(),
         )
 
     # ------------------------------------------------------------------

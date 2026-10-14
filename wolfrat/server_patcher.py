@@ -234,7 +234,7 @@ _TEXT2_VA, _TEXT2_RAW, _TEXT2_STOCK = 0x795000, 0x2B000, 0x2AA10
 
 
 def _map_cave_tail(img: Image, what: str) -> None:
-    """Patches 14 and 15 live in the zero tail of `_text`; map it once."""
+    """Patches 14, 15, 19 and 20 live in the zero tail of `_text`; map it once."""
     sec = img.section(b"_text")
     if sec is None:
         raise PatchError(f"{what}: this exe is not the build WolfRAT knows.")
@@ -302,6 +302,19 @@ def _long_chat(img: Image, colour: bool) -> None:                     # 15
     img.put(_CHAT_SEND_VA, _CHAT_STRIPPED, _CHAT_COLOUR if colour else _CHAT_PLAIN, what)
 
 
+KEEP_WORDS = {"claymore": "Keep claymores after a respawn", "at_mine": "Keep AT mines after a respawn"}
+
+
+def _keep_device(img: Image, device: str) -> None:                    # 19 / 20
+    """Separate patches: each changes only its own device's test (Dale 2026-10-14)."""
+    what = KEEP_WORDS[device]
+    site, stock, cave, code = sp.KEEP[device][:4]
+    _map_cave_tail(img, what)
+    code = bytes.fromhex(code)
+    img.put(cave, bytes(len(code)), code, what)
+    img.put(site, bytes.fromhex(stock), _jmp(site, cave) + b"\x90", what)
+
+
 def _chat_colour(img: Image, colour: bool) -> None:
     """Long chat is already in: only switch colours on or off."""
     old, new = (_CHAT_PLAIN, _CHAT_COLOUR) if colour else (_CHAT_COLOUR, _CHAT_PLAIN)
@@ -348,6 +361,8 @@ class State:
     kill_list: Optional[bool]
     spectator: Optional[bool]
     long_chat: Optional[str]        # "off" / "plain" / "colour"
+    keep_claymores: Optional[bool] = None
+    keep_at_mines: Optional[bool] = None
     cfg: dict = field(default_factory=dict)
     # the running server, when it differs from the file (a hook DLL at start-up)
     admin_fix_live: bool = False
@@ -404,7 +419,8 @@ def state_of(exe_path: str, exe: sp.Exe, cfg: dict, dll_value: Optional[int]) ->
         fps_lock=fps, spawn=spawn,
         kill_list=sp._two_way(exe, 0x504C2B, "80e201", "80e200"),
         spectator={b"\xe9": True, b"\x80": False}.get(first),
-        long_chat=sp.long_chat(exe), cfg=cfg)
+        long_chat=sp.long_chat(exe), keep_claymores=sp.keep_device(exe, "claymore"),
+        keep_at_mines=sp.keep_device(exe, "at_mine"), cfg=cfg)
 
 
 @dataclass
@@ -418,6 +434,8 @@ class Choice:
     spectator: bool = False
     long_chat: bool = False
     chat_colour: bool = True
+    keep_claymores: bool = False
+    keep_at_mines: bool = False
 
 
 def wants_fps_lock(choice: Choice) -> bool:
@@ -460,6 +478,9 @@ def default_choice(state: State) -> Choice:
         spectator=bool(state.spectator),
         long_chat=state.long_chat in ("plain", "colour"),
         chat_colour=state.long_chat != "plain",
+        # they change the game, so only on request
+        keep_claymores=bool(state.keep_claymores),
+        keep_at_mines=bool(state.keep_at_mines),
     )
 
 
@@ -522,6 +543,11 @@ def plan_exe(data: bytes, state: State, choice: Choice) -> tuple:
         if want != state.long_chat:
             _chat_colour(img, choice.chat_colour)
             changed.append("Long chat colours " + ("on" if choice.chat_colour else "off"))
+    for device, wanted, have in (("claymore", choice.keep_claymores, state.keep_claymores),
+                                 ("at_mine", choice.keep_at_mines, state.keep_at_mines)):
+        if wanted and have is False:
+            _keep_device(img, device)
+            changed.append(KEEP_WORDS[device])
     return bytes(img.data), changed
 
 

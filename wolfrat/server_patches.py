@@ -404,6 +404,60 @@ def check_long_chat(exe: Exe) -> Finding:
     return Finding("long_chat", "Long chat", level, text, doc)
 
 
+# Keep claymores / AT mines after a respawn (19 / 20).  Each one turns a type
+# test in the redeploy clean-up into a jump to a cave in the zero tail of
+# `_text`: the device stays when its owner redeploys, and still goes when they
+# leave the server.  (device: site, stock test, cave, cave bytes, doc, words)
+KEEP_DEPLOY_CALL, KEEP_SWEEP = 0x5178D8, 0x546E00
+KEEP = {
+    "claymore": (0x546E8B, "3b15d07d4e02", 0x7BFF00,
+                 "3b15d07d4e020f85906fd8ff817c2410dd7851000f84826fd8ffe9746fd8ff",
+                 "19-keep-claymores.md", "claymores"),
+    "at_mine": (0x546EAE, "3b05c07d4e02", 0x7BFF20,
+                "3b05c07d4e020f85f46ed8ff817c2410dd7851000f84e66ed8ffe97b6fd8ff",
+                "20-keep-at-mines.md", "AT mines"),
+}
+KEEP_TITLES = {"claymore": "Keep claymores", "at_mine": "Keep AT mines"}
+
+
+def keep_device(exe: Exe, device: str) -> Optional[bool]:
+    """True = patch 19/20 in, False = stock with room for it, None = it cannot go in
+    (something else at the site, or the cave space used, as on client exes)."""
+    site, stock, cave, code = KEEP[device][:4]
+    here = exe.read(site, 6)
+    if here == bytes.fromhex(stock):
+        return False if exe.read(cave, len(code) // 2) == bytes(len(code) // 2) else None
+    if (here and here[0] == 0xE9 and here[5] == 0x90
+            and site + 5 + struct.unpack("<i", here[1:5])[0] == cave and exe.is_(cave, code)):
+        return True
+    return None
+
+
+def keep_by_hook(live: Optional[LiveRead]) -> bool:
+    """The running server's redeploy no longer calls the stock clean-up: a hook
+    DLL (onHook's KeepClaymoresOnRespawn / KeepAvMinesOnRespawn) took it over."""
+    call = _live(live, KEEP_DEPLOY_CALL, 5)
+    return (call is not None and call[0] == 0xE8
+            and (KEEP_DEPLOY_CALL + 5 + struct.unpack("<i", call[1:5])[0]) & 0xFFFFFFFF != KEEP_SWEEP)
+
+
+def check_keep(exe: Exe, device: str, live: Optional[LiveRead] = None) -> Finding:
+    doc, words = DOCS + KEEP[device][4], KEEP[device][5]
+    key, title = "keep_" + device, KEEP_TITLES[device]
+    state = keep_device(exe, device)
+    if state:
+        return Finding(key, title, GOOD, f"In. A player's {words} stay when they redeploy.", doc)
+    if state is False and keep_by_hook(live):
+        return Finding(key, title, INFO, f"Not in the exe. The hook DLL (onHook) handles the redeploy "
+                       f"clean-up in this server, so its own setting decides about {words}.", doc)
+    if state is False:
+        return Finding(key, title, INFO, f"Not in (optional): {words} go when their owner redeploys.", doc)
+    if exe.read(KEEP[device][0], 6) == bytes.fromhex(KEEP[device][1]):
+        return Finding(key, title, INFO, f"Not in: {words} go when their owner redeploys. This exe has "
+                       "no room for it (another patch uses the space).", doc)
+    return Finding(key, title, UNKNOWN, "Cannot tell on this build.", doc)
+
+
 # ---- live patches: in the RUNNING server, not the exe (Dale 2026-10-09) ---------
 
 class _LiveMemory:
@@ -478,7 +532,8 @@ def live_stamp(live: Optional[LiveRead]) -> tuple:
     from wolfrat import live_patches as lp, wildlife
     return (_live(live, SPEED_VA, 1), _live(live, ARENA_SIZE_VA, 4),
             _live(live, ADMIN_FIX_VA, 4), _live(live, SPAWN_VA, 10),
-            _live(live, lp.CHUTE_SITE, 5), _live(live, wildlife.KIN_LEG, 8))
+            _live(live, lp.CHUTE_SITE, 5), _live(live, wildlife.KIN_LEG, 8),
+            _live(live, KEEP_DEPLOY_CALL, 5))
 
 
 def check(exe_path: str, live: Optional[LiveRead] = None, cfg: Optional[dict] = None) -> Report:
@@ -497,6 +552,7 @@ def check(exe_path: str, live: Optional[LiveRead] = None, cfg: Optional[dict] = 
         check_admin_crash(exe, live), check_speed(exe, live), check_hole_skip(exe), check_fps(exe, cfg),
         check_kill_list(exe), check_long_chat(exe), check_spectator(exe), check_spawn(exe, cfg, live),
         check_memory(exe, folder, live), check_laa(exe),
+        check_keep(exe, "claymore", live), check_keep(exe, "at_mine", live),
     )
     known = sum(f.level != UNKNOWN for f in findings) >= 6
     # what was written into the running server (shown only when WolfRAT can read it)

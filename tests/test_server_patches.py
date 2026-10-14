@@ -28,6 +28,7 @@ STOCK = {
     0x516BBA: "c781240100006c020000",              # 03/12: stock 620 ticks
     0x5137C7: "80bed7880100",                      # 14 S: off
     0x49A93B: "e820e6ffff", 0x49A9DC: "8d4c240451",  # 15: off
+    0x546E8B: "3b15d07d4e02", 0x546EAE: "3b05c07d4e02",  # 19 / 20: off
 }
 LIVE = dict(STOCK)
 LIVE.update({
@@ -88,6 +89,17 @@ def test_our_live_server(tmp_path):
     by = {f.key: f for f in r.findings}
     assert by["spawn"].detail == "Set in game.cfg: e_spawn_protection = 5 seconds."
     assert "with colours" in by["long_chat"].detail
+
+
+def test_keep_claymores_and_at_mines_each_reported(tmp_path):
+    sites = dict(STOCK)
+    site, _stock, cave, code = sp.KEEP["claymore"][:4]
+    sites[site] = "e9" + struct.pack("<i", cave - (site + 5)).hex() + "90"
+    sites[cave] = code
+    by = {f.key: f for f in sp.check(write(tmp_path, sites)).findings}
+    assert by["keep_claymore"].level == sp.GOOD and "claymores stay" in by["keep_claymore"].detail
+    assert by["keep_at_mine"].level == sp.INFO and "AT mines go" in by["keep_at_mine"].detail
+    assert by["keep_claymore"].doc.endswith("19-keep-claymores.md")
 
 
 def test_stock_server_is_missing_the_crash_fix(tmp_path):
