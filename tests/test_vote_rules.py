@@ -313,3 +313,31 @@ def test_reset_on_new_map_drops_the_held_vote():
     g.hold(FIRE)
     g.reset()
     assert g.step(QUIET, 0.0) == (None, None)
+
+
+# ---- GameTime 0/0 (Dale 2026-10-15) ---------------------------------------------
+
+def test_no_match_running_never_fires():
+    """A server on its menus (just restarted) reports GameTime 0/0."""
+    decision = decide(MatchView("AS-KutuTowerAssault.BMS", 0, 0), 3, OFF, KillWatch())
+    assert not decision.fire and "no match running" in decision.status
+
+
+def test_tonights_vote_one_minute_into_kutu_does_not_happen_again():
+    """02:55 restart: menus (0/0) with nobody on, then Kutu loads (30/30),
+    Dale joins, 40 s grace - the vote must not start on the menus reading."""
+    from wolfrat.app import MapVotingTab
+    grace = vr.JoinGrace(secs=40)
+    tab = P(_join_grace=grace, _server_game_time_total=30, _server_game_time_remaining=30,
+            _server_time_updated=None, match_duration_spin=P(setValue=lambda _v: None))
+    MapVotingTab.update_game_time(tab, 0, 0)                 # menus: ignored...
+    assert tab._server_time_updated is None and tab._server_game_time_total == 30
+    assert decide(MatchView("AS-KutuTowerAssault.BMS", 0, 0), 3, OFF, KillWatch()).fire is False
+    # (had an older reading fired and been held, the 0/0 reading drops it)
+    grace.hold(decide(MatchView("AS-KutuTowerAssault.BMS", 2, 30), 3, OFF, KillWatch()))
+    assert grace.held is not None
+    MapVotingTab.update_game_time(tab, 0, 0)
+    assert grace.held is None
+    MapVotingTab.update_game_time(tab, 30, 30)               # the map is up
+    fresh = decide(MatchView("AS-KutuTowerAssault.BMS", 30, 30), 3, OFF, KillWatch())
+    assert grace.step(fresh, 1000.0) == (None, None)        # Dale joins: no vote

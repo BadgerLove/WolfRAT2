@@ -256,6 +256,10 @@ def decide(
     remaining = view.remaining_mins
     total = view.total_mins
 
+    if not total or total <= 0:
+        # GameTime 0/0: the server has no match running (menus, loading).
+        return Decision(False, status="Status: no match running. Waiting for the map...")
+
     if remaining <= trigger_mins:
         return Decision(
             True,

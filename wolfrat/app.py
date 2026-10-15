@@ -7236,6 +7236,13 @@ class MapVotingTab(QWidget):
     def update_game_time(self, total_mins, remaining_mins):
         """Called by SettingsTab when GameTime is received from server."""
         import time
+        if total_mins <= 0:
+            # 0/0 = no match running (the server is on its menus, e.g. just
+            # restarted). Not "0 minutes left": ignore it, and drop any vote
+            # held from before - it belonged to a match that is gone.
+            # (Dale 2026-10-15: a vote held from 0/0 started 1 min into Kutu.)
+            self._join_grace.reset()
+            return
         self._server_game_time_total = total_mins
         self._server_game_time_remaining = remaining_mins
         self._server_time_updated = time.time()
