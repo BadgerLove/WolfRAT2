@@ -20,6 +20,7 @@ from PyQt6.QtCore import Qt, QTimer, pyqtSignal, QObject, QAbstractTableModel, Q
 from PyQt6.QtGui import QColor, QIcon, QTextCursor
 
 from wolfrat import vote_rules
+from wolfrat import map_match
 from wolfrat import weather
 from wolfrat import coop_guard
 from wolfrat import score_lead
@@ -5204,72 +5205,34 @@ class MissionsStore:
     def prefer_tac(self, val):
         self._prefer_tac = val
 
+    def entries(self, extra_rotation=()) -> list:
+        """Every map WolfRAT knows: the rotation first (it wins a duplicate), then
+        what the server can load. ``extra_rotation`` = raw MISSION LIST lines."""
+        # The rotation only knows file names; the server's list has the proper names.
+        nice = {e['file'].casefold(): e['name'] for e in self._data.get('available', [])}
+        out = [map_match.MapEntry(nice.get(e['file'].casefold(), e['name']), e['file'], 'rotation')
+               for e in self._data.get('rotation', [])]
+        for raw in extra_rotation or ():
+            clean = self._clean(raw)
+            if clean:
+                out.append(map_match.MapEntry(nice.get(clean.casefold(), self._strip_ext(clean)),
+                                              clean, 'rotation'))
+        out += [map_match.MapEntry(e['name'], e['file'], 'available')
+                for e in self._data.get('available', [])]
+        return out
+
+    def match(self, query, extra_rotation=()) -> "map_match.MapMatch":
+        """The map a mod meant, or the choices when several fit equally well
+        (see map_match.py)."""
+        return map_match.find(query, self.entries(extra_rotation), prefer_tac=self.prefer_tac)
+
     def find(self, query):
-        """Search for a map by partial name. Returns (name, file, source) or (None, None, None).
-        source is 'rotation' or 'available'.
-        """
-        if not query:
+        """Search for a map by name. Returns (name, file, source) or (None, None, None).
+        source is 'rotation' or 'available'. Several equally good maps = None."""
+        result = self.match(query)
+        if result.entry is None:
             return None, None, None
-        q = query.lower().strip()
-        # Strip extension if user typed it
-        for ext in ('.bms', '.npj', '.npz'):
-            if q.endswith(ext):
-                q = q[:-len(ext)]
-                break
-
-        def _match(entry):
-            name_lower = entry['name'].lower()
-            if q == name_lower:
-                return True
-            if q in name_lower:
-                return True
-            # Without prefix (e.g. 'villa' matches 'AS-Villa')
-            no_pfx = name_lower
-            for pfx in ('as-', 'dm-', 'td-', 'ad-', 'tk-', 'ctf-'):
-                if no_pfx.startswith(pfx):
-                    no_pfx = no_pfx[len(pfx):]
-            return q == no_pfx or q in no_pfx
-
-        def _score(entry):
-            name_lower = entry['name'].lower()
-            if self.prefer_tac and name_lower.endswith('tac'):
-                return 2
-            return 1
-
-        best_match = None
-        best_score = -1
-
-        # Search rotation first
-        for entry in self._data.get('rotation', []):
-            if _match(entry):
-                score = _score(entry)
-                if score > best_score:
-                    best_match = (entry['name'], entry['file'], 'rotation')
-                    best_score = score
-
-        # If we found a TAC match in rotation, use it immediately
-        if best_match and best_score == 2:
-            return best_match
-
-        # Otherwise search available maps
-        best_avail_match = None
-        best_avail_score = -1
-        for entry in self._data.get('available', []):
-            if _match(entry):
-                score = _score(entry)
-                if score > best_avail_score:
-                    best_avail_match = (entry['name'], entry['file'], 'available')
-                    best_avail_score = score
-                    if best_avail_score == 2:
-                        return best_avail_match
-
-        # Prefer rotation matches (even if score=1) over available maps (score=1)
-        if best_match:
-            return best_match
-        if best_avail_match:
-            return best_avail_match
-
-        return None, None, None
+        return result.entry.name, result.entry.file, result.entry.source
 
     @property
     def rotation_count(self):
@@ -5876,36 +5839,27 @@ class ModsTab(QWidget):
                     return p
             return None
 
+        map_choices = []
+
         def find_map(name):
-            """Find map by name. Uses missions store, falls back to live server data."""
-            # Try the persistent store first
-            result = self.missions_store.find(name)
-            if result[0]:
-                return result
-            # Fallback: search live server missions data
-            if not name:
+            """Find a map by what the mod typed (map_match.py): the store, plus
+            the live rotation in case the store is behind."""
+            result = self.missions_store.match(name, extra_rotation=self.server.missions or ())
+            map_choices[:] = result.choices
+            if result.entry is None:
+                if result.choices:
+                    wire_log(f"[MODS] map '{name}' fits {len(result.choices)} maps: "
+                             + ", ".join(e.file for e in result.choices[:8]))
                 return None, None, None
-            q = name.lower().strip()
-            for ext in ('.bms', '.npj', '.npz'):
-                if q.endswith(ext):
-                    q = q[:-len(ext)]
-                    break
-            for raw in self.server.missions:
-                clean = MissionsStore._clean(raw)
-                bare = MissionsStore._strip_ext(clean)
-                if q == bare.lower() or q in bare.lower():
-                    return bare, clean, 'rotation'
-            # Try without prefix
-            for raw in self.server.missions:
-                clean = MissionsStore._clean(raw)
-                bare = MissionsStore._strip_ext(clean)
-                no_pfx = bare.lower()
-                for pfx in ('as-', 'dm-', 'td-', 'ad-', 'tk-', 'ctf-'):
-                    if no_pfx.startswith(pfx):
-                        no_pfx = no_pfx[len(pfx):]
-                if q == no_pfx or q in no_pfx:
-                    return bare, clean, 'rotation'
-            return None, None, None
+            return result.entry.name, result.entry.file, result.entry.source
+
+        def map_not_found(map_name):
+            """'Map not found', or the maps it could be (nothing is loaded on a guess)."""
+            if map_choices:
+                for line in map_match.choices_lines(map_name, map_choices):
+                    self._send_mod_chat(line, "Send map choices")
+            else:
+                self._send_mod_chat(f"Map not found: {map_name}", "Send missing map response")
 
         now = time.strftime('%H:%M:%S')
 
@@ -5976,9 +5930,7 @@ class ModsTab(QWidget):
             # Find the map
             name, filename, source = find_map(map_name)
             if not name or not filename:
-                self._send_mod_chat(
-                    f"Map not found: {map_name}", "Send missing map response"
-                )
+                map_not_found(map_name)
                 return
             mission_entry = None
             if source == "rotation":
@@ -6436,9 +6388,7 @@ class ModsTab(QWidget):
                     log_message=f"[{now}] {sender} switched to {name}",
                 )
             else:
-                self._send_mod_chat(
-                    f"Map not found: {map_name}", "Send missing map response"
-                )
+                map_not_found(map_name)
                 self.mod_log.addItem(f"[{now}] {sender} tried !map but '{map_name}' not found")
 
         elif cmd == '!add':
@@ -6456,9 +6406,7 @@ class ModsTab(QWidget):
                     ),
                 )
             else:
-                self._send_mod_chat(
-                    f"Map not found: {map_name}", "Send missing map response"
-                )
+                map_not_found(map_name)
                 self.mod_log.addItem(f"[{now}] {sender} tried !add but '{map_name}' not found")
 
         elif cmd == '!remove':
@@ -6493,9 +6441,7 @@ class ModsTab(QWidget):
                 )
                 self.mod_log.addItem(f"[{now}] {sender} tried !remove but {name} not in rotation")
             else:
-                self._send_mod_chat(
-                    f"Map not found: {map_name}", "Send missing map response"
-                )
+                map_not_found(map_name)
                 self.mod_log.addItem(f"[{now}] {sender} tried !remove but '{map_name}' not found")
 
     def _schedule_vote_milestones(self, vote_id):
