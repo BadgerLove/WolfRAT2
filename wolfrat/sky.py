@@ -30,8 +30,9 @@ Things that are true of the game and shaped this file
   own colour (999 by convention).  That snaps; it does not fade.
 * Lightning, ceiling and floor have NO "back to the map": the game stores
   whatever it is given until the map changes (day/night never touches them).
-  WolfRAT reads the map's own colour before it first changes it and writes
-  that back for "off".  Ceiling and floor light the inside of buildings
+  WolfRAT writes the map's own colour back for "off": lightning as read
+  before WolfRAT first changed it, ceiling and floor from the copy of the
+  map's .env values the game never changes.  Ceiling and floor light the inside of buildings
   (Dale saw purple rooms on 2026-10-15); stock maps have dim greys there.
 * A map change puts every colour back to the map's own on its own.
 * Players who join later miss a colour that was sent before they came, so
@@ -80,6 +81,11 @@ OFF = 999                           # "the map's own colour" for the held blocks
 LIGHTNING_COLOUR = 0x026C646C       # packed 0xRRGGBB, written by the `lightning` action
 CEILING_COLOUR = 0x026C6470         # indoor light from above, packed 0xRRGGBB (`ceiling`)
 FLOOR_COLOUR = 0x026C64D8           # indoor light from below, packed 0xRRGGBB (`floor`)
+# The map's own ceiling/floor as its .env set them.  The `ceiling`/`floor`
+# actions never write these (they set +0x2C and fade the block), so they stay
+# true all map long - even when WolfRAT is restarted with coloured rooms showing.
+CEILING_MAP_OWN = 0x026C6498        # g_EnvCeilingColorTarget
+FLOOR_MAP_OWN = 0x026C6500          # g_EnvFloorColorTarget
 ACTION_TABLE = 0x0082D290           # WAC action table, 44-byte entries, kind byte first
 ACTION_SIZE = 44
 BROADCAST_KIND = 0x0C               # kind byte of an action the server sends to players
@@ -122,7 +128,9 @@ ELEMENTS = (
 ELEMENT_KEYS = tuple(e.key for e in ELEMENTS)
 HELD_KEYS = ("fog", "horizon", "sun", "sky", "ground")   # a value over 255 = back to the map
 # No "back to the map" for these: WolfRAT reads the map's own and sends it back.
-HOME_ADDRESS = {"lightning": LIGHTNING_COLOUR, "ceiling": CEILING_COLOUR, "floor": FLOOR_COLOUR}
+# Lightning has no untouched copy (the action writes the map's value itself),
+# so it is read before WolfRAT first changes it; ceiling/floor have one.
+HOME_ADDRESS = {"lightning": LIGHTNING_COLOUR, "ceiling": CEILING_MAP_OWN, "floor": FLOOR_MAP_OWN}
 PLAIN_KEYS = tuple(HOME_ADDRESS)
 # First G of each colour in a whole look (command 110).  The first six keep the
 # 2026-10-09 slots; ceiling and floor came later and sit just below them.
@@ -240,6 +248,20 @@ BUILTIN_SCENES = (
     _scene("synthwave", "Synthwave", fog=(120, 20, 120), horizon=(255, 60, 180), sun=(255, 80, 200),
            sky=(40, 200, 255), ground=(120, 0, 160), ceiling=(150, 30, 130), floor=(20, 60, 120),
            lightning=(255, 40, 200)),
+    # Wild west, for Silver Creek (2026-10-15).  Sundown Showdown was seen live by
+    # Dale; the other three are unseen.
+    _scene("sundownshowdown", "Sundown Showdown", fog=(200, 100, 60), horizon=(255, 140, 60),
+           sun=(255, 150, 80), sky=(80, 50, 90), ground=(100, 45, 30), ceiling=(180, 120, 60),
+           floor=(80, 40, 30), lightning=(255, 220, 180)),
+    _scene("sepiatintype", "Sepia Tintype", fog=(160, 128, 96), horizon=(200, 164, 120),
+           sun=(210, 180, 140), sky=(110, 90, 65), ground=(90, 70, 48), ceiling=(140, 110, 70),
+           floor=(60, 45, 30)),
+    _scene("highnoon", "High Noon", fog=(230, 210, 170), horizon=(255, 240, 200),
+           sun=(255, 240, 210), sky=(160, 140, 110), ground=(140, 110, 70), ceiling=(110, 90, 60),
+           floor=(70, 50, 32)),
+    _scene("ghosttown", "Ghost Town", fog=(140, 140, 120), horizon=(170, 160, 140),
+           sun=(160, 160, 140), sky=(80, 90, 80), ground=(60, 60, 50), ceiling=(90, 100, 80),
+           floor=(40, 40, 32)),
 )
 
 # words a mod types that are not scene names

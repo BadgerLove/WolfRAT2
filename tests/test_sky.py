@@ -12,6 +12,7 @@ from wolfrat.sky_page import SkyPage
 
 PLAIN_ACTIONS = {"lightning": sky.LIGHTNING_COLOUR, "ceiling": sky.CEILING_COLOUR,
                  "floor": sky.FLOOR_COLOUR}
+MAP_OWN = {"ceiling": sky.CEILING_MAP_OWN, "floor": sky.FLOOR_MAP_OWN}   # the action never writes these
 
 
 def parse_block(lines):
@@ -47,6 +48,8 @@ class FakeSkyServer:
         for action, rgb in (("lightning", lightning), ("ceiling", ceiling), ("floor", floor)):
             r, g, b = rgb
             self.poke(PLAIN_ACTIONS[action], (r << 16) | (g << 8) | b)
+            if action in MAP_OWN:
+                self.poke(MAP_OWN[action], (r << 16) | (g << 8) | b)
         for n in range(200, 256):
             self.poke(sky.g_address(n), 0)
 
@@ -120,8 +123,10 @@ def test_every_builtin_scene_is_sane():
         assert not scene.look.is_empty()
         for rgb in scene.look.colours.values():
             assert all(0 <= c <= 255 for c in rgb)
-    for name in ("zombie", "bloodmoon", "toxic", "sandstorm"):     # Dale asked for these by name
+    for name in ("zombie", "bloodmoon", "toxic", "sandstorm", "sundownshowdown", "sepiatintype",
+                 "highnoon", "ghosttown"):                       # Dale asked for these by name
         assert name in keys
+    assert sky.parse_chat(["sundown"], sky.BUILTIN_SCENES).scene.key == "sundownshowdown"
 
 
 def test_the_script_block_is_crlf_and_small():
@@ -260,6 +265,23 @@ def test_rooms_go_purple_and_come_back_to_the_maps_grey():
     assert keeper.homes["ceiling"] == (55, 55, 55)                     # read BEFORE it changed
     sender.push(keeper.off().command)
     run(server, sender, keeper)
+    assert server.colour("ceiling") == (55, 55, 55) and server.colour("floor") == (25, 25, 25)
+
+
+def test_off_gives_the_maps_own_rooms_back_even_after_a_wolfrat_restart():
+    # Dale 2026-10-15: "!sky off never cleared the inside of the buildings" -
+    # WolfRAT was restarted while coloured rooms were showing and took them as
+    # the map's own.  The map's own now comes from the copy the game never changes.
+    server = FakeSkyServer(ceiling=(55, 55, 55), floor=(25, 25, 25))
+    old = sky.SkyKeeper(clock=lambda: 0.0)
+    old.tick(map_name="M1", players=1, settled=True, map_scene=None)
+    sender = sky.Sender()
+    sender.push(old.show(sky.BUILTIN_SCENES[0], "page").command)        # purple rooms
+    run(server, sender, old)
+    fresh, sender = sky.SkyKeeper(clock=lambda: 0.0), sky.Sender()      # WolfRAT restarted
+    fresh.tick(map_name="M1", players=1, settled=True, map_scene=None)
+    sender.push(fresh.off().command)
+    run(server, sender, fresh)
     assert server.colour("ceiling") == (55, 55, 55) and server.colour("floor") == (25, 25, 25)
 
 
