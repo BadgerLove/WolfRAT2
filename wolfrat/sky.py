@@ -1,10 +1,12 @@
-"""Sky colours: fog, horizon, sunlight, sky light, ground light and lightning
-colour for a running match (Dale, 2026-10-09; proven in game 2026-10-05).
+"""Sky colours: fog, horizon, sunlight, sky light, ground light, lightning
+colour and the light inside buildings (ceiling + floor) for a running match
+(Dale, 2026-10-09; proven in game 2026-10-05; indoors proven 2026-10-15).
 
 How it gets to the players
 --------------------------
 Joint Ops already has mission-script actions for every colour (``fogcolor``,
-``skyfogcolor``, ``sun``, ``sky``, ``ground``, ``lightning``), but on a stock
+``skyfogcolor``, ``sun``, ``sky``, ``ground``, ``lightning``, ``ceiling``,
+``floor``), but on a stock
 server they never reach the players and the day/night tables overwrite them
 62 times a second.  Two things fix that, and WolfRAT needs both:
 
@@ -13,7 +15,7 @@ server they never reach the players and the day/night tables overwrite them
 * the **sky block** in the server's ``server.wac`` - a few lines that run the
   colour actions when WolfRAT asks.  WolfRAT asks the same way it asks for
   lightning: script variables are plain memory, so it writes the colours into
-  G220-G237, the fade into G243 and a command number into G248.  The script
+  G214-G237 (LOOK_SLOTS), the fade into G243 and a command number into G248.  The script
   runs once a second, does the command and puts G248 back to 0.
 
 So everything here is one command per second at most.  A whole scene is ONE
@@ -26,9 +28,11 @@ Things that are true of the game and shaped this file
   halved on the way out.  Sun, sky and ground are full scale.
 * Any value over 255 on fog, horizon, sun, sky or ground = back to the map's
   own colour (999 by convention).  That snaps; it does not fade.
-* Lightning colour has NO "back to the map": the game stores whatever it is
-  given until the map changes.  WolfRAT reads the map's own lightning colour
-  before it first changes it and writes that back for "off".
+* Lightning, ceiling and floor have NO "back to the map": the game stores
+  whatever it is given until the map changes (day/night never touches them).
+  WolfRAT reads the map's own colour before it first changes it and writes
+  that back for "off".  Ceiling and floor light the inside of buildings
+  (Dale saw purple rooms on 2026-10-15); stock maps have dim greys there.
 * A map change puts every colour back to the map's own on its own.
 * Players who join later miss a colour that was sent before they came, so
   WolfRAT sends the current look again when the player count goes up, and
@@ -60,8 +64,8 @@ def g_address(n: int) -> int:
 
 COMMAND_SLOT = 248                  # G248: what WolfRAT wants; the script resets it to 0
 FADE_SLOT = 243                     # G243: fade seconds for the command
-LOOK_FIRST_SLOT = 220               # G220..G237: 6 colours x R, G, B
-SINGLE_SLOTS = (240, 241, 242)      # G240..G242: one colour (commands 101-107)
+LOOK_FIRST_SLOT = 220               # G220..G237: the first 6 colours x R, G, B
+SINGLE_SLOTS = (240, 241, 242)      # G240..G242: one colour (commands 101-109)
 
 CMD_LOOK = 110                      # the whole look from G220-G237
 CMD_ALL_OFF = 99                    # fog, horizon, sun, sky, ground back to the map
@@ -74,6 +78,8 @@ PING_TIMEOUT = 5.0                  # seconds, with a player on the server
 OFF = 999                           # "the map's own colour" for the held blocks
 
 LIGHTNING_COLOUR = 0x026C646C       # packed 0xRRGGBB, written by the `lightning` action
+CEILING_COLOUR = 0x026C6470         # indoor light from above, packed 0xRRGGBB (`ceiling`)
+FLOOR_COLOUR = 0x026C64D8           # indoor light from below, packed 0xRRGGBB (`floor`)
 ACTION_TABLE = 0x0082D290           # WAC action table, 44-byte entries, kind byte first
 ACTION_SIZE = 44
 BROADCAST_KIND = 0x0C               # kind byte of an action the server sends to players
@@ -106,11 +112,22 @@ ELEMENTS = (
             False, "sky"),
     Element("ground", "Ground light", "Light bouncing up from the ground: a glow on walls "
             "and undersides.", False, "ground"),
+    Element("ceiling", "Indoors: ceiling", "Light from above inside buildings and under "
+            "roofs.", False, "ceiling"),
+    Element("floor", "Indoors: floor", "Light from below inside buildings: floors and the "
+            "bottom of walls.", False, "floor"),
     Element("lightning", "Lightning", "The colour of a lightning flash. Shows best when the "
             "scene is dark.", False, "lightning"),
 )
 ELEMENT_KEYS = tuple(e.key for e in ELEMENTS)
-HELD_KEYS = ELEMENT_KEYS[:5]        # the ones a value over 255 hands back to the map
+HELD_KEYS = ("fog", "horizon", "sun", "sky", "ground")   # a value over 255 = back to the map
+# No "back to the map" for these: WolfRAT reads the map's own and sends it back.
+HOME_ADDRESS = {"lightning": LIGHTNING_COLOUR, "ceiling": CEILING_COLOUR, "floor": FLOOR_COLOUR}
+PLAIN_KEYS = tuple(HOME_ADDRESS)
+# First G of each colour in a whole look (command 110).  The first six keep the
+# 2026-10-09 slots; ceiling and floor came later and sit just below them.
+LOOK_SLOTS = {"fog": 220, "horizon": 223, "sun": 226, "sky": 229, "ground": 232,
+              "lightning": 235, "ceiling": 214, "floor": 217}
 
 RGB = tuple  # (r, g, b), 0..255 each, as players see it
 
@@ -159,23 +176,30 @@ def _scene(key, label, fade=DEFAULT_FADE, **colours) -> Scene:
 
 # The first six are the 2026-10-05 scenes exactly as Dale saw them (fog and
 # horizon doubled back to what is drawn; sun/sky/ground were sent at the
-# values below).  Zombie is his green sky light + black fog from the showcase.
+# values below).  Zombie is his green sky light + black fog from the showcase,
+# with the green sun/ground and purple rooms he picked live on 2026-10-15.
 # The rest are new on 2026-10-09 and unseen in game - tune them on the page.
+# Indoor colours (ceiling/floor) on the other scenes are new on 2026-10-15 and
+# unseen in game; the natural-looking scenes keep the map's own rooms.
 BUILTIN_SCENES = (
-    _scene("zombie", "Zombie", fog=(0, 0, 0), horizon=(0, 0, 0), sky=(40, 220, 60),
+    _scene("zombie", "Zombie", fog=(0, 0, 0), horizon=(0, 0, 0), sun=(50, 110, 50),
+           sky=(40, 220, 60), ground=(10, 40, 10), ceiling=(100, 30, 130), floor=(40, 10, 55),
            lightning=(120, 255, 80)),
     _scene("bloodmoon", "Blood Moon", fog=(180, 20, 20), horizon=(220, 30, 30), sun=(100, 30, 30),
-           sky=(60, 10, 10), ground=(40, 5, 5), lightning=(255, 0, 0)),
+           sky=(60, 10, 10), ground=(40, 5, 5), ceiling=(110, 15, 15), floor=(45, 5, 5),
+           lightning=(255, 0, 0)),
     _scene("toxic", "Toxic", fog=(60, 180, 40), horizon=(80, 220, 60), sun=(70, 110, 40),
-           sky=(20, 60, 15), ground=(15, 40, 10), lightning=(60, 255, 40)),
+           sky=(20, 60, 15), ground=(15, 40, 10), ceiling=(60, 120, 30), floor=(20, 50, 10),
+           lightning=(60, 255, 40)),
     _scene("arctic", "Arctic", fog=(200, 230, 254), horizon=(220, 240, 254), sun=(90, 105, 127),
            sky=(70, 85, 110), ground=(60, 70, 90)),
     _scene("sandstorm", "Sandstorm", fog=(240, 170, 80), horizon=(250, 190, 100),
            sun=(120, 95, 60), sky=(80, 60, 30), ground=(60, 45, 20)),
     _scene("night", "Night", fog=(10, 16, 50), horizon=(16, 24, 70), sun=(15, 20, 45),
-           sky=(8, 10, 30), ground=(4, 5, 15)),
+           sky=(8, 10, 30), ground=(4, 5, 15), ceiling=(15, 20, 45), floor=(5, 8, 20)),
     _scene("inferno", "Inferno", fog=(240, 100, 10), horizon=(254, 140, 20), sun=(127, 70, 20),
-           sky=(90, 30, 5), ground=(100, 30, 0), lightning=(255, 120, 0)),
+           sky=(90, 30, 5), ground=(100, 30, 0), ceiling=(130, 60, 15), floor=(70, 20, 0),
+           lightning=(255, 120, 0)),
     _scene("golden", "Golden Hour", fog=(230, 160, 90), horizon=(255, 170, 80),
            sun=(255, 180, 110), sky=(120, 90, 70), ground=(90, 60, 40)),
     _scene("dawn", "Dawn", fog=(200, 150, 170), horizon=(255, 180, 150), sun=(255, 200, 170),
@@ -183,17 +207,22 @@ BUILTIN_SCENES = (
     _scene("dusk", "Dusk", fog=(70, 50, 110), horizon=(140, 70, 120), sun=(150, 90, 120),
            sky=(50, 40, 90), ground=(30, 25, 50)),
     _scene("eclipse", "Eclipse", fog=(20, 15, 20), horizon=(255, 140, 40), sun=(40, 30, 30),
-           sky=(20, 20, 30), ground=(10, 8, 10), lightning=(255, 200, 120)),
+           sky=(20, 20, 30), ground=(10, 8, 10), ceiling=(30, 20, 20), floor=(15, 10, 10),
+           lightning=(255, 200, 120)),
     _scene("mars", "Mars", fog=(190, 90, 50), horizon=(220, 120, 70), sun=(230, 140, 100),
            sky=(110, 50, 30), ground=(90, 40, 20)),
     _scene("alien", "Alien", fog=(110, 30, 150), horizon=(160, 60, 220), sun=(150, 90, 220),
-           sky=(60, 200, 180), ground=(80, 20, 100), lightning=(180, 60, 255)),
+           sky=(60, 200, 180), ground=(80, 20, 100), ceiling=(40, 140, 130), floor=(60, 15, 90),
+           lightning=(180, 60, 255)),
     _scene("underwater", "Underwater", fog=(10, 70, 90), horizon=(20, 110, 130),
-           sun=(60, 150, 170), sky=(20, 80, 110), ground=(10, 50, 60)),
+           sun=(60, 150, 170), sky=(20, 80, 110), ground=(10, 50, 60), ceiling=(30, 100, 120),
+           floor=(10, 40, 50)),
     _scene("haunted", "Haunted", fog=(90, 70, 120), horizon=(60, 50, 90), sun=(90, 90, 120),
-           sky=(60, 40, 90), ground=(40, 120, 60), lightning=(180, 120, 255)),
+           sky=(60, 40, 90), ground=(40, 120, 60), ceiling=(50, 120, 70), floor=(40, 20, 60),
+           lightning=(180, 120, 255)),
     _scene("aurora", "Aurora", fog=(10, 40, 50), horizon=(40, 200, 150), sun=(60, 90, 140),
-           sky=(30, 160, 120), ground=(20, 40, 60), lightning=(80, 255, 200)),
+           sky=(30, 160, 120), ground=(20, 40, 60), ceiling=(30, 110, 90), floor=(15, 30, 50),
+           lightning=(80, 255, 200)),
     _scene("storm", "Storm Front", fog=(70, 80, 95), horizon=(90, 100, 115), sun=(110, 115, 130),
            sky=(60, 70, 85), ground=(40, 45, 55), lightning=(200, 220, 255)),
     _scene("winter", "Nuclear Winter", fog=(150, 150, 140), horizon=(170, 165, 150),
@@ -203,11 +232,14 @@ BUILTIN_SCENES = (
     _scene("jungle", "Jungle Mist", fog=(110, 140, 100), horizon=(140, 170, 130),
            sun=(190, 210, 160), sky=(80, 110, 70), ground=(50, 70, 40)),
     _scene("ghost", "Ghost", fog=(230, 230, 240), horizon=(240, 240, 250), sun=(220, 220, 235),
-           sky=(180, 180, 200), ground=(150, 150, 170)),
+           sky=(180, 180, 200), ground=(150, 150, 170), ceiling=(120, 120, 140),
+           floor=(70, 70, 90)),
     _scene("matrix", "Matrix", fog=(0, 60, 10), horizon=(0, 120, 30), sun=(60, 200, 80),
-           sky=(0, 120, 30), ground=(0, 60, 10), lightning=(0, 255, 60)),
+           sky=(0, 120, 30), ground=(0, 60, 10), ceiling=(0, 120, 30), floor=(0, 50, 10),
+           lightning=(0, 255, 60)),
     _scene("synthwave", "Synthwave", fog=(120, 20, 120), horizon=(255, 60, 180), sun=(255, 80, 200),
-           sky=(40, 200, 255), ground=(120, 0, 160), lightning=(255, 40, 200)),
+           sky=(40, 200, 255), ground=(120, 0, 160), ceiling=(150, 30, 130), floor=(20, 60, 120),
+           lightning=(255, 40, 200)),
 )
 
 # words a mod types that are not scene names
@@ -253,30 +285,36 @@ def sent_value(element: str, rgb: Optional[RGB]) -> tuple:
 FILENAME = "server.wac"
 BEGIN = "// >>> WolfRAT sky colours (written by WolfRAT - change it in WolfRAT, not here)"
 END = "// <<< WolfRAT sky colours"
-# Test blocks from the 2026-10-05 work: replaced by ours on install.
+# Test blocks replaced by ours on install: the 2026-10-05 work and the
+# hand-made indoor block of 2026-10-15.
 OLD_BLOCKS = (
     ("// >>> Sky colour TEST", "// <<< Sky colour TEST"),
     ("// >>> Fog colour TEST", "// <<< Fog colour TEST"),
+    ("// >>> FMJ indoor light TEST", "// <<< FMJ indoor light TEST"),
 )
 _SINGLE = ((101, ("fogcolor", "skyfogcolor")), (102, ("fogcolor",)), (103, ("skyfogcolor",)),
-           (104, ("sun",)), (105, ("sky",)), (106, ("ground",)), (107, ("lightning",)))
+           (104, ("sun",)), (105, ("sky",)), (106, ("ground",)), (107, ("lightning",)),
+           (108, ("ceiling",)), (109, ("floor",)))
+# the order the whole look runs its actions in: the 2026-10-09 six, then indoors
+_LOOK_ORDER = ("fog", "horizon", "sun", "sky", "ground", "lightning", "ceiling", "floor")
 
 
 def block_lines() -> list:
-    slots = iter(range(LOOK_FIRST_SLOT, LOOK_FIRST_SLOT + 3 * len(ELEMENTS)))
+    by_key = {e.key: e for e in ELEMENTS}
     lines = [
         BEGIN,
         "// Sky colours for WolfRAT. Needs a sky-colour server exe AND patched clients.",
         "// Does nothing unless WolfRAT asks. G248 = what to do (back to 0 when done):",
-        "//   110 whole look from G220-G237 (fog, horizon, sun, sky, ground, lightning)",
-        "//   101-107 one colour from G240-G242, 99 all back to the map, 96 ping -> 95",
+        "//   110 whole look from G214-G237 (fog, horizon, sun, sky, ground, lightning,",
+        "//   indoor ceiling + floor), 101-109 one colour from G240-G242,",
+        "//   99 all back to the map, 96 ping -> 95",
         "//   G243 = fade seconds. 999 = the map's own colour.",
         f"if eq(G{COMMAND_SLOT}, {CMD_LOOK}) then",
         f"colorfade(G{FADE_SLOT})",
     ]
-    for element in ELEMENTS:
-        r, g, b = next(slots), next(slots), next(slots)
-        lines.append(f"{element.action}(G{r}, G{g}, G{b})")
+    for key in _LOOK_ORDER:
+        first = LOOK_SLOTS[key]
+        lines.append(f"{by_key[key].action}(G{first}, G{first + 1}, G{first + 2})")
     lines += [f"set(G{COMMAND_SLOT}, 0)", "endif"]
     single = ", ".join(f"G{n}" for n in SINGLE_SLOTS)
     for code, actions in _SINGLE:
@@ -314,6 +352,18 @@ def block_installed(server_dir) -> bool:
             return BEGIN.encode("ascii") in handle.read()
     except OSError:
         return False
+
+
+def block_current(server_dir) -> bool:
+    """True when server.wac holds THIS WolfRAT's block, line for line.  An
+    older WolfRAT's block still works for what it knew, so out of date is a
+    warning (Update), not a stop."""
+    try:
+        with open(os.path.join(str(server_dir), FILENAME), "rb") as handle:
+            data = handle.read().decode("latin-1").replace("\r\n", "\n")
+    except OSError:
+        return False
+    return block_text().replace("\r\n", "\n") in data
 
 
 def old_test_block(server_dir) -> bool:
@@ -399,26 +449,28 @@ class Command:
     code: int
     writes: tuple = ()              # ((G number, value), ...) written before the code
     label: str = ""
-    # CMD_LOOK only: the lightning colour, or None = the map's own (read from
-    # the server before WolfRAT first changes it on this map)
-    lightning: Optional[RGB] = None
+    # CMD_LOOK only: ((key, colour or None), ...) for lightning, ceiling and
+    # floor.  None = the map's own, read from the server before WolfRAT first
+    # changes it on this map.
+    plain: tuple = ()
+
+    @property
+    def lightning(self) -> Optional[RGB]:
+        return dict(self.plain).get("lightning")
 
 
 def look_command(look: Look, fade: Optional[int] = None, label: str = "") -> Command:
     writes = []
-    slot = LOOK_FIRST_SLOT
-    for element in ELEMENTS:
-        if element.key != "lightning":
-            writes += list(zip(range(slot, slot + 3), sent_value(element.key,
-                                                                 look.colours.get(element.key))))
-        slot += 3
+    for key in HELD_KEYS:
+        first = LOOK_SLOTS[key]
+        writes += list(zip(range(first, first + 3), sent_value(key, look.colours.get(key))))
     writes.append((FADE_SLOT, clamp(look.fade if fade is None else fade, 0, 60)))
-    lightning = look.colours.get("lightning")
-    return Command(CMD_LOOK, tuple(writes), label,
-                   tuple(lightning) if lightning is not None else None)
+    plain = tuple((key, tuple(look.colours[key]) if look.colours.get(key) is not None else None)
+                  for key in PLAIN_KEYS)
+    return Command(CMD_LOOK, tuple(writes), label, plain)
 
 
-LIGHTNING_SLOTS = tuple(range(LOOK_FIRST_SLOT + 15, LOOK_FIRST_SLOT + 18))
+LIGHTNING_SLOTS = tuple(range(LOOK_SLOTS["lightning"], LOOK_SLOTS["lightning"] + 3))
 
 
 class Sender:
@@ -445,11 +497,11 @@ class Sender:
     def queued(self) -> list:
         return list(self._queue)
 
-    def pump(self, memory, lightning_home: Callable[[], RGB],
+    def pump(self, memory, home: Callable[[str], RGB],
              only_ping: bool = False) -> Optional[Command]:
         """Send the next command if G248 is free.  Returns what was sent.
-        ``lightning_home()`` = the map's own lightning colour (it may read the
-        server, so it is only called when a look is actually going out)."""
+        ``home(key)`` = the map's own lightning / ceiling / floor colour (it may
+        read the server, so it is only called when a look is actually going out)."""
         slot = g_address(COMMAND_SLOT)
         current = _get(memory, slot)
         if current not in CMD_FREE:
@@ -464,9 +516,11 @@ class Sender:
         self._queue.remove(command)
         writes = list(command.writes)
         if command.code == CMD_LOOK:
-            home = lightning_home()      # always first: it must be read before we change it
-            rgb = command.lightning if command.lightning is not None else home
-            writes += list(zip(LIGHTNING_SLOTS, (clamp(c, 0, 255) for c in rgb)))
+            for key, wanted in command.plain:
+                found = home(key)        # always: it must be read before we change it
+                rgb = wanted if wanted is not None else found
+                first = LOOK_SLOTS[key]
+                writes += list(zip(range(first, first + 3), (clamp(c, 0, 255) for c in rgb)))
         for n, value in writes:
             _put(memory, g_address(n), value)
         _put(memory, slot, command.code)       # the command last: the script acts on it
@@ -624,7 +678,7 @@ class SkyKeeper:
         self._clock = clock
         self.active: Optional[Active] = None
         self.map_name: Optional[str] = None
-        self.lightning_home: Optional[RGB] = None      # the map's own, read before we change it
+        self.homes: dict = {}                         # map's own lightning/ceiling/floor, read first
         self.off_for_this_map = False                 # "off" / last minute: no map rule till next map
         self._last_sent_at: Optional[float] = None
         self._last_players = 0
@@ -700,7 +754,7 @@ class SkyKeeper:
             # The load put every colour back by itself: nothing to undo.
             first = self.map_name is None
             self.map_name = map_name
-            self.lightning_home = None
+            self.homes = {}
             self.off_for_this_map = False
             self._showing = False
             self._last_sent_at = None
@@ -772,12 +826,20 @@ class SkyKeeper:
     def _command_for(self, look: Look, fade: Optional[int] = None, label: str = "") -> Command:
         return look_command(look, fade=fade, label=label)
 
+    @property
+    def lightning_home(self) -> Optional[RGB]:
+        return self.homes.get("lightning")
+
+    def home_colour(self, memory, key: str) -> RGB:
+        """The map's own lightning / ceiling / floor colour: read once per map,
+        before WolfRAT's first look goes out (the game keeps whatever it is
+        given)."""
+        if key not in self.homes:
+            self.homes[key] = unpack_rgb(_get(memory, HOME_ADDRESS[key]))
+        return self.homes[key]
+
     def home_lightning(self, memory) -> RGB:
-        """The map's own lightning colour: read once per map, before WolfRAT's
-        first look goes out (the game keeps whatever it is given)."""
-        if self.lightning_home is None:
-            self.lightning_home = unpack_rgb(_get(memory, LIGHTNING_COLOUR))
-        return self.lightning_home
+        return self.home_colour(memory, "lightning")
 
     def _send_active(self, announce: str = "", log: str = "", fade: Optional[int] = None) -> Step:
         self._showing = True
@@ -813,7 +875,8 @@ class SkyKeeper:
 
 __all__ = [
     "BUILTIN_SCENES", "CHAT_USAGE", "Command", "ELEMENTS", "ELEMENT_KEYS", "Look", "Scene",
-    "Sender", "SkyError", "SkyKeeper", "SkyRequest", "Step", "block_installed", "block_text",
+    "Sender", "SkyError", "SkyKeeper", "SkyRequest", "Step", "block_current", "block_installed",
+    "block_text",
     "chat_lines", "install_block", "look_command", "old_test_block", "parse_chat",
     "parse_colour", "scene_key", "sent_value", "server_can_do_sky", "to_hex",
 ]

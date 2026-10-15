@@ -1,6 +1,7 @@
 """Sky colours: the script block, the sender, the keeper and the Sky page,
 against a fake server that runs our server.wac block the way the game does."""
 
+import re
 import struct
 
 import pytest
@@ -9,20 +10,43 @@ from wolfrat import sky
 from wolfrat.sky_page import SkyPage
 
 
-class FakeSkyServer:
-    """Sparse memory + what our server.wac block does once a second."""
+PLAIN_ACTIONS = {"lightning": sky.LIGHTNING_COLOUR, "ceiling": sky.CEILING_COLOUR,
+                 "floor": sky.FLOOR_COLOUR}
 
-    def __init__(self, capable=True, script=True, lightning=(85, 85, 90)):
+
+def parse_block(lines):
+    """server.wac block -> {code: [(action, args), ...]}: what the game runs."""
+    program, code = {}, None
+    for line in lines:
+        match = re.fullmatch(r"if eq\(G248, (\d+)\) then", line)
+        if match:
+            code = int(match.group(1))
+            program[code] = []
+        elif line == "endif":
+            code = None
+        elif code is not None:
+            name, args = re.fullmatch(r"(\w+)\((.*)\)", line).groups()
+            program[code].append((name, [a.strip() for a in args.split(",")]))
+    return program
+
+
+class FakeSkyServer:
+    """Sparse memory + the server.wac block (the real text, parsed) run once a second."""
+
+    def __init__(self, capable=True, script=True, lightning=(85, 85, 90),
+                 ceiling=(55, 55, 55), floor=(25, 25, 25), block=None):
         self.cells = {}
         self.script = script            # is our block compiled into the running map?
         self.players = 1                # the script only runs with someone on
         self.applied = []               # (code, {action: (r, g, b)}, fade)
         self.held = {}                  # action -> colour sent (None = map's own)
+        self.program = parse_block(block if block is not None else sky.block_lines())
         for _, index in sky.SKY_ACTIONS:
             self.cells[sky.ACTION_TABLE + sky.ACTION_SIZE * index] = bytes(
                 [sky.BROADCAST_KIND if capable else 0x04])
-        r, g, b = lightning
-        self.poke(sky.LIGHTNING_COLOUR, (r << 16) | (g << 8) | b)
+        for action, rgb in (("lightning", lightning), ("ceiling", ceiling), ("floor", floor)):
+            r, g, b = rgb
+            self.poke(PLAIN_ACTIONS[action], (r << 16) | (g << 8) | b)
         for n in range(200, 256):
             self.poke(sky.g_address(n), 0)
 
@@ -44,31 +68,37 @@ class FakeSkyServer:
     def write(self, address, data):
         self.cells[address] = bytes(data)
 
+    def value(self, arg):
+        return self.g(int(arg[1:])) if arg.startswith("G") else int(arg)
+
     def run_script(self):
         if not self.script or not self.players:
             return
         code = self.g(sky.COMMAND_SLOT)
-        if code == sky.CMD_LOOK:
-            colours = {}
-            for i, element in enumerate(sky.ELEMENTS):
-                rgb = tuple(self.g(sky.LOOK_FIRST_SLOT + 3 * i + k) for k in range(3))
-                colours[element.action] = rgb
-                if element.key == "lightning":
-                    r, g, b = rgb
-                    self.poke(sky.LIGHTNING_COLOUR, (r << 16) | (g << 8) | b)
-                else:
-                    self.held[element.action] = None if rgb[0] > 255 else rgb
-            self.applied.append((code, colours, self.g(sky.FADE_SLOT)))
-            self.poke(sky.g_address(sky.COMMAND_SLOT), 0)
-        elif code == sky.CMD_LIGHTNING:              # lightning(G240, G241, G242)
-            r, g, b = (self.g(n) for n in sky.SINGLE_SLOTS)
-            self.poke(sky.LIGHTNING_COLOUR, (r << 16) | (g << 8) | b)
-            self.poke(sky.g_address(sky.COMMAND_SLOT), 0)
-        elif code == sky.CMD_PING:
-            self.poke(sky.g_address(sky.COMMAND_SLOT), sky.CMD_PONG)
+        if code not in self.program:
+            return
+        colours, fade = {}, 0
+        for name, args in self.program[code]:
+            values = [self.value(a) for a in args]
+            if name == "colorfade":
+                fade = values[0]
+            elif name == "set":
+                self.poke(sky.g_address(int(args[0][1:])), values[1])
+            elif name in PLAIN_ACTIONS:
+                r, g, b = values
+                self.poke(PLAIN_ACTIONS[name], (r << 16) | (g << 8) | b)   # no "off": kept as given
+                colours[name] = tuple(values)
+            else:
+                self.held[name] = None if values[0] > 255 else tuple(values)
+                colours[name] = tuple(values)
+        if colours:
+            self.applied.append((code, colours, fade))
+
+    def colour(self, action):
+        return sky.unpack_rgb(self.peek(PLAIN_ACTIONS[action]))
 
     def lightning(self):
-        return sky.unpack_rgb(self.peek(sky.LIGHTNING_COLOUR))
+        return self.colour("lightning")
 
 
 # ---- pure parts ---------------------------------------------------------
@@ -101,7 +131,23 @@ def test_the_script_block_is_crlf_and_small():
     code = [l for l in text.split("\r\n") if l.strip() and not l.startswith("//")]
     assert len(code) < 80                          # script space is shared with the map
     assert "lightning(G235, G236, G237)" in text
+    assert "ceiling(G214, G215, G216)" in text and "floor(G217, G218, G219)" in text
     assert f"if eq(G248, {sky.CMD_PING}) then" in text
+    # every G a whole look uses is its own: no colour shares a slot with another,
+    # the single colour (G240-242), the fade (G243) or the command (G248)
+    used = [n for key in sky.ELEMENT_KEYS for n in range(sky.LOOK_SLOTS[key], sky.LOOK_SLOTS[key] + 3)]
+    assert len(used) == len(set(used)) == 24
+    assert not set(used) & {*sky.SINGLE_SLOTS, sky.FADE_SLOT, sky.COMMAND_SLOT, 249, 250}
+
+
+def test_zombie_is_daless_purple_rooms_and_the_natural_skies_keep_the_maps_rooms():
+    zombie = next(s for s in sky.BUILTIN_SCENES if s.key == "zombie").look.colours
+    assert zombie["ceiling"] == (100, 30, 130) and zombie["floor"] == (40, 10, 55)
+    assert zombie["sun"] == (50, 110, 50) and zombie["ground"] == (10, 40, 10)
+    for key in ("haunted", "bloodmoon", "toxic", "inferno", "alien"):
+        assert "ceiling" in next(s for s in sky.BUILTIN_SCENES if s.key == key).look.colours
+    for key in ("arctic", "sandstorm", "golden", "dawn", "storm"):
+        assert "ceiling" not in next(s for s in sky.BUILTIN_SCENES if s.key == key).look.colours
 
 
 @pytest.mark.parametrize("args, kind, key, minutes", [
@@ -153,14 +199,34 @@ def test_install_keeps_the_rest_and_replaces_the_old_test_block(tmp_path):
 
 def test_install_into_an_empty_folder(tmp_path):
     assert sky.install_block(tmp_path) == "installed"
-    assert sky.block_installed(tmp_path)
+    assert sky.block_installed(tmp_path) and sky.block_current(tmp_path)
+
+
+# The 2.9.3/2.9.4 block exactly as it went out (no ceiling/floor) and the
+# hand-made indoor block that went in after it on 2026-10-15.
+OLD_293_BLOCK = [l for l in sky.block_lines() if "ceiling" not in l and "floor" not in l]
+HAND_BLOCK = ["// >>> FMJ indoor light TEST (ceiling/floor, Wendy 2026-10-15 - Dale OK'd)",
+              "if eq(G248, 108) then", "colorfade(G243)", "ceiling(G240, G241, G242)",
+              "set(G248, 0)", "endif", "if eq(G248, 109) then", "colorfade(G243)",
+              "floor(G240, G241, G242)", "set(G248, 0)", "endif", "// <<< FMJ indoor light TEST"]
+
+
+def test_an_older_block_is_out_of_date_and_update_takes_the_hand_block_out(tmp_path):
+    wac = tmp_path / "server.wac"
+    wac.write_bytes(("\r\n".join(["// mine", *OLD_293_BLOCK, *HAND_BLOCK]) + "\r\n").encode())
+    assert sky.block_installed(tmp_path) and not sky.block_current(tmp_path)
+    assert sky.install_block(tmp_path) == "updated"
+    data = wac.read_bytes()
+    assert sky.block_current(tmp_path) and b"FMJ indoor light TEST" not in data
+    assert data.startswith(b"// mine\r\n") and data.count(b"\n") == data.count(b"\r\n")
+    assert data.count(b"if eq(G248, 108) then") == 1
 
 
 # ---- sender + keeper on the fake server ---------------------------------------
 
 def run(server, sender, keeper, seconds=3):
     for _ in range(seconds):
-        sender.pump(server, lambda: keeper.home_lightning(server))
+        sender.pump(server, lambda key: keeper.home_colour(server, key))
         server.run_script()
 
 
@@ -181,6 +247,42 @@ def test_one_command_goes_out_whole_and_lightning_goes_home_after():
     run(server, sender, keeper)
     assert all(v is None for v in server.held.values())                 # all back to the map
     assert server.lightning() == (85, 85, 90)                          # no "off" for lightning
+
+
+def test_rooms_go_purple_and_come_back_to_the_maps_grey():
+    server, sender = FakeSkyServer(ceiling=(55, 55, 55), floor=(25, 25, 25)), sky.Sender()
+    keeper = sky.SkyKeeper(clock=lambda: 0.0)
+    keeper.tick(map_name="M1", players=1, settled=True, map_scene=None)
+    sender.push(keeper.show(sky.BUILTIN_SCENES[0], "page").command)      # Zombie
+    run(server, sender, keeper)
+    assert server.colour("ceiling") == (100, 30, 130) and server.colour("floor") == (40, 10, 55)
+    assert server.held["sun"] == (50, 110, 50)
+    assert keeper.homes["ceiling"] == (55, 55, 55)                     # read BEFORE it changed
+    sender.push(keeper.off().command)
+    run(server, sender, keeper)
+    assert server.colour("ceiling") == (55, 55, 55) and server.colour("floor") == (25, 25, 25)
+
+
+def test_a_scene_without_indoor_colours_leaves_the_rooms_alone():
+    server, sender = FakeSkyServer(ceiling=(70, 60, 50), floor=(30, 20, 10)), sky.Sender()
+    keeper = sky.SkyKeeper(clock=lambda: 0.0)
+    keeper.tick(map_name="M1", players=1, settled=True, map_scene=None)
+    sender.push(keeper.show(sky.BUILTIN_SCENES[0], "page").command)      # Zombie: purple rooms
+    run(server, sender, keeper)
+    arctic = next(s for s in sky.BUILTIN_SCENES if s.key == "arctic")
+    sender.push(keeper.show(arctic, "page").command)                    # no indoor colours
+    run(server, sender, keeper)
+    assert server.colour("ceiling") == (70, 60, 50) and server.colour("floor") == (30, 20, 10)
+
+
+def test_the_old_block_still_does_its_six_colours_and_ignores_indoors():
+    server, sender = FakeSkyServer(block=OLD_293_BLOCK), sky.Sender()
+    keeper = sky.SkyKeeper(clock=lambda: 0.0)
+    keeper.tick(map_name="M1", players=1, settled=True, map_scene=None)
+    sender.push(keeper.show(sky.BUILTIN_SCENES[0], "page").command)
+    run(server, sender, keeper)
+    assert server.held["sky"] == (40, 220, 60) and server.lightning() == (120, 255, 80)
+    assert server.colour("ceiling") == (55, 55, 55)                    # the old block cannot
 
 
 def test_a_scene_without_lightning_leaves_the_maps_lightning_alone():
@@ -216,9 +318,10 @@ def test_timed_scene_ends_and_a_map_change_ends_any_scene():
     assert keeper.active is None and steps[0].announce == "Sky: back to normal."
 
     keeper.show(sky.BUILTIN_SCENES[2], "mod")                      # until the map changes
+    keeper.homes["ceiling"] = (1, 2, 3)
     steps = keeper.tick(map_name="M2", players=1, settled=False, map_scene=None)
     assert keeper.active is None and steps[0].command is None      # the load reset it already
-    assert keeper.lightning_home is None                           # read again on the new map
+    assert keeper.lightning_home is None and not keeper.homes      # read again on the new map
 
 
 def test_map_rule_goes_on_after_the_load_and_a_mod_beats_it():
@@ -333,6 +436,32 @@ def test_page_waits_for_the_install_and_says_so(qtbot, tmp_path):
     assert "Install" in page.now_lbl.text()
     page._install()
     assert sky.block_installed(tmp_path / "server")
+
+
+def test_page_says_an_older_block_needs_updating(qtbot, tmp_path):
+    page, server, _, logged, now = make_page(qtbot, tmp_path, installed=False)
+    (tmp_path / "server" / "server.wac").write_bytes(
+        ("\r\n".join(OLD_293_BLOCK) + "\r\n").encode())
+    page.server_tick(server, True, "Map One", 1, True)
+    assert "older WolfRAT" in page.server_lbl.text()
+    assert not page.install_btn.isHidden() and page.install_btn.text().startswith("Update")
+    page._install()
+    page.server_tick(server, True, "Map One", 1, True)
+    assert sky.block_current(tmp_path / "server") and page.install_btn.isHidden()
+    assert any("server.wac updated" in line for line in logged)
+
+
+def test_page_editor_has_the_indoor_pickers(qtbot, tmp_path):
+    page, server, _, _, now = make_page(qtbot, tmp_path)
+    settle(page, server, now)
+    assert page._use["ceiling"].text() == "Indoors: ceiling" and "floor" in page._use
+    for key in sky.ELEMENT_KEYS:
+        page._use[key].setChecked(False)
+    page.set_colour("ceiling", (255, 0, 0))
+    page._try_clicked()
+    settle(page, server, now)
+    assert server.colour("ceiling") == (255, 0, 0) and server.colour("floor") == (25, 25, 25)
+    assert server.held["sun"] is None
 
 
 def test_page_without_a_sky_exe_says_so(qtbot, tmp_path):

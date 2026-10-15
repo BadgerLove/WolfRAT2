@@ -38,13 +38,15 @@ BANNER = (
 NO_SERVER = "The Sky page needs WolfRAT on the same PC as the game server, connected to it."
 
 HELP = (
-    "<b>Scenes</b> change fog, horizon, sunlight, sky light, ground light and lightning "
-    "together, with a fade. <b>Keep it for</b> 0 = until the map changes.<br><br>"
+    "<b>Scenes</b> change fog, horizon, sunlight, sky light, ground light, lightning and the "
+    "light inside buildings together, with a fade. <b>Keep it for</b> 0 = until the map "
+    "changes.<br><br>"
     "<b>Make your own:</b> tick what to change and pick its colour. Unticked = the map's own "
     "colour. <b>Try it</b> shows it on the server; <b>Save as a scene</b> keeps it with a "
     "name, and mods can then use that name in chat too.<br><br>"
-    "<b>Lightning colour</b> only shows when the scene is dark. WolfRAT remembers the map's "
-    "own lightning colour and puts it back.<br><br>"
+    "<b>Indoors: ceiling / floor</b> light the inside of buildings (stock maps keep them a "
+    "dim grey). <b>Lightning colour</b> only shows when the scene is dark. WolfRAT remembers "
+    "the map's own lightning and indoor colours and puts them back.<br><br>"
     "<b>Good to know</b><br>"
     "• A map change puts the map's own sky back. A map rule (right) then puts its scene on.<br>"
     "• Players who join later get the sky sent again (when someone joins, and every 30 s).<br>"
@@ -124,6 +126,7 @@ class SkyPage(QWidget):
         self._writable = False
         self._capable = False
         self._installed = False
+        self._current = False              # the block in server.wac is this WolfRAT's
         self._old_block = False
         self._script = "unknown"           # unknown | asked | yes | no
         self._ping_sent_at: Optional[float] = None
@@ -543,6 +546,7 @@ class SkyPage(QWidget):
             self.server_lbl.setText("⚠️ " + str(exc))
             return
         self._installed = True
+        self._current = True
         self._script = "unknown"
         self._log(f"Sky: server.wac {result} ({os.path.join(folder, sky.FILENAME)}). "
                   "It starts working at the next map load.")
@@ -721,6 +725,7 @@ class SkyPage(QWidget):
         self._capable = sky.server_can_do_sky(memory)
         folder = self._server_dir()
         self._installed = bool(folder) and sky.block_installed(folder)
+        self._current = self._installed and sky.block_current(folder)
         self._old_block = bool(folder) and sky.old_test_block(folder)
         if self._ping_map != map_name:
             self._ping_map = map_name
@@ -739,6 +744,10 @@ class SkyPage(QWidget):
             text = ("🟡 The server exe can do sky colours. WolfRAT's lines are not in server.wac "
                     "yet" + (" (an old sky TEST block is - Install replaces it)" if self._old_block
                              else "") + ".")
+        elif not self._current:
+            text = ("🟡 The sky lines in server.wac are from an older WolfRAT: indoor colours "
+                    "(ceiling / floor) will not show. Press Update - it starts working at the "
+                    "next map load.")
         elif self._script == "yes":
             text = f"🟢 Sky colours ready (server process {pid})."
         elif self._script == "no":
@@ -747,7 +756,9 @@ class SkyPage(QWidget):
         else:
             text = "🟡 Checking the server's script... (it only runs while someone is on the server)"
         self.server_lbl.setText(text)
-        self.install_btn.setVisible(self._capable and not self._installed)
+        self.install_btn.setText("Update the sky lines in server.wac" if self._installed
+                                 else "Install the sky lines in server.wac")
+        self.install_btn.setVisible(self._capable and not (self._installed and self._current))
         self._show_now()
 
     def _show_now(self):
@@ -775,7 +786,7 @@ class SkyPage(QWidget):
             return
         try:
             self._script_check(memory, players)
-            sent = self.sender.pump(memory, lambda: self.keeper.home_lightning(memory),
+            sent = self.sender.pump(memory, lambda key: self.keeper.home_colour(memory, key),
                                     only_ping=self._script != "yes")
         except Exception as exc:
             self.server_lbl.setText(f"⚠️ Sky: {exc}")
