@@ -898,15 +898,25 @@ class ServerTab(QWidget):
             self.connect_btn.setEnabled(True)
             self._handle_connect_failure()
 
+    # First retries come quickly: a map load drops the admin connection and
+    # the new map's first seconds matter (map weapons, first blood). Dale,
+    # 2026-10-15: a flat 30 s left WolfRAT 55 s late on a big TAC map.
+    RECONNECT_STEPS_MS = (3 * 1000, 5 * 1000, 10 * 1000)
+    RECONNECT_SLOW_MS = 30 * 1000
+
     def _reconnect_delay_ms(self) -> int:
-        """Flat 30s retry.
+        """3 s, 5 s, 10 s, then every 30 s.
 
         The old 30/60/120s backoff never delivered its 30s step: one drop
         raises several disconnect signals, each bumped the attempt count and
-        restarted the timer, so every reconnect waited the 120s cap. The
-        server's 30s start delay means a 30s retry lands as the game begins.
+        restarted the timer, so every reconnect waited the 120s cap.
+        _arm_reconnect ignores repeat signals for the same drop, so the
+        attempt count here is real.
         """
-        return 30 * 1000
+        step = self._reconnect_attempts - 1
+        if 0 <= step < len(self.RECONNECT_STEPS_MS):
+            return self.RECONNECT_STEPS_MS[step]
+        return self.RECONNECT_SLOW_MS
 
     def _arm_reconnect(self, reason: str) -> None:
         """Schedule one reconnect; repeat signals for the same drop are no-ops."""
@@ -7953,6 +7963,7 @@ class WeaponsTab(QWidget):
             return
         current = map_weapons.current_map_from_missions(missions)
         before = self.map_weapons.current_map
+        self.map_weapons.on_next(map_weapons.next_map_from_missions(missions))
         self.map_weapons.on_map(current)
         if current and current != before:
             self._refresh_map_current()
@@ -9168,6 +9179,30 @@ class MainWindow(QMainWindow):
         self.weapons_tab.attach_map_weapons(self.map_weapons, display_name=self.missions_tab._find_display_name)
         self.signals.missions_signal.connect(self.weapons_tab.on_missions_updated)
         self.signals.connected_signal.connect(self.map_weapons.on_connected)
+        # The next map's weapons go on before it loads (players' weapon menus
+        # are fixed at load): before WolfRAT's own MISSION CYCLE ...
+        self.server.before_cycle = self.map_weapons.steps_before_cycle
+        # ... and when a round ends by itself (server memory, same PC only).
+        self._round_over_seen = None
+        self._round_over_timer = QTimer(self)
+        self._round_over_timer.timeout.connect(self._watch_round_over)
+        self._round_over_timer.start(1000)
+
+    def _watch_round_over(self):
+        keeper = self.map_weapons
+        weather_tab = getattr(self, "weather_tab", None)
+        if keeper is None or weather_tab is None or not keeper.config.enabled:
+            self._round_over_seen = None
+            return
+        raw = weather_tab.read_server(map_weapons.ROUND_OVER_FLAG, 4)
+        if not raw or len(raw) != 4:
+            self._round_over_seen = None
+            return
+        over = int.from_bytes(raw, "little") != 0
+        if over and self._round_over_seen is False:
+            wire_log(f"[MAP WEAPONS] round over on {keeper.current_map} - next map {keeper.next_map}")
+            keeper.round_over()
+        self._round_over_seen = over
 
     def _update_status_bar(self, state):
         mode = state.get("mode", "")

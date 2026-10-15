@@ -10,9 +10,18 @@ Why this works, tested 2026-10-14 on a test host + joined player
 (details: WolfRAT vault, Development/Map Weapons.md): WEAPON SET changes the server's table at
 once, and the server checks a spawn kit and the armoury against that table.
 A map change does NOT reset it, so going back to a normal map needs the
-"every weapon Yes" step. The admin answered again under a second after
-MISSION CYCLE, and WolfRAT sees the new map on its next 5 s mission poll,
-well inside the 30 s before anyone can spawn.
+"every weapon Yes" step.
+
+BUT a player's weapon MENU is taken when they load into the map.  On Dale's
+server (2026-10-15) a big TAC map kept the admin port silent for 20 s, the
+drop + 30 s reconnect made WolfRAT 55 s late, and everyone loaded in with
+the old map's list.  So the next map's weapons now go on BEFORE the load:
+  * WolfRAT's own switches (!map, the vote, Missions tab, web admin): the
+    ServerManager runs ``steps_before_cycle`` just before MISSION CYCLE;
+  * a round that ends on its own (timer, objectives, kill limit): the main
+    window watches the server's round-over flag and calls ``round_over``
+    - the server waits about 20 s on the scoreboard before it loads.
+The normal "new map" apply still runs after the load as the check.
 
 Weapons are applied once per map, plus one check a few seconds later. After
 that WolfRAT keeps its hands off, so an admin can still hand weapons back
@@ -44,6 +53,11 @@ NO_RULE_LABELS = {
 MODE_WORD = {WeaponMode.ALWAYS: "Yes", WeaponMode.ARMORY: "Armory", WeaponMode.NEVER: "No"}
 
 RECHECK_SECONDS = 8.0       # second look after an apply, for a server that resets on load
+PREPARED_SECONDS = 90.0     # a pre-load set this recent covers the round-over call too
+BEFORE_LOAD = "before the next map loads"
+# Server memory (same PC): 0 while a round is played, 1 from the moment it ends
+# (timer, objectives, kill limit or MISSION CYCLE) until the next map starts.
+ROUND_OVER_FLAG = 0x024C1928
 RETRY_SECONDS = 3.0
 MAX_ATTEMPTS = 3
 MAX_APPLIES_PER_MAP = 3   # failures + 'changed back' re-applies, then wait for the next map
@@ -194,6 +208,46 @@ def still_wrong(entries: Sequence[WeaponEntry], wanted: dict) -> list:
     return [entry for entry in entries if wanted.get(entry.admdef_id, entry.mode) is not entry.mode]
 
 
+def full_plan(entries: Sequence[WeaponEntry], wanted: dict) -> list:
+    """Every weapon to its wanted mode WITHOUT trusting the table we hold
+    (it can be minutes old): SET ALL to the commonest mode, then the rest."""
+    counts = Counter(wanted[entry.admdef_id] for entry in entries if entry.admdef_id in wanted)
+    if not counts:
+        return []
+    base = max(sorted(counts, key=lambda mode: mode.value), key=lambda mode: counts[mode])
+    return [Step(base)] + [Step(wanted[entry.admdef_id], entry) for entry in entries
+                           if entry.admdef_id in wanted and wanted[entry.admdef_id] is not base]
+
+
+def _mission_rows(lines) -> list:
+    """(file name, current?, next?) for each MISSION LIST line."""
+    import re
+    rows = []
+    for line in lines or ():
+        if " - " not in line:
+            continue
+        name = line.split(" - ")[0].strip()
+        if ":" in name[:5]:
+            name = name.split(":", 1)[1].strip()
+        name = re.sub(r"<[^>]*>", "", name).strip()
+        if name:
+            rows.append((name, "<CURRENT MISSION>" in line, "<NEXT MISSION>" in line))
+    return rows
+
+
+def next_map_from_missions(lines) -> Optional[str]:
+    """The map the server loads next: the <NEXT MISSION> row, else the row
+    after <CURRENT MISSION> (wrapping), else None."""
+    rows = _mission_rows(lines)
+    for name, _current, is_next in rows:
+        if is_next:
+            return name
+    for index, (_name, current, _next) in enumerate(rows):
+        if current:
+            return rows[(index + 1) % len(rows)][0]
+    return None
+
+
 def current_map_from_missions(lines) -> Optional[str]:
     """The <CURRENT MISSION> file name from MISSION LIST lines (the parse the
     Weather and Sprees tabs use)."""
@@ -258,7 +312,9 @@ class MapWeaponsKeeper:
         self._request: Optional[tuple] = None    # (map name, reason)
         self._closed = False
         self.current_map: Optional[str] = None
+        self.next_map: Optional[str] = None      # what the server loads next (mission list)
         self.applied_map: Optional[str] = None   # the map the last apply was for
+        self._prepared: Optional[tuple] = None   # (map key, clock) of the last pre-load set
         self._recheck_after_connect = False
         self._manual = False                     # the admin changed weapons by hand on this map
         self._applies_this_map = 0
@@ -319,6 +375,39 @@ class MapWeaponsKeeper:
             self._ask(map_name, "reconnected")
         self._recheck_after_connect = False
 
+    def on_next(self, map_name: Optional[str]) -> None:
+        """Called on every mission poll with the map the server loads next."""
+        self.next_map = map_name or None
+
+    def steps_before_cycle(self, next_map: Optional[str], entries: Sequence[WeaponEntry]) -> list:
+        """WolfRAT is about to send MISSION CYCLE: the next map's weapons as
+        (mode, entry or None for SET ALL) pairs, sent first in the same queue.
+        Nothing when Map Weapons is off, the map is unknown, or "leave alone"."""
+        next_map = next_map or self.next_map
+        if not self.config.enabled or not next_map or not entries:
+            return []
+        rule = rule_for(next_map, self.config.rules)
+        wanted = targets(entries, rule, self.config.no_rule)
+        if wanted is None:
+            return []
+        steps = full_plan(entries, wanted)
+        self._prepared = (map_key(next_map), self._clock())
+        name = f"rule '{rule.match}'" if rule else "no rule"
+        self._say(f"{next_map}: {name} set before the switch ({len(steps)} command(s)).")
+        return [(step.mode, step.entry) for step in steps]
+
+    def round_over(self) -> None:
+        """The server's round just ended (it loads the next map in ~20 s):
+        put the next map's weapons on now, so players load in with them."""
+        if not self.config.enabled or not self.next_map:
+            return
+        recent = self._prepared
+        if recent and recent[0] == map_key(self.next_map) and \
+                self._clock() - recent[1] < PREPARED_SECONDS:
+            return                                # WolfRAT's own switch already did it
+        self._prepared = (map_key(self.next_map), self._clock())
+        self._ask(self.next_map, BEFORE_LOAD)
+
     def on_connected(self) -> None:
         """A (re)connect: the next mission poll checks the weapons again, in
         case the server put its own back while it loaded."""
@@ -366,8 +455,10 @@ class MapWeaponsKeeper:
         started = self._clock()
         rule = rule_for(map_name, self.config.rules)
         name = f"rule '{rule.match}'" if rule else "no rule"
-        self.applied_map = map_name
-        self._applies_this_map += 1
+        early = reason == BEFORE_LOAD             # for the NEXT map: the after-load apply still checks it
+        if not early:
+            self.applied_map = map_name
+            self._applies_this_map += 1
         wanted, done = None, []
         for attempt in range(1, MAX_ATTEMPTS + 1):
             try:
@@ -393,7 +484,7 @@ class MapWeaponsKeeper:
                 problem = f"{type(error).__name__}: {error}"
             if attempt == MAX_ATTEMPTS:
                 self._say(f"{map_name}: {name} FAILED after {attempt} tries - {problem}")
-                if self._applies_this_map < MAX_APPLIES_PER_MAP:
+                if not early and self._applies_this_map < MAX_APPLIES_PER_MAP:
                     self.applied_map = None          # the next mission poll tries again
                 return None
             newer = self._take(RETRY_SECONDS)
@@ -407,6 +498,8 @@ class MapWeaponsKeeper:
             self._say(f"{map_name}: {name} set ({mix}) with {len(done)} command(s) in {took:.1f} s ({reason}).")
         else:
             self._say(f"{map_name}: {name} - already right ({mix}) ({reason}).")
+        if early:
+            return None
         return self._recheck(map_name, wanted, name)
 
     def _recheck(self, map_name: str, wanted: dict, name: str) -> Optional[tuple]:

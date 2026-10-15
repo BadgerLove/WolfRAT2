@@ -166,6 +166,9 @@ class ServerManager:
         self._mutation_tail = completed_future(None)
         self._closed = False
         self._connection_generation = 0
+        # Map Weapons: (next map, weapon entries) -> [(mode, entry or None)],
+        # sent just before every MISSION CYCLE (see map_weapons.py).
+        self.before_cycle: Optional[Callable] = None
         self._last_poll_success: float = 0.0
         # Last quiet poll reply written to the wire log, per operation.
         self._wire_seen: dict = {}
@@ -1307,15 +1310,84 @@ class ServerManager:
         )
 
     def _cycle_mission_now(
-        self, session: RetailAdminSession
+        self, session: RetailAdminSession, next_name: Optional[str] = None
     ) -> Future:
-        return self._verify_acknowledgement(
-            self._execute(
-                AdminCommands.cycle_mission(),
-                expected_session=session,
-            ),
-            lambda ack: _ack_is(ack, "OK - Server is cycling..."),
-        )
+        steps = self._before_cycle_steps(next_name)
+
+        def cycle() -> Future:
+            return self._verify_acknowledgement(
+                self._execute(
+                    AdminCommands.cycle_mission(),
+                    expected_session=session,
+                ),
+                lambda ack: _ack_is(ack, "OK - Server is cycling..."),
+            )
+
+        return self._steps_then(session, steps, cycle)
+
+    def _next_mission_filename(self) -> Optional[str]:
+        entries = list(self.mission_entries or ())
+        for entry in entries:
+            if entry.is_next:
+                return entry.filename
+        for index, entry in enumerate(entries):
+            if entry.is_current:
+                return entries[(index + 1) % len(entries)].filename
+        return None
+
+    def _before_cycle_steps(self, next_name: Optional[str]) -> list:
+        """``before_cycle(next map, weapon entries)`` -> [(mode, entry or None)]:
+        Map Weapons' next-map weapons, sent just before MISSION CYCLE so
+        players load in with them (a weapon menu is fixed at load)."""
+        hook = self.before_cycle
+        if hook is None:
+            return []
+        try:
+            name = next_name or self._next_mission_filename()
+            return list(hook(name, list(self.weapon_entries or ())) or ())
+        except Exception as error:  # noqa: BLE001 - never block a map switch
+            self._log(f"[MAP WEAPONS] could not prepare the next map: {error}")
+            return []
+
+    def _steps_then(
+        self,
+        session: RetailAdminSession,
+        steps: list,
+        final: Callable[[], Future],
+    ) -> Future:
+        """Send each weapon step in turn (a failed one is logged and skipped:
+        the after-load apply checks again), then ``final()``."""
+        output: Future = Future()
+
+        def run(index: int) -> None:
+            if index >= len(steps):
+                try:
+                    last = final()
+                except BaseException as error:
+                    _settle_future(output, error=error)
+                    return
+
+                def done(finished: Future) -> None:
+                    try:
+                        _settle_future(output, result=finished.result())
+                    except BaseException as error:
+                        _settle_future(output, error=error)
+
+                last.add_done_callback(done)
+                return
+            mode, entry = steps[index]
+            try:
+                spec = (AdminCommands.set_all_weapons(mode) if entry is None
+                        else AdminCommands.set_weapon(entry, mode))
+                pending = self._execute(spec, expected_session=session)
+            except BaseException as error:  # noqa: BLE001
+                self._log(f"[MAP WEAPONS] before the switch: {error}")
+                run(index + 1)
+                return
+            pending.add_done_callback(lambda _finished: run(index + 1))
+
+        run(0)
+        return output
 
     def next_map(self) -> Future:
         return self.cycle_mission()
@@ -1325,10 +1397,12 @@ class ServerManager:
     ) -> Future:
         try:
             target = self._resolve_mission(index_or_entry)
+            next_name = target.filename
         except _MissionNotFoundError:
             if not add_if_missing or not isinstance(index_or_entry, str):
                 raise
             available = self._resolve_available_mission(index_or_entry)
+            next_name = available.filename
             AdminCommands.add_mission(
                 available, auto_switch_sides=False
             )
@@ -1354,7 +1428,7 @@ class ServerManager:
         return self._serialize_mutation(
             lambda session: self._then(
                 prepare(session),
-                lambda _result: self._cycle_mission_now(session),
+                lambda _result: self._cycle_mission_now(session, next_name),
             )
         )
 
