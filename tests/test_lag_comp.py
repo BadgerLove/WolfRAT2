@@ -23,7 +23,8 @@ def _block(**kw):
 
 
 def test_block_layout_matches_the_helper():
-    # payload.c: header 76 bytes before the settings, 64 player rows of 64 bytes.
+    # payload.c: header 76 bytes before the settings, 250 player rows of 64 bytes.
+    assert lc.SLOTS == 250
     assert lc._OFF["enabled"] == 116
     assert lc._OFF["reset_seq"] == 136
     assert lc._OFF["cal"] == 188
@@ -113,3 +114,24 @@ def test_history_updates_one_row_per_session(tmp_path):
 def test_describe_setting():
     assert lc.describe_setting(lc.Settings(True, -20, 300, 60)) == \
         "watch only, ping -20 ms, none under 60, max 300"
+
+
+def test_preload_foreign_detection():
+    class FakeProc:
+        def __init__(self, hooked: bool):
+            self.hooked = hooked
+
+        def modules(self):
+            return {}
+
+        def read(self, address: int, size: int) -> bytes:
+            if address == lc._LEG_TAIL[0]:
+                return lc._LEG_TAIL[1]
+            for site, func in lc._RETAIL_SITES:
+                if address == site:
+                    target = (0x67200000 + site) if self.hooked else func
+                    return lc._call_bytes(site, target)
+            raise lc.LagCompError("unmapped")
+
+    assert lc.read_state(FakeProc(hooked=False)).kind == lc.UNKNOWN
+    assert lc.read_state(FakeProc(hooked=True)).kind == lc.FOREIGN

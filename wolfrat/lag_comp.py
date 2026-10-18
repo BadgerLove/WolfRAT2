@@ -39,10 +39,20 @@ EXPORT_NAME = b"WolfRatLagComp"
 MAGIC = 0x31434C57
 VERSION = 1
 
-SLOTS = 64
+SLOTS = 250
+LEGACY_SLOTS = 64
 BINS = 128
 BIN_MS = 8
 BIN_MIN = -400
+
+# Retail 1.7.5.7 / TAC / FMJ call sites, so WolfRAT can spot onHook's own
+# lag compensation before loading its helper DLL.
+_RETAIL_SITES = (
+    (0x4E4C59, 0x4E4670),
+    (0x4EA5BF, 0x4E4A30),
+    (0x4C223A, 0x4EC020),
+)
+_LEG_TAIL = (0x4EA5C4, b"\x83\xc4\x08\x85\xc0\x75\x2d")
 
 DEFAULT_EXTRA_MS = 40
 DEFAULT_MAX_MS = 400
@@ -96,6 +106,7 @@ class _Shared(ctypes.LittleEndianStructure):
 
 SHARED_SIZE = ctypes.sizeof(_Shared)
 _OFF = {name: getattr(_Shared, name).offset for name, _ in _Shared._fields_}
+_MIN_SHARED_SIZE = _OFF["players"] + LEGACY_SLOTS * ctypes.sizeof(_Player)
 
 
 @dataclass
@@ -187,8 +198,10 @@ def histogram_quantiles(cal) -> tuple[Optional[int], Optional[int], Optional[int
 
 
 def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, Stats]:
-    if len(raw) < SHARED_SIZE:
+    if len(raw) < _MIN_SHARED_SIZE:
         raise LagCompError("short read of the lag compensation block")
+    if len(raw) < SHARED_SIZE:
+        raw = raw + b"\0" * (SHARED_SIZE - len(raw))
     shared = _Shared.from_buffer_copy(raw[:SHARED_SIZE])
     if now_ticks is None:
         now_ticks = _tick_count()
@@ -464,7 +477,11 @@ def _helpers(proc: ServerProcess) -> list:
                 if not address:
                     continue
                 _block_at[key] = address
-            block = _Shared.from_buffer_copy(proc.read(address, SHARED_SIZE))
+            try:
+                raw = proc.read(address, SHARED_SIZE)
+            except LagCompError:
+                raw = proc.read(address, _MIN_SHARED_SIZE) + b"\0" * (SHARED_SIZE - _MIN_SHARED_SIZE)
+            block = _Shared.from_buffer_copy(raw)
             if block.magic == MAGIC:
                 out.append(_Helper(name, base, address, block))
         except LagCompError:
@@ -489,6 +506,13 @@ def _classify(proc: ServerProcess, mine: Optional[_Helper], helpers: list) -> st
     """What the three calls point at now."""
     ref = mine or (helpers[0] if helpers else None)
     if ref is None or ref.block.status != 1:
+        try:
+            if proc.read(_LEG_TAIL[0], len(_LEG_TAIL[1])) == _LEG_TAIL[1]:
+                targets = [_call_target(proc, site) for site, _ in _RETAIL_SITES]
+                if None not in targets and targets != [func for _, func in _RETAIL_SITES]:
+                    return FOREIGN
+        except LagCompError:
+            pass
         return UNKNOWN
     targets = [_call_target(proc, site) for site, _, _ in _sites(ref.block)]
     if targets == [f for _, f, _ in _sites(ref.block)]:
@@ -513,7 +537,10 @@ def read_state(proc: ServerProcess, wanted_name: Optional[str] = None) -> State:
     kind = _classify(proc, mine, helpers)
     if mine is None:
         return State(kind if kind in (FOREIGN, STOCK) else UNKNOWN)
-    raw = proc.read(mine.shared, SHARED_SIZE)
+    try:
+        raw = proc.read(mine.shared, SHARED_SIZE)
+    except LagCompError:
+        raw = proc.read(mine.shared, _MIN_SHARED_SIZE)
     block, stats = parse_stats(raw)
     alive = ((_tick_count() - block.heartbeat) & 0xFFFFFFFF) < 3000 if block.heartbeat else False
     settings = Settings(bool(block.observe), block.extra_ms, block.max_ms, block.min_ping_ms)
