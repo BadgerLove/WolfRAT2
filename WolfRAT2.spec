@@ -3,6 +3,7 @@
 
 application_data = [
     ("wolfrat/icon.ico", "wolfrat"),
+    ("wolfrat/wolfrat_lagcomp.dll", "wolfrat"),
     ("wolfrat/sounds/*.wav", "wolfrat/sounds"),
     ("wolfrat/web_templates/*.css", "wolfrat/web_templates"),
     ("wolfrat/web_templates/*.html", "wolfrat/web_templates"),
