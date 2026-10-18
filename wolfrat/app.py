@@ -56,6 +56,7 @@ from wolfrat.server_link_panel import ServerLinkPanel
 from wolfrat.server_patches_panel import ServerPatchesPanel
 from wolfrat.server_patcher_panel import ServerPatcherPanel
 from wolfrat.live_patches_panel import LivePatchesPanel
+from wolfrat.lag_comp_panel import LagCompPanel
 from wolfrat.client_patcher_panel import ClientPatcherPanel
 from PyQt6.QtMultimedia import QSoundEffect
 from PyQt6.QtCore import QUrl
@@ -694,6 +695,10 @@ class ServerTab(QWidget):
         live_page = QWidget()
         self._live_slot = QVBoxLayout(live_page)
         self.pages.addTab(live_page, "⚡ Live patches")
+        # Lag compensation (Dale 2026-10-18): into the running server, with live numbers
+        lagcomp_page = QWidget()
+        self._lagcomp_slot = QVBoxLayout(lagcomp_page)
+        self.pages.addTab(lagcomp_page, "🎯 Lag compensation")
         patcher_page = QWidget()
         self._patcher_slot = QVBoxLayout(patcher_page)
         self.pages.addTab(patcher_page, "Server patcher")
@@ -809,6 +814,10 @@ class ServerTab(QWidget):
     def add_live_panel(self, panel: QWidget) -> None:
         """Live patches (into the running server) have their own page."""
         self._live_slot.addWidget(panel)
+
+    def add_lagcomp_panel(self, panel: QWidget) -> None:
+        """Lag compensation has its own page."""
+        self._lagcomp_slot.addWidget(panel)
 
     def add_patcher_panel(self, panel: QWidget) -> None:
         """The server patcher has the Server patcher page to itself."""
@@ -8688,6 +8697,15 @@ class MainWindow(QMainWindow):
         )
         self.weather_tab.add_server_ticker(self.live_patches_panel)
         self.server_tab.add_live_panel(self.live_patches_panel)
+        self.lag_comp_panel = LagCompPanel(
+            self.runtime.path("wolfrat_lag_comp.json"),
+            self.runtime.path("wolfrat_lag_comp_history.json"),
+            self.runtime.data_dir,
+            log=self.server_tab.log,
+            poll_now=self.weather_tab.poll_now,
+        )
+        self.weather_tab.add_server_ticker(self.lag_comp_panel)
+        self.server_tab.add_lagcomp_panel(self.lag_comp_panel)
         self.server_patcher_panel = ServerPatcherPanel(self.weather_tab.server_exe, self.weather_tab.read_server)
         self.weather_tab.link_changed.connect(lambda *_: self.server_patcher_panel.refresh())
         self.server_tab.add_patcher_panel(self.server_patcher_panel)
