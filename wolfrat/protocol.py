@@ -17,6 +17,7 @@ from typing import Callable, Iterable, Mapping, Optional
 
 from .admin_commands import (
     AdminCommands,
+    set_parse_warning_sink,
     AdminOperation,
     AvailableMission,
     CommandSpec,
@@ -199,6 +200,7 @@ class ServerManager:
         self._on_log = None
         self._on_disconnect_ui = None
         self._on_connect_done = None
+        self._parse_warnings_seen: set[str] = set()
         # coop_guard.CoopGuard, set by the Chat Bot tab. Every swap asks it.
         self.swap_guard = None
 
@@ -256,6 +258,17 @@ class ServerManager:
         self._on_disconnect_ui = on_disconnect_ui
         self._on_connect_done = on_connect_done
         self._on_weapons = on_weapons
+        # Parser warnings (a map title with a line break, a row skipped) go
+        # to the console once each; the 3 s polls would otherwise repeat
+        # them forever.  The set is cleared on every connect.
+        set_parse_warning_sink(self._parse_warning)
+
+    def _parse_warning(self, message: str) -> None:
+        with self._lock:
+            if message in self._parse_warnings_seen:
+                return
+            self._parse_warnings_seen.add(message)
+        self._log(f"WARNING: {message}")
 
     def set_raw_chat_callback(self, callback) -> None:
         self._on_raw_chat = callback

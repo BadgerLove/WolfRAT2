@@ -497,6 +497,41 @@ class RetailAdminSessionTests(unittest.TestCase):
         self.assertEqual("GAME", following.result(timeout=1).value)
         self.assertTrue(session.connected)
 
+    def test_parse_error_fails_only_that_request_and_keeps_the_connection(self):
+        # 2.10.1: before this, a reply the parser could not read closed the
+        # transport and failed every queued poll, so one odd map title made
+        # WolfRAT reconnect every 3 s (TK - Hilltop 2024, 2026-10-19).
+        transport = ScriptedTransport(
+            [
+                server_frame(b"J" * 32 + b"\x00"),
+                server_frame(b"User logged in\x00"),
+                server_frame(b"Current State = GAME\x00"),
+                server_frame(b"Current State = MENUS\x00"),
+            ]
+        )
+        session = RetailAdminSession(
+            "127.0.0.1",
+            username="admin",
+            password="secret",
+            transport_factory=lambda: transport,
+            timeout=0.25,
+        )
+        self.addCleanup(session.close)
+
+        with patch.object(
+            type(AdminCommands.game_state()),
+            "parse",
+            side_effect=[ValueError("odd row"), "MENUS"],
+        ):
+            unreadable = session.execute(AdminCommands.game_state())
+            following = session.execute(AdminCommands.game_state())
+            with self.assertRaises(ValueError) as caught:
+                unreadable.result(timeout=1)
+            self.assertIn("connection kept", str(caught.exception))
+            self.assertEqual("MENUS", following.result(timeout=1).value)
+        self.assertTrue(session.connected)
+        self.assertFalse(transport.closed)
+
     def test_stale_identity_is_rejected_before_any_bytes_are_sent(self):
         transport = ScriptedTransport(
             [

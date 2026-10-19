@@ -18,6 +18,7 @@ from wolfrat.admin_commands import (
     parse_players,
     parse_weapons,
     raw_command,
+    set_parse_warning_sink,
 )
 
 
@@ -402,9 +403,53 @@ class RetailParserTests(unittest.TestCase):
         self.assertTrue(missions[0].is_current)
         self.assertTrue(missions[1].double_time)
         self.assertTrue(missions[1].is_next)
-        # Structure is still enforced: a row missing the " - " separator fails.
-        with self.assertRaises(ValueError):
-            parse_missions("1: AS - Black Rock TAC.npj () () () <> <>\n", revision=9)
+        # A row missing the " - " separator is skipped with a warning (2.10.1:
+        # one unreadable row must never cost the connection).
+        warnings = []
+        set_parse_warning_sink(warnings.append)
+        self.addCleanup(set_parse_warning_sink, None)
+        self.assertEqual(
+            parse_missions("1: AS - Black Rock TAC.npj () () () <> <>\n", revision=9),
+            (),
+        )
+        self.assertEqual(1, len(warnings))
+        self.assertIn("MISSION LIST", warnings[0])
+
+    def test_available_parser_repairs_a_title_with_a_line_break(self):
+        # Real reply from a TAC server, 2026-10-19: the TITLE line in
+        # 'TK - Hilltop 2024.bin' ends in a line break, so the server's
+        # closing bracket lands on the next line.  Every poll raised here and
+        # WolfRAT reconnected every 3 s until the map was removed.
+        warnings = []
+        set_parse_warning_sink(warnings.append)
+        self.addCleanup(set_parse_warning_sink, None)
+        payload = (
+            "199. TK - Heatherwood.npj (TK - Heatherwood)\n"
+            "200. TK - Hilltop 2024.npj (TK - Hilltop 2024\r\n"
+            ")\n"
+            "201. TK-AlQurnahBasin.npj (TK - Al-Qurnah Basin)\n"
+        )
+        available = parse_available_missions(payload, revision=7)
+        self.assertEqual(
+            [(m.catalog_index, m.filename, m.description) for m in available],
+            [
+                (199, "TK - Heatherwood.npj", "TK - Heatherwood"),
+                (200, "TK - Hilltop 2024.npj", "TK - Hilltop 2024"),
+                (201, "TK-AlQurnahBasin.npj", "TK - Al-Qurnah Basin"),
+            ],
+        )
+        self.assertEqual(1, len(warnings))
+        self.assertIn("TK - Hilltop 2024.npj", warnings[0])
+        self.assertIn("line break", warnings[0])
+        # The bracket never arriving at all is still readable: the filename
+        # is what MISSION ADD needs.
+        available = parse_available_missions(
+            "5. DM-Dust.npj (Dust\n6. DM-Rust.npj\n", revision=8
+        )
+        self.assertEqual(
+            [(m.catalog_index, m.filename, m.description) for m in available],
+            [(5, "DM-Dust.npj", "Dust"), (6, "DM-Rust.npj", "")],
+        )
 
     def test_available_weapon_and_settings_parsers_are_typed(self):
         available = parse_available_missions(
@@ -453,16 +498,39 @@ class RetailParserTests(unittest.TestCase):
         self.assertIs(updated.apply(AdminOperation.MISSION_CYCLE, "OK"), updated)
 
     def test_malformed_identity_rows_fail_closed(self):
-        with self.assertRaises(ValueError):
-            parse_players("Alice\tbiggy\t1\tRifleman\t0\t0\t50\n", revision=1)
-        with self.assertRaises(ValueError):
-            parse_players("Alice\t251\t1\tRifleman\t0\t0\t50\n", revision=1)
-        with self.assertRaises(ValueError):
-            parse_missions("CP08.BMS <CURRENT MISSION>\n", revision=1)
-        with self.assertRaises(ValueError):
-            parse_weapons("M4 Carbine ARMORY\n", revision=1)
-        with self.assertRaises(ValueError):
-            parse_weapons("255. NEVER Out of bounds\n", revision=1)
+        # Fail closed = the row never becomes a record a kick/ban could
+        # target.  Since 2.10.1 it is skipped with a warning, not raised:
+        # raising closed the whole connection over one odd row.
+        warnings = []
+        set_parse_warning_sink(warnings.append)
+        self.addCleanup(set_parse_warning_sink, None)
+        cases = (
+            (parse_players, "Alice\tbiggy\t1\tRifleman\t0\t0\t50\n"),
+            (parse_players, "Alice\t251\t1\tRifleman\t0\t0\t50\n"),
+            (parse_missions, "CP08.BMS <CURRENT MISSION>\n"),
+            (parse_weapons, "M4 Carbine ARMORY\n"),
+            (parse_weapons, "255. NEVER Out of bounds\n"),
+        )
+        for parser, payload in cases:
+            with self.subTest(parser=parser.__name__, payload=payload):
+                before = len(warnings)
+                self.assertEqual(parser(payload, revision=1), ())
+                self.assertEqual(before + 1, len(warnings))
+        # Good rows around a bad one survive.
+        players = parse_players(
+            "Alice\t3\t1\tRifleman\t0\t0\t50\n"
+            "Bob\tbiggy\t1\tRifleman\t0\t0\t50\n"
+            "Carol\t4\t2\tMedic\t1\t0\t40\n",
+            revision=2,
+        )
+        self.assertEqual([p.server_id for p in players], [3, 4])
+        # An unknown setting is skipped, the rest are kept.
+        settings = parse_game_settings(
+            "ServerName = Dev\nTacNewThing = 1\nKOTHLimit = 20\n", revision=3
+        )
+        self.assertEqual(settings["ServerName"], "Dev")
+        self.assertEqual(settings["KOTHLimit"], "20")
+        self.assertIn("TacNewThing", warnings[-1])
 
 
 if __name__ == "__main__":

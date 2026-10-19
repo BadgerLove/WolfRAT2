@@ -382,11 +382,27 @@ class RetailAdminSession:
                 with self._condition:
                     self._revision += 1
                     revision = self._revision
-                value = (
-                    request.spec.parse(replies[0], revision)
-                    if accepted
-                    else None
-                )
+                try:
+                    value = (
+                        request.spec.parse(replies[0], revision)
+                        if accepted
+                        else None
+                    )
+                except ValueError as error:
+                    # The reply was read in full, so the stream is still in
+                    # step: only this request fails, the connection stays.
+                    # (Before 2.10.1 this fell through to _fail_generation
+                    # and one odd map title reconnected WolfRAT every 3 s.)
+                    with self._condition:
+                        self._forget_coalesced(request)
+                    self._settle_exception(
+                        request.observers,
+                        ValueError(
+                            f"{request.spec.operation.value}: could not read "
+                            f"the server's reply ({error}); connection kept"
+                        ),
+                    )
+                    continue
                 if accepted:
                     self._apply_snapshot(request.spec, value)
                 if request.raw:

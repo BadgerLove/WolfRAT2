@@ -276,8 +276,10 @@ def _optional_int(value: str) -> Optional[int]:
         return None
     try:
         return int(value)
-    except ValueError as exc:
-        raise ValueError(f"invalid numeric retail field {value!r}") from exc
+    except ValueError:
+        # Kills/deaths/ping are display only; an odd value is not worth a row.
+        _warn(f"Could not read a numeric PLAYER LIST field: {value!r}")
+        return None
 
 
 def parse_game_state(payload: str, revision: int) -> str:
@@ -287,6 +289,61 @@ def parse_game_state(payload: str, revision: int) -> str:
     return payload.strip()
 
 
+# ---------------------------------------------------------------------------
+# Lenient list parsing (2.10.1)
+#
+# List replies are built from map and DEF files written by other people.  One
+# odd row used to raise here and the session took that as a dead connection,
+# so WolfRAT reconnected every 3 s for as long as the server had that map
+# (seen 2026-10-19 on a TAC server: a map title with a stray line break,
+# '200. TK - Hilltop 2024.npj (TK - Hilltop 2024' + '\n)').  Every other admin
+# tool loads that server fine, so WolfRAT must too: rows it can read are
+# kept, a row it cannot read is skipped, and both cases are reported through
+# the warning sink instead of raised.
+# ---------------------------------------------------------------------------
+
+_warning_sink: Optional[Callable[[str], None]] = None
+
+
+def set_parse_warning_sink(sink: Optional[Callable[[str], None]]) -> None:
+    """Route parser warnings (rows repaired or skipped) to a logger."""
+    global _warning_sink
+    _warning_sink = sink
+
+
+def _warn(message: str) -> None:
+    sink = _warning_sink
+    if sink is None:
+        return
+    try:
+        sink(message)
+    except Exception:
+        pass
+
+
+_INDEXED_ROW_START = re.compile(r"^\s*\d+\s*[.:]\s")
+
+
+def _indexed_rows(payload: str) -> list[tuple[str, bool]]:
+    """Split an indexed list reply ('N. ...' or 'N: ...') into rows.
+
+    A line that does not start with an index belongs to the row before it:
+    the server printed a title containing a line break, so the rest of the
+    row (usually just the closing bracket) landed on the next line.  Returns
+    (row, repaired) pairs.
+    """
+    rows: list[list] = []
+    for raw in payload.splitlines():
+        if not raw.strip():
+            continue
+        if rows and not _INDEXED_ROW_START.match(raw):
+            rows[-1][0] = rows[-1][0].rstrip() + " " + raw.strip()
+            rows[-1][1] = True
+        else:
+            rows.append([raw, False])
+    return [(row, repaired) for row, repaired in rows]
+
+
 def parse_game_settings(payload: str, revision: int) -> GameSettings:
     values: dict[str, str] = {}
     for raw in payload.splitlines():
@@ -294,11 +351,16 @@ def parse_game_settings(payload: str, revision: int) -> GameSettings:
         if not line:
             continue
         if "=" not in line:
-            raise ValueError(f"malformed GAMESETTINGS row: {raw!r}")
+            _warn(f"Skipped a GAMESETTINGS row WolfRAT could not read: {line!r}")
+            continue
         key, _, value = line.partition("=")
         canonical = _SETTING_CASE.get(key.strip().casefold())
         if canonical is None:
-            raise ValueError(f"unknown retail setting: {key.strip()!r}")
+            _warn(
+                f"Skipped a server setting WolfRAT does not know: "
+                f"{key.strip()!r} (the Settings tab does not show it)"
+            )
+            continue
         values[canonical] = value.strip()
     return GameSettings(values, revision)
 
@@ -316,15 +378,20 @@ def parse_players(payload: str, revision: int) -> tuple[PlayerEntry, ...]:
             and columns[1] == "#"
         ):
             continue
+        # A row without a usable identity never becomes a player record
+        # (fail closed for kicks/bans), but it must not cost the connection.
         if len(columns) < 3 or not columns[1].isdigit():
-            raise ValueError(f"malformed PLAYER LIST row: {raw!r}")
+            _warn(f"Skipped a PLAYER LIST row WolfRAT could not read: {line!r}")
+            continue
         try:
             server_id = int(columns[1])
             team = int(columns[2])
-        except ValueError as exc:
-            raise ValueError(f"malformed PLAYER LIST identity: {raw!r}") from exc
+        except ValueError:
+            _warn(f"Skipped a PLAYER LIST row with a bad identity: {line!r}")
+            continue
         if not (0 <= server_id <= 250):
-            raise ValueError(f"player id outside retail roster range: {server_id}")
+            _warn(f"Skipped a PLAYER LIST row with id {server_id} (outside 0-250): {line!r}")
+            continue
         result.append(PlayerEntry(
             server_id=server_id,
             name=columns[0],
@@ -355,12 +422,16 @@ def parse_missions(payload: str, revision: int) -> tuple[MissionEntry, ...]:
     if payload.strip().casefold() == "no missions in queue.":
         return ()
     result: list[MissionEntry] = []
-    for raw in payload.splitlines():
-        if not raw.strip():
-            continue
+    for raw, repaired in _indexed_rows(payload):
         match = _MISSION_RE.match(raw)
         if not match:
-            raise ValueError(f"malformed MISSION LIST row: {raw!r}")
+            _warn(f"Skipped a MISSION LIST row WolfRAT could not read: {raw.strip()!r}")
+            continue
+        if repaired:
+            _warn(
+                f"Queue entry {match.group('file')!r} came back split over two "
+                f"lines; WolfRAT joined them."
+            )
         flags = {key: match.group(key).upper() for key in (
             "double", "flipped", "oneshot", "current", "next"
         )}
@@ -381,20 +452,33 @@ _AVAILABLE_RE = re.compile(
     r"^\s*(?P<index>\d+)\.\s+(?P<file>.+\.(?:BMS|NPJ|NPZ))\s+\((?P<description>.*)\)\s*$",
     re.IGNORECASE,
 )
+# Fallback for a row the server printed oddly: the title bracket never
+# closed, or there is no title at all.  The filename is what WolfRAT needs.
+_AVAILABLE_LENIENT_RE = re.compile(
+    r"^\s*(?P<index>\d+)\.\s+(?P<file>.+?\.(?:BMS|NPJ|NPZ))\s*"
+    r"(?:\((?P<description>.*?)\)?)?\s*$",
+    re.IGNORECASE,
+)
 
 
 def parse_available_missions(payload: str, revision: int) -> tuple[AvailableMission, ...]:
     result: list[AvailableMission] = []
-    for raw in payload.splitlines():
-        if not raw.strip():
-            continue
-        match = _AVAILABLE_RE.match(raw)
+    for raw, repaired in _indexed_rows(payload):
+        match = _AVAILABLE_RE.match(raw) or _AVAILABLE_LENIENT_RE.match(raw)
         if not match:
-            raise ValueError(f"malformed MISSION AVAILABLE row: {raw!r}")
+            _warn(f"Skipped a MISSION AVAILABLE row WolfRAT could not read: {raw.strip()!r}")
+            continue
+        filename = match.group("file").strip()
+        if repaired:
+            _warn(
+                f"Map {filename!r} has a line break in its title (the TITLE "
+                f"line in that map's .bin). WolfRAT read it anyway; the map "
+                f"maker should fix it."
+            )
         result.append(AvailableMission(
             catalog_index=int(match.group("index")),
-            filename=match.group("file"),
-            description=match.group("description"),
+            filename=filename,
+            description=(match.group("description") or "").strip(),
             revision=revision,
         ))
     return tuple(result)
@@ -409,15 +493,20 @@ _WEAPON_RE = re.compile(
 
 def parse_weapons(payload: str, revision: int) -> tuple[WeaponEntry, ...]:
     result: list[WeaponEntry] = []
-    for raw in payload.splitlines():
-        if not raw.strip():
-            continue
+    for raw, repaired in _indexed_rows(payload):
         match = _WEAPON_RE.match(raw)
         if not match:
-            raise ValueError(f"malformed WEAPON LIST row: {raw!r}")
+            _warn(f"Skipped a WEAPON LIST row WolfRAT could not read: {raw.strip()!r}")
+            continue
         admdef_id = int(match.group("id"))
         if not (0 <= admdef_id <= 254):
-            raise ValueError(f"weapon id outside retail table range: {admdef_id}")
+            _warn(f"Skipped weapon id {admdef_id} (outside 0-254): {raw.strip()!r}")
+            continue
+        if repaired:
+            _warn(
+                f"Weapon {match.group('name')!r} came back split over two "
+                f"lines; WolfRAT joined them."
+            )
         result.append(WeaponEntry(
             admdef_id=admdef_id,
             name=match.group("name"),
@@ -995,6 +1084,7 @@ __all__ = [
     "MAX_COMMAND_TOKENS", "MissionEntry",
     "PlayerEntry", "ReplyPolicy", "SETTING_SCHEMA", "WeaponEntry", "WeaponMode",
     "parse_available_missions", "parse_chat", "parse_game_settings",
+    "set_parse_warning_sink",
     "parse_game_state", "parse_missions", "parse_players", "parse_weapons",
     "raw_command",
 ]
