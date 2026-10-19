@@ -81,6 +81,54 @@ def test_exact_name_beats_a_longer_partial_one():
     assert mw.rule_for("td-western.bms", rules).match == "TD-Western.bms"
 
 
+def test_game_mode_prefix_keeps_dm_and_td_apart():
+    """DM- and TD-SulphurCreek are the same ground but want different weapons."""
+    rules = [mw.MapRule(match="DM-SulphurCreek.bms")]
+    assert mw.rule_for("DM-SulphurCreek.bms", rules).match == "DM-SulphurCreek.bms"
+    assert mw.rule_for("TD-SulphurCreek.bms", rules) is None
+    assert mw.rule_for("TK-SulphurCreek.bms", rules) is None
+    # a rule saved under the bare name still covers every mode
+    assert mw.rule_for("TD-SulphurCreek.bms", [mw.MapRule(match="SulphurCreek")]).match == "SulphurCreek"
+
+
+def test_saving_td_leaves_the_dm_rule_alone(tmp_path):
+    server = FakeServer()
+    k = keeper(tmp_path, server, rules=[western_rule(), mw.MapRule(match="DM-SulphurCreek.bms",
+                                                                   weapons={"WPN_357": "ALWAYS"})])
+    k.current_map = "TD-SulphurCreek.bms"
+    k.save_rule("TD-SulphurCreek.bms", server.entries())
+    assert sorted(r.match for r in mw.load_config(k.path).rules) == \
+        ["DM-SulphurCreek.bms", "TD-SulphurCreek.bms", "TD-Western.bms"]
+
+
+def test_copy_rule_gives_each_map_its_own_copy(tmp_path):
+    server = FakeServer()
+    k = keeper(tmp_path, server, rules=[western_rule(), mw.MapRule(match="TD-SulphurCreek.bms",
+                                                                   weapons={"WPN_M4AUTO": "NEVER"})])
+    made = k.copy_rule(western_rule(), [("TD-SulphurCreek.bms", "TD - Sulphur Creek"),
+                                        ("DM-SulphurCreek.bms", "DM - Sulphur Creek"),
+                                        ("TD-Western.bms", "")])          # the source itself: skipped
+    assert [r.match for r in made] == ["TD-SulphurCreek.bms", "DM-SulphurCreek.bms"]
+    saved = {r.match: r for r in mw.load_config(k.path).rules}
+    assert len(saved) == 3
+    assert saved["TD-SulphurCreek.bms"].weapons == western_rule().weapons      # replaced, not merged
+    assert saved["DM-SulphurCreek.bms"].label == "DM - Sulphur Creek"
+    saved["DM-SulphurCreek.bms"].weapons["WPN_357"] = "NEVER"
+    assert k.config.rules[0].weapons["WPN_357"] == "ALWAYS"                    # a copy, not shared
+
+
+def test_copy_onto_the_map_being_played_sends_it(tmp_path):
+    server = FakeServer()
+    k = keeper(tmp_path, server, rules=[western_rule()])
+    k.current_map = "TD-SulphurCreek.bms"
+    k.copy_rule(western_rule(), [("TD-SulphurCreek.bms", "")])
+    assert k._request == ("TD-SulphurCreek.bms", "rule copied")
+    k.copy_rule(western_rule(), [("AS-Doslin.bms", "")])
+    k._request = None
+    k.copy_rule(western_rule(), [("AS-Doslin.bms", "")])
+    assert k._request is None                                                  # not playing: nothing sent
+
+
 def test_current_map_from_mission_list():
     lines = ["0: 03TR.BMS - () () () <> <>", "1: MOGADISHU.BMS - (2x) () () <CURRENT MISSION> <>"]
     assert mw.current_map_from_missions(lines) == "MOGADISHU.BMS"

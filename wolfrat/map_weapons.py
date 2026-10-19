@@ -29,12 +29,17 @@ mid-match from the Weapons tab.
 
 Rules are keyed by weapon NAME, not the ADMDEF number, so a rule survives a
 mod that renumbers its weapons.
+
+Map names keep their game-mode prefix here (unlike Weather and Sky, where
+DM-, TD- and TK-SulphurCreek are one map): a deathmatch and a team
+deathmatch on the same ground want different weapons (Dale, 2026-10-19).
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from collections import Counter
@@ -42,7 +47,15 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
 
 from wolfrat.admin_commands import WeaponEntry, WeaponMode
-from wolfrat.weather_dynamic import map_key
+
+_EXTENSION = re.compile(r"\.(bms|npj|mis)$", re.IGNORECASE)   # as weather_dynamic
+
+
+def map_key(name: str) -> str:
+    """Lower case, no extension, letters and digits only. The game-mode
+    prefix STAYS: 'DM-SulphurCreek.bms' -> 'dmsulphurcreek'."""
+    text = _EXTENSION.sub("", (name or "").strip().lower())
+    return re.sub(r"[^a-z0-9]", "", text)
 
 NO_RULE_ALL_YES = "all_yes"
 NO_RULE_LEAVE = "leave"
@@ -352,6 +365,29 @@ class MapWeaponsKeeper:
             self.applied_map = self.current_map   # it IS what the server has right now
             self._manual = False
         return rule
+
+    def copy_rule(self, source: MapRule, maps: Sequence[tuple]) -> list:
+        """Give each (map file, display name) in `maps` its own copy of
+        `source`'s weapons, replacing any rule saved under that exact name.
+        The maps do not need to be playing. Returns the new rules."""
+        made = []
+        for map_name, label in maps:
+            key = map_key(map_name)
+            if not key or key == map_key(source.match):
+                continue
+            rule = MapRule(match=map_name.strip(), label=label or "", weapons=dict(source.weapons),
+                           saved=time.strftime("%Y-%m-%d %H:%M"))
+            self.config.rules = [old for old in self.config.rules if map_key(old.match) != key]
+            self.config.rules.append(rule)
+            made.append(rule)
+        if made:
+            self.save()
+        current = map_key(self.current_map or "")
+        if self.config.enabled and current and any(map_key(rule.match) == current for rule in made):
+            self._manual = False                     # the map being played just got new weapons
+            self._applies_this_map = 0
+            self._ask(self.current_map, "rule copied")
+        return made
 
     def remove_rule(self, match: str) -> None:
         self.config.rules = [rule for rule in self.config.rules if map_key(rule.match) != map_key(match)]

@@ -7748,6 +7748,7 @@ class WeaponsTab(QWidget):
         self.server = server
         self.map_weapons = None              # map_weapons.MapWeaponsKeeper, attached by the main window
         self._display_name = lambda filename: filename
+        self._map_list = None                # () -> [(map file, display name)], every map the server has
         self._admin_futures = QtAdminDispatcher(
             parent=self, error_sink=self.server._log
         )
@@ -7860,6 +7861,12 @@ class WeaponsTab(QWidget):
                             "the current map gets those weapons every time it loads.")
         save_btn.clicked.connect(self._save_map_rule)
         buttons.addWidget(save_btn)
+        copy_btn = SatisfyingButton("Copy rule to maps...")
+        copy_btn.setToolTip("Give other maps the same weapons as a saved rule\n"
+                            "(they do not need to be playing). Select a rule first, or it\n"
+                            "starts with the current map's.")
+        copy_btn.clicked.connect(self._copy_map_rule)
+        buttons.addWidget(copy_btn)
         remove_btn = SatisfyingButton("Remove rule")
         remove_btn.setToolTip("Delete the selected map's rule")
         remove_btn.clicked.connect(self._remove_map_rule)
@@ -7881,10 +7888,11 @@ class WeaponsTab(QWidget):
         self.map_status_signal.connect(lambda text: self.map_status_label.setText(f"Last: {text}"))
         return box
 
-    def attach_map_weapons(self, keeper, display_name=None):
+    def attach_map_weapons(self, keeper, display_name=None, map_list=None):
         self.map_weapons = keeper
         if display_name is not None:
             self._display_name = display_name
+        self._map_list = map_list
         self.map_enabled_cb.blockSignals(True)
         self.map_enabled_cb.setChecked(keeper.config.enabled)
         self.map_enabled_cb.blockSignals(False)
@@ -7962,6 +7970,33 @@ class WeaponsTab(QWidget):
         self.map_status_label.setText(
             f"Last: saved the weapons for {self._display_name(current)} ({rule.summary()})")
         self._refresh_map_rules()
+
+    def _copy_map_rule(self):
+        keeper = self.map_weapons
+        if keeper is None:
+            return
+        if not keeper.config.rules:
+            QMessageBox.information(self, "Map Weapons",
+                                    "No saved rule to copy yet: play a map, set its weapons, "
+                                    "then click 'Save for this map'.")
+            return
+        from wolfrat.map_weapons_copy_dialog import CopyRuleDialog
+        row = self.map_rules_table.currentRow()
+        if 0 <= row < len(keeper.config.rules):
+            source = keeper.config.rules[row]
+        else:
+            source = map_weapons.rule_for(keeper.current_map, keeper.config.rules)
+        try:
+            maps = list(self._map_list()) if self._map_list else []
+        except Exception:
+            maps = []
+        dialog = CopyRuleDialog(keeper, maps, source=source, display_name=self._display_name, parent=self)
+        dialog.exec()
+        for rule in dialog.made:
+            self.server._log(f"[MAP WEAPONS] copied rule to '{rule.match}': {rule.summary()}")
+        if dialog.made:
+            self.map_status_label.setText(f"Last: copied a rule to {len(dialog.made)} map(s)")
+            self._refresh_map_rules()
 
     def _remove_map_rule(self):
         keeper = self.map_weapons
@@ -9147,7 +9182,10 @@ class MainWindow(QMainWindow):
             log=lambda text: self.server._log(text),
             status=lambda text: self.weapons_tab.map_status_signal.emit(text),
         )
-        self.weapons_tab.attach_map_weapons(self.map_weapons, display_name=self.missions_tab._find_display_name)
+        self.weapons_tab.attach_map_weapons(
+            self.map_weapons, display_name=self.missions_tab._find_display_name,
+            map_list=lambda: [(m.get('file', ''), m.get('name', ''))
+                              for m in self.missions_store._data.get('available', [])])
         self.signals.missions_signal.connect(self.weapons_tab.on_missions_updated)
         self.signals.connected_signal.connect(self.map_weapons.on_connected)
         # The next map's weapons go on before it loads (players' weapon menus
