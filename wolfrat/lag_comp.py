@@ -567,13 +567,15 @@ def apply_settings(pid: int, settings: Settings, wanted_name: Optional[str] = No
         return read_state(proc, wanted_name)
 
 
-def reset_stats(pid: int, wanted_name: Optional[str] = None) -> None:
+def reset_stats(pid: int, wanted_name: Optional[str] = None) -> bool:
+    """Clear the numbers.  False when the helper is not in this server."""
     with ServerProcess(pid) as proc:
         state = read_state(proc, wanted_name)
         if not state.shared:
-            return
+            return False
         seq = struct.unpack("<I", proc.read(state.shared + _OFF["reset_seq"], 4))[0]
         proc.write(state.shared + _OFF["reset_seq"], struct.pack("<I", (seq + 1) & 0xFFFFFFFF))
+        return True
 
 
 def turn_on(pid: int, memory, data_dir: str, settings: Settings) -> State:

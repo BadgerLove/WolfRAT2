@@ -13,6 +13,7 @@ is none.  The numbers refresh every second on their own while the page shows.
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -35,6 +36,9 @@ BANNER = (
 
 NO_SERVER = ("Lag compensation needs WolfRAT on the same PC as the game server, connected "
              "to it (Server connection page).")
+RESET_TEXT = "Start counting again"
+RESET_TIP_ON = "Set every number on this page back to zero and count from now."
+RESET_TIP_OFF = "Nothing to count yet - switch lag compensation on first."
 
 _HELP = (
     "<b>The problem.</b> The server decides every hit, against where people are on the "
@@ -99,6 +103,8 @@ class LagCompPanel(QWidget):
         self._pid: Optional[int] = None
         self._state: Optional[lc.State] = None
         self._last_record = 0.0
+        self._reset_note = ""           # "counting started again" line, shown for a few seconds
+        self._reset_note_until = 0.0
         self._updating = False
         self._build()
         self._show_wish()
@@ -182,7 +188,9 @@ class LagCompPanel(QWidget):
         self.suggest_btn = QPushButton("Use suggested")
         self.suggest_btn.setEnabled(False)
         buttons.addWidget(self.suggest_btn)
-        self.reset_btn = QPushButton("Start counting again")
+        self.reset_btn = QPushButton(RESET_TEXT)
+        self.reset_btn.setEnabled(False)
+        self.reset_btn.setToolTip(RESET_TIP_OFF)
         buttons.addWidget(self.reset_btn)
         buttons.addStretch()
         stats_box.addLayout(buttons)
@@ -304,11 +312,33 @@ class LagCompPanel(QWidget):
         if not self._pid:
             return
         try:
-            lc.reset_stats(self._pid, self._helper_name)
-            self._log("Lag compensation: counting started again.")
+            cleared = lc.reset_stats(self._pid, self._helper_name)
         except lc.LagCompError as exc:
             self._log("Lag compensation: " + str(exc))
-        self._refresh_stats()
+            self.totals_lbl.setText("⚠ Could not start counting again: " + str(exc))
+            return
+        if not cleared:
+            self.totals_lbl.setText("Nothing to clear - lag compensation is not in this "
+                                    "server yet. Switch it on first.")
+            self._show_reset_button(False)
+            return
+        self._log("Lag compensation: counting started again.")
+        self._reset_note = "✔ Counting started again at " + time.strftime("%H:%M:%S") + "."
+        if self._state is not None and not self._state.alive:
+            self._reset_note += " Nobody is on yet: it counts from the first player."
+        self._reset_note_until = time.monotonic() + 8.0
+        self.reset_btn.setText("✔ Started again")
+        QTimer.singleShot(2500, lambda: self.reset_btn.setText(RESET_TEXT))
+        self._refresh_stats(force=True)
+
+    def _show_reset_button(self, loaded: bool):
+        self.reset_btn.setEnabled(loaded)
+        self.reset_btn.setToolTip(RESET_TIP_ON if loaded else RESET_TIP_OFF)
+
+    def _with_reset_note(self, text: str) -> str:
+        if self._reset_note and time.monotonic() < self._reset_note_until:
+            return "<b>" + self._reset_note + "</b><br>" + text
+        return text
 
     # ---------------------------------------------- called by the Weather tab
     def wants_write(self) -> bool:
@@ -319,6 +349,7 @@ class LagCompPanel(QWidget):
         self._pid = None
         self._state = None
         self._set_available(False)
+        self._show_reset_button(False)
         self.server_lbl.setText("⚠ " + text)
         self.state_lbl.setText("")
 
@@ -358,6 +389,7 @@ class LagCompPanel(QWidget):
             state = self._write(pid, memory, state)
         self._state = state
         self._show_state(state)
+        self._show_reset_button(bool(state.shared))
 
     def _write(self, pid: int, memory, state: lc.State) -> lc.State:
         self._dirty = False
@@ -405,14 +437,15 @@ class LagCompPanel(QWidget):
         self.state_lbl.setText(text)
 
     # ------------------------------------------------------------- numbers
-    def _refresh_stats(self):
-        if not self._pid or not self.isVisible():
+    def _refresh_stats(self, force: bool = False):
+        if not self._pid or not (force or self.isVisible()):
             return
         try:
             st = lc.server_state(self._pid, self._helper_name)
         except lc.LagCompError:
             return
         self._state = st
+        self._show_reset_button(bool(st.shared))
         if not st.stats:
             self.totals_lbl.setText("No numbers yet - switch it on.")
             self.tune_lbl.setText("")
@@ -422,7 +455,6 @@ class LagCompPanel(QWidget):
         s = st.stats
         self._show_totals(st, s)
         self._show_players(s)
-        import time
         now = time.time()
         if now - self._last_record >= 30 and st.settings and \
                 self._history.record(self._pid, s, st.settings, now):
@@ -436,18 +468,18 @@ class LagCompPanel(QWidget):
     def _show_totals(self, st: lc.State, s: lc.Stats):
         minutes = s.seconds // 60
         if not s.tests:
-            self.totals_lbl.setText(
+            self.totals_lbl.setText(self._with_reset_note(
                 f"Counting for {minutes} min. No shots from rewound players yet "
-                f"(server tick {s.tick_us / 1000:.1f} ms).")
+                f"(server tick {s.tick_us / 1000:.1f} ms)."))
         else:
             gain = s.gain_percent
             word = "would have" if st.observe else "counted"
-            self.totals_lbl.setText(
+            self.totals_lbl.setText(self._with_reset_note(
                 f"<b>{s.hits:,}</b> hits {word} with it, <b>{s.plain_hits:,}</b> without "
                 f"(<b>{'-' if gain is None else '%+.0f%%' % gain}</b>)"
                 f"<br>Saved <b>{s.gained:,}</b> · cost <b>{s.lost:,}</b>"
                 f"<br><span style='font-size:9pt'>{minutes} min · {s.tests:,} bullet "
-                f"checks · server tick {s.tick_us / 1000:.1f} ms</span>")
+                f"checks · server tick {s.tick_us / 1000:.1f} ms</span>"))
         suggestion = s.suggested_extra()
         if s.cal_median is None:
             self.tune_lbl.setText("Best rewind: waiting for shots that pass close to someone.")
