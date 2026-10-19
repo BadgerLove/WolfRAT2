@@ -1027,11 +1027,13 @@ class ServerManagerFacadeTests(unittest.TestCase):
 
         self.assertTrue(combined.result().verified)
         self.assertTrue(setting.result().verified)
+        # Kill comes first: killed after the swap, JO blames the victim's
+        # last attacker, now a teammate, for a team kill (and punts them).
         self.assertEqual(
             [
-                AdminOperation.PLAYER_SWAPTEAM,
-                AdminOperation.PLAYER_LIST,
                 AdminOperation.PLAYER_KILL,
+                AdminOperation.PLAYER_LIST,
+                AdminOperation.PLAYER_SWAPTEAM,
                 AdminOperation.PLAYER_LIST,
                 AdminOperation.SET_SETTING,
                 AdminOperation.GET_GAMESETTINGS,
@@ -1203,7 +1205,23 @@ class ServerManagerFacadeTests(unittest.TestCase):
             [AdminOperation.MISSION_SETNEXT],
         )
 
-    def test_rejected_swap_never_kills_player(self):
+    def test_rejected_kill_never_swaps_player(self):
+        rejection = CommandResult(
+            AdminOperation.PLAYER_KILL,
+            ("ERROR - Player Not Found.",),
+            False,
+        )
+        self.session.result_overrides[AdminOperation.PLAYER_KILL] = [rejection]
+
+        result = self.manager.swap_and_kill(12).result()
+
+        self.assertIs(result, rejection)
+        self.assertEqual(
+            [spec.operation for spec in self.session.specs],
+            [AdminOperation.PLAYER_KILL],
+        )
+
+    def test_rejected_swap_after_kill_is_reported(self):
         rejection = CommandResult(
             AdminOperation.PLAYER_SWAPTEAM,
             ("ERROR - Player Not Found.",),
@@ -1216,7 +1234,11 @@ class ServerManagerFacadeTests(unittest.TestCase):
         self.assertIs(result, rejection)
         self.assertEqual(
             [spec.operation for spec in self.session.specs],
-            [AdminOperation.PLAYER_SWAPTEAM],
+            [
+                AdminOperation.PLAYER_KILL,
+                AdminOperation.PLAYER_LIST,
+                AdminOperation.PLAYER_SWAPTEAM,
+            ],
         )
 
     def test_rejected_sequence_step_stops_later_announcements(self):
@@ -1550,13 +1572,13 @@ class ServerManagerFacadeTests(unittest.TestCase):
         self.assertTrue(setting.result().verified)
         self.assertEqual(
             [
-                AdminOperation.PLAYER_SWAPTEAM,
-                AdminOperation.PLAYER_LIST,
                 AdminOperation.PLAYER_KILL,
                 AdminOperation.PLAYER_LIST,
                 AdminOperation.PLAYER_SWAPTEAM,
                 AdminOperation.PLAYER_LIST,
                 AdminOperation.PLAYER_KILL,
+                AdminOperation.PLAYER_LIST,
+                AdminOperation.PLAYER_SWAPTEAM,
                 AdminOperation.PLAYER_LIST,
                 AdminOperation.SET_SETTING,
                 AdminOperation.GET_GAMESETTINGS,
@@ -1629,15 +1651,48 @@ class ServerManagerFacadeTests(unittest.TestCase):
             ),
         )
 
-        with patch("wolfrat.protocol.random.shuffle", lambda _items: None):
-            workflow = self.manager.shuffle_teams()
+        workflow = self.manager.shuffle_teams()
 
+        # A 1v1 has no other split: refuse rather than just trade sides.
         result = workflow.completion.result()
-        self.assertEqual(("No changes needed",), workflow.messages)
+        self.assertEqual(("Not enough players to mix teams",), workflow.messages)
         self.assertTrue(result.accepted)
         self.assertTrue(result.verified)
-        self.assertEqual(("No changes needed",), result.replies)
+        self.assertEqual(("Not enough players to mix teams",), result.replies)
         self.assertEqual([], self.session.specs)
+
+    def test_shuffle_really_mixes_even_teams(self):
+        from wolfrat.protocol import _shuffle_moves
+
+        for size in (2, 3, 4, 8):
+            team1 = [
+                PlayerEntry(10 + i, f"A{i}", 1) for i in range(size)
+            ]
+            team2 = [
+                PlayerEntry(50 + i, f"B{i}", 2) for i in range(size)
+            ]
+            before = {
+                frozenset(p.server_id for p in team1),
+                frozenset(p.server_id for p in team2),
+            }
+            for _ in range(200):
+                moved = {p.server_id for p in _shuffle_moves(team1, team2)}
+                self.assertTrue(moved)
+                after1 = frozenset(
+                    p.server_id
+                    for p in team1 + team2
+                    if (p.team == 1) != (p.server_id in moved)
+                )
+                after2 = frozenset(
+                    p.server_id for p in team1 + team2
+                ) - after1
+                # Teams stay even and are a different split, not a
+                # straight trade of sides.
+                self.assertEqual(size, len(after1))
+                self.assertNotIn(after1, before)
+                self.assertNotIn(after2, before)
+                # Never more moves than half the server.
+                self.assertLessEqual(len(moved), size)
 
 
 if __name__ == "__main__":

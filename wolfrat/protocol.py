@@ -1002,11 +1002,25 @@ class ServerManager:
         *,
         allow_coop: bool = False,
     ) -> Future:
+        # Kill on the old team first, then swap. JO blames every death on
+        # the victim's last attacker (entity +0x178). Its own team change
+        # clears that before killing; PLAYER SWAPTEAM does not, so
+        # swap-then-kill left the victim on their last attacker's team and
+        # the server logged a team kill for the shooter - past
+        # MaxFriendlyKills it punted them (Mix Teams kicked players).
+        if self.swap_guard is not None:
+            self.swap_guard.check(allow_coop)
+        player = self._rebind_owned_player(
+            target, session, expected_team=target.team
+        )
         return self._then(
-            self._swap_player_now(target, session, allow_coop=allow_coop),
-            lambda _result: self._kill_player_now(
-                self._rebind_owned_player(target, session),
+            self._kill_player_now(player, session),
+            lambda _result: self._swap_player_now(
+                self._rebind_owned_player(
+                    player, session, expected_team=player.team
+                ),
                 session,
+                allow_coop=allow_coop,
             ),
         )
 
@@ -1695,10 +1709,15 @@ class ServerManager:
                 "Need players on both teams to shuffle"
             )
 
-        swap_count = min(len(team1), len(team2))
-        from_team1 = random.sample(team1, swap_count)
-        from_team2 = random.sample(team2, swap_count)
-        targets = tuple(from_team1 + from_team2)
+        # Deal everyone into two new teams at random (sizes within 1) and
+        # move only the players whose team changes. The old code moved the
+        # whole smaller team plus as many from the other, so the picked
+        # groups stayed together: an even 2v2 just traded sides.
+        targets = _shuffle_moves(team1, team2)
+        if not targets:
+            return self._completed_team_workflow(
+                "Not enough players to mix teams"
+            )
 
         names = [p.name for p in targets]
         name_list = ", ".join(names)
@@ -2072,6 +2091,39 @@ def _settle_future(
             future.set_exception(error)
     except InvalidStateError:
         pass
+
+
+def _shuffle_moves(
+    team1: list[PlayerEntry], team2: list[PlayerEntry]
+) -> tuple[PlayerEntry, ...]:
+    """Players to move for a real mix; empty when no other split exists."""
+
+    players = team1 + team2
+    if len(players) < 3:
+        return ()
+    current = {
+        frozenset(p.server_id for p in team1),
+        frozenset(p.server_id for p in team2),
+    }
+    for _attempt in range(100):
+        order = random.sample(players, len(players))
+        size = len(players) // 2
+        if len(players) % 2 and random.random() < 0.5:
+            size += 1
+        group = order[:size]
+        if frozenset(p.server_id for p in group) in current:
+            continue
+        rest = order[size:]
+        # The new split is fixed; give each half whichever team means
+        # fewer players are killed and moved.
+        as_is = [p for p in group if p.team != 1] + [
+            p for p in rest if p.team != 2
+        ]
+        flipped = [p for p in group if p.team != 2] + [
+            p for p in rest if p.team != 1
+        ]
+        return tuple(as_is if len(as_is) <= len(flipped) else flipped)
+    return ()
 
 
 def _result_succeeded(result: object) -> bool:
