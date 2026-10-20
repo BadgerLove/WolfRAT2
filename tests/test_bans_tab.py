@@ -382,3 +382,63 @@ def test_zone_flip_is_reported_to_the_sprees_hook_and_zones_left_feeds_the_vote(
     rig.tab.on_missions_updated(["3: AS-Other.bms - () () () <CURRENT MISSION> <>"])
     rig.now += 5; rig.tab.on_players([{"id": "1", "name": "Dale", "team": "2"}])   # after a map change: first sight again
     assert len(got) == 2
+
+
+# ---- saving while a file is busy (JustAPlayer's crash, 2026-10-20) ----------
+# WinError 32 at start-up: the checks page saved while the tab was still being built,
+# the save failed (file held by OneDrive / antivirus / a second WolfRAT) and logging
+# the failure hit the not-yet-made log box -> AttributeError, WolfRAT never opened.
+
+def test_start_up_does_not_write_and_survives_a_locked_file(tmp_path):
+    import json
+    from wolfrat import bans_tab as bt
+    checks = tmp_path / bt.CHECKS_FILE
+    checks.write_text(json.dumps({"config": {"enabled": True}}), encoding="utf-8")
+    before = checks.stat().st_mtime_ns
+    with open(checks, "r", encoding="utf-8"):          # held open = os.replace onto it is refused
+        rig = Rig(tmp_path)
+    assert rig.tab.checks.enabled
+    assert checks.stat().st_mtime_ns == before
+    assert not any(name.endswith(".json") and name != bt.CHECKS_FILE for name in os.listdir(tmp_path))
+    assert rig.logged == []
+
+
+def test_busy_file_is_retried_then_saved(tmp_path, monkeypatch):
+    from wolfrat import bans_tab as bt
+    rig = Rig(tmp_path)
+    real, calls = os.replace, []
+
+    def busy_twice(src, dst):
+        calls.append(dst)
+        if len(calls) <= 2:
+            raise PermissionError(13, "The process cannot access the file", None, 32)
+        return real(src, dst)
+
+    monkeypatch.setattr(bt.os, "replace", busy_twice)
+    monkeypatch.setattr(bt.time, "sleep", lambda _s: None)
+    rig.tab.checks_cb.setChecked(not rig.tab.checks_cb.isChecked())
+    assert len(calls) == 6                               # 2 refusals, then all four files
+    assert os.path.exists(tmp_path / bt.CHECKS_FILE)
+    assert not any("Could not save" in line for line in rig.logged)
+
+
+def test_file_that_stays_busy_warns_and_carries_on(tmp_path, monkeypatch):
+    from wolfrat import bans_tab as bt
+    rig = Rig(tmp_path)
+
+    def always_busy(src, dst):
+        raise PermissionError(13, "The process cannot access the file", None, 32)
+
+    monkeypatch.setattr(bt.os, "replace", always_busy)
+    monkeypatch.setattr(bt.time, "sleep", lambda _s: None)
+    rig.tab.idle_cb.setChecked(not rig.tab.idle_cb.isChecked())
+    warned = [line for line in rig.logged if "Could not save" in line]
+    assert len(warned) == 4 and "Could not save " + bt.BANS_FILE in warned[0]
+    assert "Could not save" in rig.tab.log_text.toPlainText()
+
+
+def test_log_before_the_log_box_exists_goes_to_the_console(tmp_path):
+    rig = Rig(tmp_path)
+    del rig.tab.log_text
+    rig.tab.log("early line")
+    assert rig.logged[-1] == "early line"

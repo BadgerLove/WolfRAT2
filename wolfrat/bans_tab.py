@@ -39,6 +39,7 @@ BANS_FILE = "wolfrat_bans.json"
 HISTORY_FILE = "wolfrat_player_history.json"
 CHECKS_FILE = "wolfrat_ip_checks.json"
 IDLE_FILE = "wolfrat_idle.json"
+SAVE_RETRIES = 5                     # file busy -> try again 100 ms later, then give up with a warning
 EXPIRY_CHOICES = [("never", ""), ("1 hour", "1h"), ("1 day", "1d"), ("7 days", "7d"),
                   ("30 days", "30d"), ("90 days", "90d")]
 
@@ -214,7 +215,15 @@ class BansTab(QWidget):
                 tmp = path + ".tmp"
                 with open(tmp, "w", encoding="utf-8") as handle:
                     json.dump(payload, handle)
-                os.replace(tmp, path)
+                for attempt in range(SAVE_RETRIES):
+                    try:
+                        os.replace(tmp, path)
+                        break
+                    except PermissionError:
+                        # WinError 32: OneDrive, antivirus or a second WolfRAT has the file open for a moment
+                        if attempt == SAVE_RETRIES - 1:
+                            raise
+                        time.sleep(0.1)
             except OSError as exc:
                 self.log(f"Could not save {name}: {exc}")
         self._dirty = False
@@ -368,8 +377,8 @@ class BansTab(QWidget):
         self.idle_cb.stateChanged.connect(self._idle_changed)
         self.idle_mods_cb.stateChanged.connect(self._idle_changed)
         self.idle_minutes.valueChanged.connect(self._idle_changed)
+        self._idle_changed()              # status line only - still loading, so no save
         self._loading_idle = False
-        self._idle_changed()
         return page
 
     def _idle_changed(self):
@@ -556,8 +565,8 @@ class BansTab(QWidget):
             widget.currentIndexChanged.connect(self._checks_changed)
         for widget in (self.key_edit, self.countries_edit):
             widget.editingFinished.connect(self._checks_changed)
+        self._checks_changed()            # status line only - still loading, so no save
         self._loading_checks = False
-        self._checks_changed()
         return box
 
     def _checks_changed(self):
@@ -1074,5 +1083,7 @@ class BansTab(QWidget):
 
     def log(self, text: str) -> None:
         stamp = time.strftime("%H:%M:%S", time.localtime(self._clock()))
-        self.log_text.appendPlainText(f"[{stamp}] {text}")
+        log_text = getattr(self, "log_text", None)
+        if log_text is not None:          # not built yet while the pages are being made
+            log_text.appendPlainText(f"[{stamp}] {text}")
         self._log_out(text)
