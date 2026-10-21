@@ -8611,6 +8611,7 @@ class MainWindow(QMainWindow):
         self.signals.settings_signal.connect(lambda s: print(f"[WolfRAT] settings_signal received: {len(s)} keys"))
         self.signals.settings_signal.connect(lambda s: self.flash_sync_led())
         self.signals.settings_signal.connect(lambda s: self.web_server.broadcast_state())
+        self.signals.settings_signal.connect(self.update_status_time)
         self.signals.gamestate_signal.connect(lambda s: self.flash_sync_led())
         self.signals.players_signal.connect(lambda s: self.flash_sync_led())
         self.signals.connected_signal.connect(lambda: self.set_connected(True))
@@ -8623,6 +8624,7 @@ class MainWindow(QMainWindow):
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
+        self.signals.disconnected_signal.connect(lambda: self.update_status_time({}))
         self.signals.reconnecting_signal.connect(lambda attempt: self.set_connected(False, f'Reconnecting (Attempt {attempt})...'))
         self.signals.disconnected_signal.connect(lambda: sounds.play("disconnect"))
 
@@ -8894,6 +8896,16 @@ class MainWindow(QMainWindow):
         self.status_map_label = QLabel(" Map: - ")
         self.status_map_label.setStyleSheet("font-size: 10pt; color: #ffff00; font-weight: bold; padding: 2px 8px;")
         status_bar.addWidget(self.status_map_label)
+
+        sep_time = QLabel("│")
+        sep_time.setStyleSheet("color: #333; padding: 0 4px;")
+        status_bar.addWidget(sep_time)
+
+        # Game time left, same numbers as the Settings tab, on every page.
+        self.status_time_label = QLabel(" Time left: - ")
+        self.status_time_label.setStyleSheet("font-size: 10pt; color: #40e040; font-weight: bold; padding: 2px 8px;")
+        self.status_time_label.setToolTip("Game time left on this map / the time limit (server sends whole minutes)")
+        status_bar.addWidget(self.status_time_label)
 
         sep3 = QLabel("│")
         sep3.setStyleSheet("color: #333; padding: 0 4px;")
@@ -9170,6 +9182,18 @@ class MainWindow(QMainWindow):
 
     def update_status_map(self, text):
         self.status_map_label.setText(text)
+
+    def update_status_time(self, settings):
+        """Status bar time left, from GameTime = "remaining/total" minutes."""
+        if not hasattr(self, 'status_time_label'):
+            return
+        raw = str(settings.get('gametime', '')) if settings else ''
+        remaining, slash, total = raw.partition('/')
+        try:
+            text = f" Time left: {int(float(remaining))}m / {int(float(total))}m " if slash else " Time left: - "
+        except ValueError:
+            text = " Time left: - "
+        self.status_time_label.setText(text)
 
     def _start_map_weapons(self):
         """Map Weapons: each map loads with its own weapons (Weapons tab)."""
