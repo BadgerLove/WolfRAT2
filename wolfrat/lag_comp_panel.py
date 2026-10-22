@@ -58,6 +58,11 @@ _HELP = (
     "<i>Hits</i> counted, against <i>Without</i> = what plain JO would have given. "
     "<i>Saved</i> = hits only the rewind gave; <i>Cost</i> = shots that would have hit "
     "before (the target ducked or turned in that split second - their pose is not rewound)."
+    "<br><br><b>Checks.</b> A bullet is not judged once when it is fired. The server moves "
+    "every bullet a short way each tick (about 60 times a second) and checks that bit of "
+    "its path against everyone, until it hits something or runs out. <i>Checks</i> counts "
+    "those, so one bullet that flies a second adds about 60 and a full magazine can add "
+    "a few thousand. Tens of thousands for a busy player is normal, not a fault."
     "<br><br><b>Best rewind</b> looks at every shot that passed close to someone and finds "
     "the rewind that lines it up best. Its middle value, minus the ping, is the <b>Extra</b> "
     "that suits your players. <b>Use suggested</b> sets it (after 300 close shots)."
@@ -67,7 +72,7 @@ _HELP = (
     "<b>Past sessions</b> is one setting."
 )
 
-_PLAYER_COLUMNS = ["Player", "Ping", "Rewind", "Shots", "Hits", "Without", "Gain"]
+_PLAYER_COLUMNS = ["Player", "Ping", "Rewind", "Checks", "Hits", "Without", "Gain"]
 _HISTORY_COLUMNS = ["Started", "Min", "Setting", "Hits", "Without", "Gain", "Best"]
 
 
@@ -469,7 +474,7 @@ class LagCompPanel(QWidget):
         minutes = s.seconds // 60
         if not s.tests:
             self.totals_lbl.setText(self._with_reset_note(
-                f"Counting for {minutes} min. No shots from rewound players yet "
+                f"Counting for {minutes} min. No bullet checks from rewound players yet"
                 f"(server tick {s.tick_us / 1000:.1f} ms)."))
         else:
             gain = s.gain_percent
