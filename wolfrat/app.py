@@ -1,5 +1,5 @@
 """
-WolfRAT 2.10.5 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.10.6 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -8156,6 +8156,8 @@ class WebAdminTab(QWidget):
         self._config_path = self._get_config_path()
         self._config = self._load_config()
         self._pending_web_start = None
+        self._web_start_is_autostart = False
+        self._web_autostart_retries = 0
         self._web_start_finished_signal.connect(
             self._web_start_completed,
             Qt.ConnectionType.QueuedConnection,
@@ -8221,7 +8223,8 @@ class WebAdminTab(QWidget):
         if not self._config.get("web_enabled", False):
             return
         self.ws.port = self._config.get("web_port", 8070)
-        self._observe_web_start(self.ws.start())
+        self._web_autostart_retries = 3
+        self._observe_web_start(self.ws.start(), autostart=True)
 
     def _on_web_login(self, ip, timestamp):
         """Called by web server when a new login happens. Persists to config."""
@@ -8399,8 +8402,9 @@ class WebAdminTab(QWidget):
             self._save_config()
             self._show_msg("New token generated!")
 
-    def _observe_web_start(self, future):
+    def _observe_web_start(self, future, autostart=False):
         self._pending_web_start = future
+        self._web_start_is_autostart = autostart
         self.status_label.setText("Starting…")
         self.status_label.setStyleSheet(
             "font-size: 12pt; font-weight: bold; color: #e8c840;"
@@ -8415,27 +8419,42 @@ class WebAdminTab(QWidget):
         if future is not self._pending_web_start:
             return
         self._pending_web_start = None
+        autostart = self._web_start_is_autostart
+        self._web_start_is_autostart = False
         try:
             outcome = future.result()
         except Exception as error:
-            self._disable_web_after_start_failure()
-            self._update_status(error=str(error))
+            self._handle_web_start_failure(str(error), autostart)
             return
         if outcome.ok and self.ws.is_running:
+            self._web_autostart_retries = 0
             self._update_status()
             return
-        self._disable_web_after_start_failure()
-        self._update_status(
-            error=outcome.error or "Web server stopped before becoming ready"
+        self._handle_web_start_failure(
+            outcome.error or "Web server stopped before becoming ready", autostart
         )
 
-    def _disable_web_after_start_failure(self):
-        self._loading = True
-        try:
-            self.enable_cb.setChecked(False)
-        finally:
-            self._loading = False
-        self._save_config()
+    def _handle_web_start_failure(self, error, autostart):
+        """A start attempt failed. Never erase the saved preference over it: the tick
+        is what the user wants, so it stays ticked and saved true, and we just show the
+        failure (2026-10-25: a transient boot-time failure used to untick the box and
+        write web_enabled=false, so Dale kept finding Web Admin off and 'not saved').
+        For an auto-start at launch, retry a few times in case the network/port was not
+        ready yet."""
+        if autostart and getattr(self, "_web_autostart_retries", 0) > 0:
+            self._web_autostart_retries -= 1
+            self.status_label.setText("Starting…")
+            self.status_label.setStyleSheet(
+                "font-size: 12pt; font-weight: bold; color: #e8c840;"
+            )
+            QTimer.singleShot(
+                4000,
+                lambda: self._observe_web_start(self.ws.start(), autostart=True),
+            )
+            return
+        # Give up retrying, but keep the preference: show Failed, leave the box ticked
+        # and web_enabled=true saved so the next launch tries again.
+        self._update_status(error=error)
 
     def _update_status(self, error=None):
         if self.ws.is_running:
@@ -8524,7 +8543,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.10.5 Main Window."""
+    """WolfRAT 2.10.6 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -8543,7 +8562,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.10.5 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.10.6 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -8620,7 +8639,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.10.5 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.10.6 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -8639,9 +8658,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.10.5 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.10.6 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.10.5 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.10.6 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -8649,7 +8668,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.10.5")
+        header = QLabel("WolfRAT 2.10.6")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -8944,7 +8963,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.10.5 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.10.6 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -9000,7 +9019,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.10.5"
+    _CURRENT_VERSION = "2.10.6"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -9298,7 +9317,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.10.5")
+    app.setApplicationName("WolfRAT 2.10.6")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -9407,7 +9426,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.10.5 STARTED ===")
+    wire_log("=== WolfRAT 2.10.6 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -9460,7 +9479,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.10.5",
+                "2.10.6",
                 data_dir=runtime.data_dir,
             )
         except Exception:
