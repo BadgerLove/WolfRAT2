@@ -1,5 +1,5 @@
 """
-WolfRAT 2.10.6 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.10.7 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -2548,21 +2548,141 @@ class MissionsTab(QWidget):
         except Exception as e:
             self.server._log(f"Save preset error: {e}")
 
+    @staticmethod
+    def _preset_entry_file(entry):
+        return entry["file"] if isinstance(entry, dict) else entry
+
     def _load_preset(self):
         name = self.preset_combo.currentText()
         if name == "(none)" or name not in self._presets:
             return
-
-        reply = QMessageBox.question(
-            self, "Load Preset",
-            f"Add '{name}' maps to current rotation?\n\nOld preset will stay unless you click Cancel.\nClick Clear at the bottom right to remove it.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        if not self.server.is_connected:
+            QMessageBox.information(
+                self, "Load Preset", "Connect to a server first."
+            )
             return
 
-        preset = self._presets[name]
+        # A map taken out of the JO folder is gone from the server's list
+        # after a restart but stays in the preset, and the server refuses it.
+        # Read the list now so those maps are found before anything is added.
+        submit_admin(
+            self,
+            lambda: self.server.refresh_available_maps(),
+            lambda result: self._check_preset_maps(name, result),
+            "Read the server's map list before loading a preset",
+            on_failure=lambda _message: self._check_preset_maps(name, None),
+            policy=CompletionPolicy.ACCEPTED,
+        )
 
+    def _check_preset_maps(self, name, result):
+        if name not in self._presets:
+            return
+        preset = self._presets[name]
+        available = getattr(result, "value", None)
+        if not isinstance(available, tuple) or not available:
+            available = self.server.available_mission_entries
+        if not available:
+            # An empty list means the server has not answered yet, not that
+            # every map is gone: never offer to remove maps on that.
+            QMessageBox.warning(
+                self, "Load Preset",
+                "WolfRAT has not received the server's map list yet, so it "
+                "cannot check the preset.\n\nWait a few seconds and press "
+                "Load again.",
+            )
+            return
+
+        on_server = {mission.filename.casefold() for mission in available}
+        missing = []
+        for entry in preset:
+            filename = self._preset_entry_file(entry)
+            if filename.casefold() not in on_server and filename not in missing:
+                missing.append(filename)
+
+        if not missing:
+            reply = QMessageBox.question(
+                self, "Load Preset",
+                f"Add '{name}' maps to current rotation?\n\nOld preset will stay unless you click Cancel.\nClick Clear at the bottom right to remove it.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            self._start_preset_load(name, preset)
+            return
+
+        choice = self._ask_about_missing_maps(name, missing)
+        if choice is None:
+            return
+        gone = {filename.casefold() for filename in missing}
+        keep = [
+            entry for entry in preset
+            if self._preset_entry_file(entry).casefold() not in gone
+        ]
+        if choice == "remove":
+            self._presets[name] = keep
+            self._save_presets()
+            self.server._log(
+                f"Removed from preset '{name}' (no longer on the server): "
+                + ", ".join(missing)
+            )
+        else:
+            self.server._log(
+                f"Skipped in preset '{name}' (no longer on the server, kept "
+                f"in the preset): " + ", ".join(missing)
+            )
+        if not keep:
+            QMessageBox.information(
+                self, "Load Preset",
+                f"None of the maps in '{name}' are on the server, so there "
+                f"is nothing to load.",
+            )
+            return
+        self._start_preset_load(name, keep)
+
+    def _ask_about_missing_maps(self, name, missing):
+        """'skip', 'remove' or None (Cancel) for maps the server no longer has."""
+        shown = missing[:20]
+        lines = "\n".join(f"  • {filename}" for filename in shown)
+        if len(missing) > len(shown):
+            lines += f"\n  ...and {len(missing) - len(shown)} more"
+        if len(missing) == 1:
+            intro = (
+                f"This map in preset '{name}' is no longer on the server "
+                f"(its file has been taken out of the Joint Ops folder):"
+            )
+        else:
+            intro = (
+                f"These {len(missing)} maps in preset '{name}' are no longer "
+                f"on the server (their files have been taken out of the "
+                f"Joint Ops folder):"
+            )
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("Maps missing from the server")
+        box.setText(f"{intro}\n\n{lines}")
+        box.setInformativeText(
+            "Skip and load: add the other maps to the rotation and keep "
+            "these in the preset (for maps that are only off for a while).\n\n"
+            "Remove and load: take these out of the preset for good, then "
+            "add the other maps to the rotation."
+        )
+        skip_button = box.addButton(
+            "Skip and load", QMessageBox.ButtonRole.AcceptRole
+        )
+        remove_button = box.addButton(
+            "Remove and load", QMessageBox.ButtonRole.AcceptRole
+        )
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(skip_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is skip_button:
+            return "skip"
+        if clicked is remove_button:
+            return "remove"
+        return None
+
+    def _start_preset_load(self, name, preset):
         self.server._log(
             f"Loading preset '{name}' - adding {len(preset)} maps..."
         )
@@ -2573,10 +2693,17 @@ class MissionsTab(QWidget):
             ),
         )
 
-    def _add_missions_in_sequence(self, entries, index=0, on_complete=None):
-        """Add a preset serially and stop at the first rejected operation."""
+    def _add_missions_in_sequence(
+        self, entries, index=0, on_complete=None, failed=None
+    ):
+        """Add a preset serially; a map the server refuses is skipped and
+        listed at the end, it does not stop the rest of the preset."""
 
+        if failed is None:
+            failed = []
         if index >= len(entries):
+            if failed:
+                self._report_failed_preset_adds(failed)
             if on_complete is not None:
                 on_complete()
             return
@@ -2592,16 +2719,56 @@ class MissionsTab(QWidget):
             self,
             lambda: self._send_mission_add(filename, play_count),
             lambda _result: self._mission_added_in_sequence(
-                entries, index, filename, on_complete
+                entries, index, filename, on_complete, failed
             ),
             f"Add preset mission {filename}",
+            on_failure=lambda message: self._mission_failed_in_sequence(
+                entries, index, filename, on_complete, failed, message
+            ),
         )
 
     def _mission_added_in_sequence(
-        self, entries, index, filename, on_complete
+        self, entries, index, filename, on_complete, failed=None
     ):
         self.server._log(f"  [{index + 1}/{len(entries)}] Added {filename}")
-        self._add_missions_in_sequence(entries, index + 1, on_complete)
+        self._add_missions_in_sequence(
+            entries, index + 1, on_complete, failed
+        )
+
+    def _mission_failed_in_sequence(
+        self, entries, index, filename, on_complete, failed, message
+    ):
+        self.server._log(
+            f"  [{index + 1}/{len(entries)}] Skipped {filename}: {message}"
+        )
+        failed.append(filename)
+        if not self.server.is_connected:
+            # Connection gone: the rest would only fail the same way.
+            failed.extend(
+                self._preset_entry_file(entry) for entry in entries[index + 1:]
+            )
+            self._report_failed_preset_adds(failed, disconnected=True)
+            return
+        self._add_missions_in_sequence(
+            entries, index + 1, on_complete, failed
+        )
+
+    def _report_failed_preset_adds(self, failed, disconnected=False):
+        shown = failed[:20]
+        lines = "\n".join(f"  • {filename}" for filename in shown)
+        if len(failed) > len(shown):
+            lines += f"\n  ...and {len(failed) - len(shown)} more"
+        reason = (
+            "The connection to the server was lost, so these maps were not "
+            "added:"
+            if disconnected
+            else "The server would not add these maps, so they were skipped "
+            "(the rest of the preset was added):"
+        )
+        QMessageBox.warning(
+            self, "Load Preset",
+            f"{reason}\n\n{lines}\n\nThe console log says why.",
+        )
 
     def _ok_clicked(self):
         """Save Auto Rotation - snapshot the current cycle for auto-apply on connect."""
@@ -8543,7 +8710,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.10.6 Main Window."""
+    """WolfRAT 2.10.7 Main Window."""
 
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
@@ -8562,7 +8729,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.10.6 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.10.7 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -8639,7 +8806,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.10.6 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.10.7 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -8658,9 +8825,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.10.6 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.10.7 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.10.6 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.10.7 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -8668,7 +8835,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.10.6")
+        header = QLabel("WolfRAT 2.10.7")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -8963,7 +9130,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.10.6 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.10.7 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -9019,7 +9186,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.10.6"
+    _CURRENT_VERSION = "2.10.7"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -9317,7 +9484,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.10.6")
+    app.setApplicationName("WolfRAT 2.10.7")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -9426,7 +9593,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.10.6 STARTED ===")
+    wire_log("=== WolfRAT 2.10.7 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -9479,7 +9646,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.10.6",
+                "2.10.7",
                 data_dir=runtime.data_dir,
             )
         except Exception:
