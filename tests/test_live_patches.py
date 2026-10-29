@@ -184,6 +184,23 @@ def test_restart_with_reapply_puts_it_back():
     assert result.state.on and result.wish.on and "put back" in result.note
 
 
+def test_a_failed_put_back_after_a_restart_stays_ticked_and_retries(monkeypatch):
+    clock = [1000.0]
+    monkeypatch.setattr(lp.time, "monotonic", lambda: clock[0])
+    keeper = lp.ChuteKeeper()
+    restarted = FakeServer(can_write=False)
+    result = keeper.tick(restarted, ON, writable=True, reapply=True)
+    assert result.wish.on and "Still ticked" in result.note
+    assert keeper.tick(restarted, ON, writable=True, reapply=True).note == ""   # waits
+    clock[0] += lp.ChuteKeeper.RETRY_SECONDS
+    again = keeper.tick(restarted, ON, writable=True, reapply=True)
+    assert again.wish.on and again.note == ""                 # same error: not repeated
+    restarted.can_write = True
+    clock[0] += lp.ChuteKeeper.RETRY_SECONDS
+    back = keeper.tick(restarted, ON, writable=True, reapply=True)
+    assert back.state.on and back.wish.on and "put back" in back.note
+
+
 def test_reapply_waits_for_write_access():
     keeper = lp.ChuteKeeper()
     result = keeper.tick(FakeServer(), ON, writable=False, reapply=True)

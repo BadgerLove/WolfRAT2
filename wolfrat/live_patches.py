@@ -24,6 +24,7 @@ private vault.
 from __future__ import annotations
 
 import struct
+import time
 from dataclasses import dataclass, replace
 from typing import Optional
 
@@ -241,13 +242,19 @@ class ChuteKeeper:
     - a safety-net cave left by a test build: the plain one goes back, once.
     """
 
+    RETRY_SECONDS = 60
+
     def __init__(self):
         self.dirty = False
         self._gave_up_on = None          # cave a rewrite failed on: no retry storm
+        self._reapply_retry_at = 0.0     # a failed put-back tries again from then
+        self._reapply_error = ""         # reported once, not every retry
 
     def changed(self):
         self.dirty = True
         self._gave_up_on = None
+        self._reapply_retry_at = 0.0
+        self._reapply_error = ""
 
     def tick(self, mem, wish: ChuteWish, *, writable: bool, reapply: bool) -> KeeperResult:
         state = chute_state(mem)
@@ -278,10 +285,20 @@ class ChuteKeeper:
                                     "(it restarted?). Tick it to put it back.")
             if not writable:
                 return KeeperResult(state, wish, waiting=True)
+            if time.monotonic() < self._reapply_retry_at:
+                return KeeperResult(state, wish)
             try:
                 state = chute_on(mem)
             except LivePatchError as exc:
-                return KeeperResult(state, ChuteWish(False), f"Spacebar parachute: {exc}")
+                # Stays ticked: a failed put-back is retried, never unticked.
+                self._reapply_retry_at = time.monotonic() + self.RETRY_SECONDS
+                note = "" if str(exc) == self._reapply_error else (
+                    f"Spacebar parachute: {exc} Still ticked - WolfRAT tries again "
+                    f"every {self.RETRY_SECONDS} s.")
+                self._reapply_error = str(exc)
+                return KeeperResult(state, wish, note)
+            self._reapply_retry_at = 0.0
+            self._reapply_error = ""
             return KeeperResult(state, wish, "Server restarted: spacebar parachute put back on.")
         if state.on and not wish.on:
             return KeeperResult(state, ChuteWish(True), "The spacebar parachute is already on in "

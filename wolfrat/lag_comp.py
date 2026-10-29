@@ -248,14 +248,27 @@ def bundled_dll_path() -> Optional[str]:
     return p if os.path.exists(p) else None
 
 
+_bundled_bytes: Optional[bytes] = None   # read once: the temp folder can vanish later
+
+
+def _helper_bytes() -> bytes:
+    """The bundled helper, read on first use and kept.  A long-running WolfRAT
+    cannot count on its own temp folder: a temp clean-up deleted the helper from
+    a live one (2026-10-23) and the next server restart could not load it."""
+    global _bundled_bytes
+    if _bundled_bytes is None:
+        src = bundled_dll_path()
+        if not src:
+            raise LagCompError("WolfRAT's lag compensation helper is missing from this build.")
+        with open(src, "rb") as fh:
+            _bundled_bytes = fh.read()
+    return _bundled_bytes
+
+
 def materialize_dll(data_dir: str) -> tuple[str, str, bytes]:
     """Copy the bundled helper to data_dir/wolfrat_lagcomp_<sha8>.dll (a copy the
     server still holds is never in the way).  Returns (path, file name, bytes)."""
-    src = bundled_dll_path()
-    if not src:
-        raise LagCompError("WolfRAT's lag compensation helper is missing from this build.")
-    with open(src, "rb") as fh:
-        data = fh.read()
+    data = _helper_bytes()
     sha = hashlib.sha256(data).hexdigest()[:8]
     name = LOADED_PREFIX + sha + ".dll"
     dest = os.path.join(data_dir, name)

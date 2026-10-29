@@ -74,3 +74,61 @@ def test_write_refused_is_shown(qtbot, tmp_path, monkeypatch):
     monkeypatch.setattr(lc, "reset_stats", refuse)
     p._reset_clicked()
     assert "Could not start counting again" in p.totals_lbl.text()
+
+
+# ------------------------------------------- the box stays ticked (2026-10-29)
+# 24 Oct: a temp clean-up had deleted the helper out of the running WolfRAT's own
+# temp folder; at the next server restart switching it back on failed, and the
+# failure unticked the box and saved it unticked.  The server ran four days
+# without lag compensation.
+
+class _Mem:
+    pid = 5460
+
+
+def _saved(tmp_path):
+    import json
+    return json.loads((tmp_path / "lc.json").read_text(encoding="utf-8"))
+
+
+def test_a_failed_switch_on_after_a_restart_keeps_the_box_ticked_and_retries(
+        qtbot, tmp_path, monkeypatch):
+    import json
+    (tmp_path / "lc.json").write_text(json.dumps({"on": True, "reapply": True}), encoding="utf-8")
+    state = {"now": lc.State(lc.STOCK)}
+    monkeypatch.setattr(lc, "loaded_name", lambda data_dir: "wolfrat_lagcomp_test.dll")
+    monkeypatch.setattr(lc, "server_state", lambda pid, name=None: state["now"])
+    monkeypatch.setattr(lc, "reset_stats", lambda pid, name=None: True)
+    clock = [1000.0]
+    monkeypatch.setattr(panel_mod.time, "monotonic", lambda: clock[0])
+    calls = []
+
+    def turn_on(pid, memory, data_dir, settings):
+        calls.append(pid)
+        if len(calls) < 3:
+            raise lc.LagCompError("WolfRAT's lag compensation helper is missing from this build.")
+        state["now"] = _loaded(alive=True)
+        return state["now"]
+    monkeypatch.setattr(lc, "turn_on", turn_on)
+    logs = []
+    p = panel_mod.LagCompPanel(tmp_path / "lc.json", tmp_path / "lc_history.json",
+                               tmp_path, log=logs.append)
+    qtbot.addWidget(p)
+
+    p.server_tick(_Mem(), writable=True)                     # a new server: put it back
+    assert calls == [5460]
+    assert p.on_cb.isChecked() and _saved(tmp_path)["on"] is True
+    assert "NOT running" in p.state_lbl.text() and "stays ticked" in p.state_lbl.text()
+    assert sum("missing" in line for line in logs) == 1
+
+    p.server_tick(_Mem(), writable=True)                     # too soon: no retry yet
+    assert calls == [5460]
+    clock[0] += panel_mod.RETRY_SECONDS
+    p.server_tick(_Mem(), writable=True)                     # fails again: not logged twice
+    assert len(calls) == 2 and sum("missing" in line for line in logs) == 1
+    assert p.on_cb.isChecked() and _saved(tmp_path)["on"] is True
+
+    clock[0] += panel_mod.RETRY_SECONDS
+    p.server_tick(_Mem(), writable=True)                     # works
+    assert len(calls) == 3 and "NOT running" not in p.state_lbl.text()
+    assert p.on_cb.isChecked() and not p.wants_write()

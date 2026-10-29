@@ -37,6 +37,7 @@ BANNER = (
 NO_SERVER = ("Lag compensation needs WolfRAT on the same PC as the game server, connected "
              "to it (Server connection page).")
 RESET_TEXT = "Start counting again"
+RETRY_SECONDS = 30      # a failed switch-on is tried again this often
 RESET_TIP_ON = "Set every number on this page back to zero and count from now."
 RESET_TIP_OFF = "Nothing to count yet - switch lag compensation on first."
 
@@ -105,6 +106,9 @@ class LagCompPanel(QWidget):
                                      int(saved.get("min_ping_ms", lc.DEFAULT_MIN_PING_MS))).clamp()
         self._reapply = bool(saved.get("reapply", False))
         self._dirty = False             # a click waits to be written into the server
+        self._retry_at = 0.0            # a failed switch-on tries again from then (0 = none)
+        self._last_error = ""           # logged once, not every retry
+        self._failed_text = ""          # shown while a ticked box is not running
         self._pid: Optional[int] = None
         self._state: Optional[lc.State] = None
         self._last_record = 0.0
@@ -274,6 +278,9 @@ class LagCompPanel(QWidget):
             return
         self._wish_on = bool(on)
         self._dirty = True
+        self._retry_at = 0.0
+        self._last_error = ""
+        self._failed_text = ""
         self._save()
         self.state_lbl.setText("Writing to the server...")
         if self._poll_now:
@@ -346,9 +353,12 @@ class LagCompPanel(QWidget):
         return text
 
     # ---------------------------------------------- called by the Weather tab
+    def _retry_due(self) -> bool:
+        return bool(self._wish_on and self._retry_at and time.monotonic() >= self._retry_at)
+
     def wants_write(self) -> bool:
-        return self._dirty or (self._wish_on and self._reapply and
-                               self._state is not None and not self._state.on)
+        return self._dirty or self._retry_due() or (
+            self._wish_on and self._reapply and self._state is not None and not self._state.on)
 
     def no_server(self, text: str):
         self._pid = None
@@ -386,6 +396,8 @@ class LagCompPanel(QWidget):
                 self._show_wish()
                 self._log("Lag compensation: the server restarted and it is off. "
                           "Tick it to put it back.")
+        if self._retry_due() and not state.on:
+            self._dirty = True
         if self._dirty:
             if not writable:
                 self.state_lbl.setText("Waiting for write access to the server "
@@ -394,6 +406,8 @@ class LagCompPanel(QWidget):
             state = self._write(pid, memory, state)
         self._state = state
         self._show_state(state)
+        if self._failed_text and not state.on:
+            self.state_lbl.setText(self._failed_text)
         self._show_reset_button(bool(state.shared))
 
     def _write(self, pid: int, memory, state: lc.State) -> lc.State:
@@ -412,13 +426,24 @@ class LagCompPanel(QWidget):
                 state = lc.turn_off(pid, memory)
                 self._log("Lag compensation OFF: the server is back to normal JO hits.")
         except lc.LagCompError as exc:
-            self._log("Lag compensation: " + str(exc))
-            self.state_lbl.setText("⚠ " + str(exc))
+            # Never untick on a failure: the admin asked for it on, so it stays
+            # ticked (and saved) and WolfRAT keeps trying.  Unticking here once
+            # left a server without lag compensation for four days.
+            if str(exc) != self._last_error:
+                self._last_error = str(exc)
+                self._log("Lag compensation: " + str(exc)
+                          + (" Still ticked - WolfRAT tries again every "
+                             f"{RETRY_SECONDS} s." if self._wish_on else ""))
             if self._wish_on:
-                self._wish_on = False
-                self._save()
-                self._show_wish()
+                self._retry_at = time.monotonic() + RETRY_SECONDS
+                self._failed_text = ("⚠ NOT running: " + str(exc) + " The box stays "
+                                     f"ticked; WolfRAT tries again every {RETRY_SECONDS} s.")
+            else:
+                self._failed_text = "⚠ " + str(exc)
             return state
+        self._retry_at = 0.0
+        self._last_error = ""
+        self._failed_text = ""
         try:
             return lc.server_state(pid, self._helper_name)
         except lc.LagCompError:

@@ -43,6 +43,21 @@ def test_bundled_helper_exports_its_block():
     assert lc.export_rva(data, lc.EXPORT_NAME)
 
 
+def test_helper_survives_its_temp_folder_being_cleaned(tmp_path, monkeypatch):
+    """2026-10-23: a temp clean-up deleted the helper out of a running WolfRAT's
+    _MEI folder.  Read once, it is kept in memory and its data-folder copy is
+    rewritten if that goes too."""
+    monkeypatch.setattr(lc, "_bundled_bytes", None)
+    path, name, data = lc.materialize_dll(str(tmp_path))
+    monkeypatch.setattr(lc, "bundled_dll_path", lambda: None)       # temp folder gone
+    (tmp_path / name).unlink()                                     # and the copy
+    again = lc.materialize_dll(str(tmp_path))
+    assert again == (path, name, data) and (tmp_path / name).read_bytes() == data
+    monkeypatch.setattr(lc, "_bundled_bytes", None)                # never read: says so
+    with pytest.raises(lc.LagCompError, match="missing from this build"):
+        lc.materialize_dll(str(tmp_path))
+
+
 def test_quantiles_from_the_histogram():
     cal = [0] * lc.BINS
     zero = -lc.BIN_MIN // lc.BIN_MS            # bin holding 0..+8 ms
