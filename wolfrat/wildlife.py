@@ -24,6 +24,15 @@ either is already there WolfRAT leaves the code alone.  On a server whose code
 it does not recognise it does not make sharks berserk at all.  The code change
 lasts until the server restarts; a map load keeps it.
 
+AI ignores sharks (optional): to the game, anything hunting the players is an
+enemy of the players' AI side too, so AI gunships (the AH-6 Little Birds rank
+people and animals second) and soldiers shoot berserk sharks.  The second
+switch sets the game's own "never target this" bit on every shark, the bit an
+items.def NoTarget gives satchel charges and oil drums: every AI target search
+skips it, but fired rounds still hit, so players can still kill sharks.  The
+bit comes only from the item definition (sharks have none) and a respawn
+clears it, so WolfRAT re-applies it, and switching off takes it off again.
+
 Everything here works through the same ``Memory`` the Weather tab holds
 (read/write of the live server on this PC).  Addresses are bare constants
 by design; where they came from is in the private vault.
@@ -52,6 +61,8 @@ class Addr:
 
 
 ENT_NAME_PTR = 0x20      # -> item definition name, NUL-terminated
+ENT_FLAGS = 0x24         # dword; NO_TARGET bit
+NO_TARGET = 0x8000000    # entity flags bit: every AI target search skips it
 ENT_AI_PTR = 0x68        # -> AI slot (null for non-AI entities)
 ENT_HP = 0x11E           # int16
 ENT_TEAM = 0x162         # byte
@@ -95,10 +106,15 @@ class Shark:
     ai_flags: int = 0
     min_m: float = 0.0
     max_m: float = 0.0
+    ent_flags: int = 0
 
     @property
     def hunting(self) -> bool:
         return bool(self.ai_flags & BERSERK)
+
+    @property
+    def ignored_by_ai(self) -> bool:
+        return bool(self.ent_flags & NO_TARGET)
 
     @property
     def can_close_in(self) -> bool:
@@ -146,9 +162,10 @@ def scan(mem) -> list[Shark]:
             lo = struct.unpack("<i", mem.read(ai + AI_MIN_ENGAGE, 4))[0] / 65536
             hi = struct.unpack("<i", mem.read(ai + AI_MAX_ENGAGE, 4))[0] / 65536
             hp = struct.unpack("<h", mem.read(ent + ENT_HP, 2))[0]
+            ent_flags = _u32(mem, ent + ENT_FLAGS)
         except Exception:
             continue                      # a half-built slot; next poll sees it
-        sharks.append(Shark(ent, ai, team, attack, hp, flags, lo, hi))
+        sharks.append(Shark(ent, ai, team, attack, hp, flags, lo, hi, ent_flags))
     return sharks
 
 
@@ -180,6 +197,27 @@ def hunt(mem, sharks: list[Shark], attack_m: float) -> int:
             shark.min_m = float(START_CHASE_M)
         shark.ai_flags |= BERSERK
         shark.attack_m = attack_m
+        changed += 1
+    return changed
+
+
+def set_ignored_by_ai(mem, sharks: list[Shark], on: bool) -> int:
+    """Set (or clear) the never-target bit on every shark that differs.
+    Writes only the flags byte holding the bit: the game changes the other
+    flag bytes all the time.  Returns how many sharks were changed.  Raises
+    WildlifeError on a failed write."""
+    shift = NO_TARGET.bit_length() - 1
+    byte_at, bit = ENT_FLAGS + shift // 8, 1 << (shift % 8)
+    changed = 0
+    for shark in sharks:
+        if shark.ignored_by_ai == on:
+            continue
+        try:
+            now = mem.read(shark.address + byte_at, 1)[0]
+            mem.write(shark.address + byte_at, bytes([(now | bit) if on else (now & ~bit)]))
+        except Exception as exc:
+            raise WildlifeError("Could not write to the server (run WolfRAT as administrator?).") from exc
+        shark.ent_flags = (shark.ent_flags | NO_TARGET) if on else (shark.ent_flags & ~NO_TARGET)
         changed += 1
     return changed
 
@@ -218,12 +256,26 @@ class SharkKeeper:
     def __init__(self):
         self.reapplied = 0        # writes since the switch went on
         self._map = None
+        self._ai_bit_set = False  # the never-target bit may be on sharks: clear it when switched off
 
     def reset(self):
         self.reapplied = 0
 
+    def _ai_ignore(self, mem, sharks, on: bool, where: str) -> str:
+        """Keep the never-target bit in step with the switch; a log line or "".
+        Raises WildlifeError."""
+        if not on and not self._ai_bit_set:
+            return ""                     # never set by us: leave the game's flags alone
+        changed = set_ignored_by_ai(mem, sharks, on)
+        self._ai_bit_set = on
+        if not changed:
+            return ""
+        n = f"{changed} shark{'s' if changed != 1 else ''}"
+        return (f"Sharks: AI now ignores {n}{where}." if on
+                else f"Sharks: AI can target {n}{where} again.")
+
     def tick(self, mem, *, enabled: bool, attack_m: float, writable: bool,
-             map_name: Optional[str], linked: bool) -> Status:
+             map_name: Optional[str], linked: bool, ai_ignore: bool = False) -> Status:
         where = f" on {map_name}" if map_name else " on this map"
         if not linked:
             return Status("Not linked to a game server on this PC - see the Server tab.")
@@ -235,26 +287,37 @@ class SharkKeeper:
             return Status(str(exc))
         if not sharks:
             return Status("No sharks" + where + ". Sharks only exist on TAC mod maps that place them.")
-        if not enabled:
-            return Status(f"{len(sharks)} shark{'s' if len(sharks) != 1 else ''}{where} - "
-                          "hunting is off (they only bite if you touch them).", sharks=sharks)
-        if not writable:
+        if not writable and (enabled or ai_ignore):
             return Status("Sharks found but WolfRAT cannot write to the server "
                           "(run WolfRAT as administrator?).", sharks=sharks)
-        # Berserk sharks fight each other unless the server has the fix.
         note = ""
+        if writable:
+            try:
+                note = self._ai_ignore(mem, sharks, ai_ignore, where)
+            except WildlifeError as exc:
+                return Status(str(exc), sharks=sharks)
+        ignored = " AI ignores them." if ai_ignore else ""
+        if not enabled:
+            return Status(f"{len(sharks)} shark{'s' if len(sharks) != 1 else ''}{where} - "
+                          "hunting is off (they only bite if you touch them)." + ignored,
+                          sharks=sharks, note=note)
+
+        def join(*lines):
+            return " ".join(line for line in lines if line)
+
+        # Berserk sharks fight each other unless the server has the fix.
         kin = kin_state(mem)
         if kin == KIN_UNKNOWN:
             return Status("Sharks NOT set to hunt: WolfRAT does not recognise this server's "
                           "code, so it cannot stop berserk sharks killing each other.",
-                          sharks=sharks)
+                          sharks=sharks, note=note)
         if kin == KIN_RETAIL:
             try:
                 add_kin_fix(mem)
             except WildlifeError as exc:
-                return Status(f"Sharks NOT set to hunt: {exc}", sharks=sharks)
-            note = ("Sharks: added 'berserk sharks ignore each other' to the running "
-                    "server (until it restarts).")
+                return Status(f"Sharks NOT set to hunt: {exc}", sharks=sharks, note=note)
+            note = join(note, "Sharks: added 'berserk sharks ignore each other' to the "
+                              "running server (until it restarts).")
         try:
             changed = hunt(mem, sharks, attack_m)
         except WildlifeError as exc:
@@ -262,7 +325,7 @@ class SharkKeeper:
         self.reapplied += changed
         n = len(sharks)
         text = (f"🟢 {n} shark{'s' if n != 1 else ''} hooked{where} - hunting "
-                f"(berserk, {attack_m:g} m), ignoring each other.")
+                f"(berserk, {attack_m:g} m), ignoring each other.") + ignored
         if self.reapplied:
             text += f" Re-applied {self.reapplied}x after map loads/respawns."
         return Status(text, hooked=True, sharks=sharks, reapplied=self.reapplied, note=note)

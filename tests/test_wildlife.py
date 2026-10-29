@@ -259,6 +259,62 @@ def test_keeper_switched_off_never_touches_the_code():
     assert mem.code_writes == [] and wl.kin_state(mem) == wl.KIN_RETAIL
 
 
+def _ignored(mem):
+    return [s.ignored_by_ai for s in wl.scan(mem)]
+
+
+def test_ai_ignore_sets_only_the_never_target_bit_in_its_own_byte():
+    mem = make_server()
+    for i in range(4):
+        mem.u32(ENTITIES + i * STRIDE + wl.ENT_FLAGS, 0x04004002)   # other flag bits, kept
+    mem.writes.clear()
+    sharks = wl.scan(mem)
+    assert not any(s.ignored_by_ai for s in sharks)
+    assert wl.set_ignored_by_ai(mem, sharks, True) == 3
+    assert [(a - ENTITIES) % STRIDE for a, _ in mem.writes] == [wl.ENT_FLAGS + 3] * 3
+    assert all(len(data) == 1 for _, data in mem.writes)          # one byte, not the dword
+    assert _u(mem, ENTITIES + wl.ENT_FLAGS) == 0x04004002 | wl.NO_TARGET
+    assert _u(mem, ENTITIES + 2 * STRIDE + wl.ENT_FLAGS) == 0x04004002   # the tiger
+    mem.writes.clear()
+    assert wl.set_ignored_by_ai(mem, wl.scan(mem), True) == 0 and mem.writes == []
+    assert wl.set_ignored_by_ai(mem, wl.scan(mem), False) == 3
+    assert _u(mem, ENTITIES + wl.ENT_FLAGS) == 0x04004002
+
+
+def test_keeper_ai_ignore_reapplies_and_switching_off_clears_it():
+    mem = make_server()
+    keeper = wl.SharkKeeper()
+    tick = lambda **kw: keeper.tick(mem, map_name="Mogadishu", linked=True, attack_m=10,
+                                    **{"enabled": True, "writable": True, "ai_ignore": True, **kw})
+    on = tick()
+    assert on.hooked and "AI ignores them" in on.text and all(_ignored(mem))
+    assert "AI now ignores 3 sharks on Mogadishu" in on.note
+    assert tick().note == ""                                  # nothing drifted
+    mem.u32(ENTITIES + wl.ENT_FLAGS, 0)                         # a respawn clears it
+    assert "AI now ignores 1 shark on" in tick().note and all(_ignored(mem))
+    assert tick(writable=False).text.startswith("Sharks found but")   # loading: no write
+    off = tick(ai_ignore=False)
+    assert "AI can target 3 sharks" in off.note and not any(_ignored(mem))
+    assert "AI ignores" not in off.text
+    mem.writes.clear()
+    assert tick(ai_ignore=False).note == "" and mem.writes == []
+
+
+def test_keeper_ai_ignore_works_with_hunting_off_and_leaves_flags_alone_when_never_on():
+    mem = make_server()
+    for i in range(4):
+        mem.u32(ENTITIES + i * STRIDE + wl.ENT_FLAGS, wl.NO_TARGET)   # set by something else
+    mem.writes.clear()
+    keeper = wl.SharkKeeper()
+    keeper.tick(mem, enabled=False, attack_m=10, writable=True, map_name="x", linked=True)
+    assert mem.writes == [] and all(_ignored(mem))               # never ours: untouched
+    mem = make_server()
+    off = keeper.tick(mem, enabled=False, attack_m=10, writable=True, map_name="x", linked=True,
+                      ai_ignore=True)
+    assert "hunting is off" in off.text and "AI ignores them" in off.text
+    assert all(_ignored(mem)) and not any(_hunting(mem)) and mem.code_writes == []
+
+
 def test_keeper_no_sharks_and_unreadable_table():
     keeper = wl.SharkKeeper()
     mem = make_server(kinds=("Tiger",))
@@ -305,6 +361,20 @@ def test_switching_on_asks_for_a_writable_handle_and_saves(qtbot, tmp_path):
     assert '"enabled": true' in saved and '"attack_m": 10' in saved
     assert any("Hunting sharks switched on" in tab.log_list.item(i).text()
                for i in range(tab.log_list.count()))
+
+
+def test_ai_ignore_switch_is_off_by_default_asks_for_writes_and_saves(qtbot, tmp_path):
+    tab, _, attaches = make(qtbot, tmp_path, _table_with_no_sharks(FakeServer()))
+    page = tab.wildlife_page
+    assert not page.ai_ignore() and page.ai_ignore_cb.isEnabled()
+    page.ai_ignore_cb.setChecked(True)
+    assert attaches == [False, True]
+    saved = (tmp_path / "wolfrat_weather.json").read_text(encoding="utf-8")
+    assert '"ai_ignore": true' in saved
+    assert any("AI ignores sharks" in tab.log_list.item(i).text()
+               for i in range(tab.log_list.count()))
+    from wolfrat.weather_wildlife_page import WildlifePage
+    assert WildlifePage({"ai_ignore": True}).ai_ignore()
 
 
 def test_wildlife_page_has_two_scrolling_columns(qtbot, tmp_path):

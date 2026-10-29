@@ -521,7 +521,7 @@ class WeatherTab(QWidget):
         controller = self._ensure(
             writable=bool(self._writable or self._schedule.active is not None
                           or self.dynamic_page.config().enabled or self._settings.get("linked")
-                          or self.wildlife_page.enabled()
+                          or self.wildlife_page.enabled() or self.wildlife_page.ai_ignore()
                           or self.sky_page.wants_write()
                           or any(t.wants_write() for t in self._server_tickers))
         )
@@ -596,6 +596,7 @@ class WeatherTab(QWidget):
                 writable=self._writable and settled,     # never write into a loading server
                 map_name=map_name,
                 linked=True,                             # a found server is enough for the sharks
+                ai_ignore=self.wildlife_page.ai_ignore(),
             )
         except Exception as exc:                          # pragma: no cover - belt and braces
             self.wildlife_page.set_status(f"⚪ Wildlife check failed: {exc}")
@@ -615,7 +616,8 @@ class WeatherTab(QWidget):
         self._sharks.reset()
         self._sharks_logged = 0
         self.log("Hunting sharks switched " + ("on" if config["enabled"] else "off")
-                 + f" (attack distance {config['attack_m']} m).")
+                 + f" (attack distance {config['attack_m']} m)"
+                 + (", AI ignores sharks." if config["ai_ignore"] else "."))
         self._poll()
 
     # ------------------------------------------------------------- dynamic

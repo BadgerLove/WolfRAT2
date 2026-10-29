@@ -58,6 +58,12 @@ _HELP = (
     "exe it does not recognise, the sharks are not set to hunt at all."
     "<br>• Untick the box and the sharks keep hunting until the next map load; WolfRAT "
     "does not put them back."
+    "<br>• <b>AI ignores sharks.</b> To the game, a shark that hunts players is an enemy of "
+    "the AI too, so AI helicopters (the AH-6 Little Birds especially) and soldiers shoot at "
+    "them. Tick this and WolfRAT gives every shark the game's own 'never target' mark, the "
+    "one satchel charges and oil drums carry: no AI aims at them, but bullets still hit, so "
+    "players can still kill sharks. Sharks can still bite AI soldiers who swim. WolfRAT "
+    "re-applies it after respawns; untick it and the mark comes off again."
 )
 
 
@@ -69,11 +75,12 @@ class WildlifePage(QWidget):
         config = config or {}
         self._loading = True
         self._build(bool(config.get("enabled", False)),
-                    int(config.get("attack_m", wildlife.DEFAULT_ATTACK_M)))
+                    int(config.get("attack_m", wildlife.DEFAULT_ATTACK_M)),
+                    bool(config.get("ai_ignore", False)))
         self._loading = False
 
     # ------------------------------------------------------------------ UI
-    def _build(self, enabled: bool, attack_m: int):
+    def _build(self, enabled: bool, attack_m: int, ai_ignore: bool):
         root = QHBoxLayout(self)
         left_scroll, left = scroll_column()
         right_scroll, right = scroll_column()
@@ -118,6 +125,11 @@ class WildlifePage(QWidget):
         hint.setWordWrap(True)
         hint.setStyleSheet("font-size: 9pt; color: #a89830;")
         box.addWidget(hint)
+
+        self.ai_ignore_cb = QCheckBox("AI ignores sharks - helicopters and soldiers never aim at them "
+                                      "(players can still shoot them)")
+        self.ai_ignore_cb.setChecked(ai_ignore)
+        box.addWidget(self.ai_ignore_cb)
         group.setLayout(box)
         left.addWidget(group)
         left.addStretch()
@@ -135,11 +147,12 @@ class WildlifePage(QWidget):
         right.addWidget(help_group)
         right.addStretch()
 
-        self._action_widgets = (self.enabled_cb, self.attack_slider)
+        self._action_widgets = (self.enabled_cb, self.attack_slider, self.ai_ignore_cb)
         self._attack_text(self.attack_slider.value())
         self.attack_slider.valueChanged.connect(self._attack_text)
         self.enabled_cb.toggled.connect(self._emit)
         self.attack_slider.valueChanged.connect(self._emit)
+        self.ai_ignore_cb.toggled.connect(self._emit)
 
     def _attack_text(self, value: int):
         word = "tested" if value == wildlife.DEFAULT_ATTACK_M else (
@@ -152,10 +165,14 @@ class WildlifePage(QWidget):
 
     # ------------------------------------------------------------- state
     def config(self) -> dict:
-        return {"enabled": self.enabled_cb.isChecked(), "attack_m": self.attack_slider.value()}
+        return {"enabled": self.enabled_cb.isChecked(), "attack_m": self.attack_slider.value(),
+                "ai_ignore": self.ai_ignore_cb.isChecked()}
 
     def enabled(self) -> bool:
         return self.enabled_cb.isChecked()
+
+    def ai_ignore(self) -> bool:
+        return self.ai_ignore_cb.isChecked()
 
     def attack_m(self) -> int:
         return self.attack_slider.value()
