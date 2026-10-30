@@ -30,6 +30,7 @@ MAX_RANK_NAME = 24
 PERMISSION_GROUPS = (
     ("Match control", (
         ("startvote", "!startvote - start the map vote now", ("!startvote",)),
+        ("startgame", "!startgame - end the start delay (game in 5 s)", ("!startgame",)),
         ("next", "!next - skip to the next map", ("!next",)),
         ("map", "!map - switch to any map", ("!map",)),
         ("gametime", "!gametime - set the game time", ("!gametime",)),
@@ -76,7 +77,7 @@ _COMMAND_PERMISSION = {
 # What a Moderator can do out of the box: run the match day to day, but not
 # ban, force a map, change the game time or edit the rotation.
 DEFAULT_MODERATOR = frozenset({
-    "startvote", "next", "weather", "quake", "lightning", "weather_dynamic", "sky",
+    "startvote", "startgame", "next", "weather", "quake", "lightning", "weather_dynamic", "sky",
     "swap", "mixteams", "balanceteams", "warn", "kill", "kick",
 })
 

@@ -22,6 +22,7 @@ from PyQt6.QtGui import QColor, QIcon, QTextCursor
 from wolfrat import vote_rules
 from wolfrat import map_match
 from wolfrat import weather
+from wolfrat import start_game
 from wolfrat import coop_guard
 from wolfrat import score_lead
 from wolfrat import whisper
@@ -5758,6 +5759,8 @@ class ModsTab(QWidget):
         ("Match control (mods)", (
             ("!startvote", "Start the map vote NOW. Use it when a team is about "
              "to hit the kill or score limit before the timer would start the vote.", True),
+            ("!startgame", "End the start-of-map wait: the game starts in 5 seconds "
+             "(the server must run on this PC)", False),
             ("!next", "Skip to the next map", False),
             ("!map <name>", "Switch to a map", False),
             ("!gametime <1-240>", "Set the game time in minutes", False),
@@ -6246,7 +6249,7 @@ class ModsTab(QWidget):
             return
 
         # If it's a ! command but not recognized, tell them
-        valid_commands = {'!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map', '!add', '!remove', '!1', '!2', '!3', '!4', '!5', '!startvote', '!mixteams', '!balanceteams', '!time', '!gametime', *weather.CHAT_COMMANDS}
+        valid_commands = {'!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map', '!add', '!remove', '!1', '!2', '!3', '!4', '!5', '!startvote', '!startgame', '!mixteams', '!balanceteams', '!time', '!gametime', *weather.CHAT_COMMANDS}
         if cmd not in valid_commands:
             self._reply_privately(
                 sender, whisper.UNKNOWN, f"Unknown command: {cmd}", "Send unknown command response"
@@ -6408,6 +6411,21 @@ class ModsTab(QWidget):
                 )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to kill but player not found")
+
+        elif cmd == '!startgame':
+            try:
+                outcome = start_game.start_local_server()
+            except (start_game.StartGameError, weather.WeatherError) as exc:
+                wire_log(f"[MODS] !startgame failed: {exc}")
+                self.mod_log.addItem(f"[{now}] {sender} tried !startgame - {exc}")
+                self._send_mod_chat("Could not start the game early.", "Send start game error")
+                return
+            if outcome.kind == start_game.STARTED:
+                self.mod_log.addItem(
+                    f"[{now}] {sender} started the game "
+                    f"({outcome.seconds_before}s wait cut to {start_game.SECONDS_LEFT}s)"
+                )
+            self._send_mod_chat(start_game.reply_for(outcome), "Send start game reply")
 
         elif cmd == '!next':
             self._submit_mod_action(
