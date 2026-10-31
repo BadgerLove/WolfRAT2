@@ -81,8 +81,9 @@ _BAND_COLUMNS = ["Target ping", "On", "Low shots", "Low hit %", "Lag shots", "La
 _TARGET_COLUMNS = ["Target", "Ping", "Low shots", "Low hit %", "Lag shots", "Lag hit %",
                    "Plain JO %", "Saved", "Cost"]
 TARGETS_HELP = (
-    "<b>Who is hard to hit?</b> Every bullet that passes within 1 m of a player (or hits "
-    "them) is a <i>close shot</i> at them; <i>hit %</i> is how many of those hit. "
+    "<b>Who is hard to hit?</b> A <i>close shot</i> = a bullet the game itself checked "
+    "against that player's body (it came close enough for the game's own hit test), or "
+    "one that hit them; <i>hit %</i> is how many of those hit. Dead bodies don't count. "
     "<b>Low</b> = shooters under the minimum ping (plain JO, never rewound). "
     "<b>Lag</b> = rewound shooters, against where the target was on their screen; "
     "<b>Plain JO %</b> = the same shots as plain JO would have judged them. "
