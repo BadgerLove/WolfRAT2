@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from wolfrat import map_timeline as timeline
 from wolfrat import weather
 from wolfrat import weather_dynamic as dyn
 
@@ -23,6 +24,16 @@ _HELP = (
     "<br><br>Pressing a button on the Manual page, or a mod's <b>!storm</b>, always "
     "wins - dynamic weather waits until that is over. <b>Clear the weather</b> "
     "ends the current front early."
+)
+
+_TIMELINE_HELP = (
+    "Pick a map in the list above, then add steps counted back from the end of the map: "
+    "<b>20 min left</b> overcast, <b>15</b> drizzle, <b>10</b> fog at 100 m with a grey sky. "
+    "Each step stays on until the next one or the end of the map. The server counts whole "
+    "minutes, so a step at 10 starts at 10:59.<br>"
+    "Works whether the changing weather above is on or off, and wins over it. A mod's "
+    "<b>!clear</b> (or Clear the weather) ends this map's weather steps; <b>!sky off</b> "
+    "ends its sky steps. Maps without a time limit never get here."
 )
 
 
@@ -53,11 +64,17 @@ class DynamicPage(QWidget):
     changed = pyqtSignal()
 
     def __init__(self, config: dyn.DynamicConfig, button_cls: type = QPushButton,
-                 map_list: Callable[[], Iterable[tuple[str, str]]] | None = None):
+                 map_list: Callable[[], Iterable[tuple[str, str]]] | None = None,
+                 timelines: dict | None = None):
         super().__init__()
         self._button_cls = button_cls
         self._map_list = map_list or (lambda: ())
         self._map_rules = dict(config.map_rules)
+        # map name -> [TimedStep]; saved by the Weather tab beside the config
+        self._timelines = timeline.timelines_from_json(timelines)
+        # [(scene key, label)] from the Sky page, set by the Weather tab
+        self.sky_choices: Callable[[], list] = lambda: []
+        self._timeline_map = ""
         self._seen = {}            # map file -> "terrain, climate" learned as maps get played
         self._loading = True
         self._build(config)
@@ -257,8 +274,8 @@ class DynamicPage(QWidget):
         self.this_map_lbl = _note("Auto: WolfRAT reads each map as it loads and picks rain or snow.")
         maps.addWidget(self.this_map_lbl)
 
-        self.map_table = QTableWidget(0, 3)
-        self.map_table.setHorizontalHeaderLabels(["Map", "Seen as", "Weather"])
+        self.map_table = QTableWidget(0, 4)
+        self.map_table.setHorizontalHeaderLabels(["Map", "Seen as", "Weather", "Timed steps"])
         self.map_table.verticalHeader().setVisible(False)
         self.map_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.map_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
@@ -267,7 +284,9 @@ class DynamicPage(QWidget):
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         self.map_table.setMinimumHeight(220)
+        self.map_table.itemSelectionChanged.connect(self._map_selected)
         maps.addWidget(self.map_table, 1)
 
         maps.addWidget(QLabel("Set the selected maps to:"))
@@ -291,6 +310,7 @@ class DynamicPage(QWidget):
         maps.addLayout(snow_row)
         maps_group.setLayout(maps)
         right.addWidget(maps_group, 1)
+        right.addWidget(self._build_timeline())
 
         # -- wiring
         for box in (self.enabled_cb, self.quake_cb, self.announce_cb, self.empty_cb, self.lightning_cb,
@@ -305,6 +325,187 @@ class DynamicPage(QWidget):
             spin.valueChanged.connect(self._emit)
         self.frequency_combo.currentIndexChanged.connect(self._emit)
         self._refresh_labels()
+
+    def _build_timeline(self) -> QGroupBox:
+        group = QGroupBox("Timed steps - counted back from the end of the map")
+        box = QVBoxLayout()
+        help_lbl = _note(_TIMELINE_HELP)
+        help_lbl.setTextFormat(Qt.TextFormat.RichText)
+        box.addWidget(help_lbl)
+        self.timeline_map_lbl = QLabel("Pick a map in the list above.")
+        self.timeline_map_lbl.setWordWrap(True)
+        self.timeline_map_lbl.setStyleSheet("font-weight: bold; color: #c8b040;")
+        box.addWidget(self.timeline_map_lbl)
+
+        self.step_table = QTableWidget(0, 3)
+        self.step_table.setHorizontalHeaderLabels(["Minutes left", "Weather", "Sky colours"])
+        self.step_table.verticalHeader().setVisible(False)
+        self.step_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.step_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.step_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        header = self.step_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self.step_table.setMinimumHeight(120)
+        box.addWidget(self.step_table)
+
+        grid = QGridLayout()
+        self.step_minutes = _spin(0, timeline.MAX_MINUTES, 10, " min left", width=110)
+        self.step_weather = QComboBox()
+        for key in timeline.WEATHER_CHOICES:
+            self.step_weather.addItem("Weather: leave it" if not key else timeline.WEATHER_LABELS[key], key)
+        self.step_weather.setCurrentIndex(max(0, self.step_weather.findData("fog")))
+        self.step_fog = _spin(0, timeline.FOG_MAX_METRES, 0, " m", width=96)
+        self.step_fog.setSpecialValueText("normal")
+        self.step_fog.setToolTip(
+            "How far players can see in this step. 'normal' = the weather's own (fog 150 m, "
+            f"storm 350 m...). {timeline.FOG_MIN_METRES} m is the closest; it can never be "
+            "further than the map itself allows."
+        )
+        self.step_sky = QComboBox()
+        self.step_sky.setMinimumWidth(140)
+        self.refresh_sky_choices()
+        grid.addWidget(QLabel("At"), 0, 0)
+        grid.addWidget(self.step_minutes, 0, 1)
+        grid.addWidget(self.step_weather, 0, 2)
+        grid.addWidget(QLabel("fog"), 0, 3)
+        grid.addWidget(self.step_fog, 0, 4)
+        grid.addWidget(self.step_sky, 1, 2, 1, 3)
+        grid.setColumnStretch(2, 1)
+        box.addLayout(grid)
+
+        buttons = QHBoxLayout()
+        self.step_add_btn = self._button_cls("Add step")
+        self.step_add_btn.clicked.connect(self._add_step)
+        self.step_remove_btn = self._button_cls("Remove selected")
+        self.step_remove_btn.clicked.connect(self._remove_steps)
+        self.step_clear_btn = self._button_cls("Remove all for this map")
+        self.step_clear_btn.clicked.connect(self._clear_steps)
+        for button in (self.step_add_btn, self.step_remove_btn, self.step_clear_btn):
+            buttons.addWidget(button)
+        buttons.addStretch()
+        box.addLayout(buttons)
+        self.timeline_hint = _note()
+        box.addWidget(self.timeline_hint)
+        group.setLayout(box)
+        self._show_timeline()
+        return group
+
+    # ------------------------------------------------------- timed steps
+    def timelines(self) -> dict:
+        return {name: list(steps) for name, steps in self._timelines.items() if steps}
+
+    def steps_for(self, map_name) -> list:
+        return timeline.steps_for(map_name, self._timelines)
+
+    def refresh_sky_choices(self):
+        current = self.step_sky.currentData() if self.step_sky.count() else ""
+        self.step_sky.clear()
+        self.step_sky.addItem("Sky: leave it", "")
+        self.step_sky.addItem("Sky: the map's own", timeline.SKY_OFF)
+        try:
+            choices = list(self.sky_choices())
+        except Exception:
+            choices = []
+        for key, label in choices:
+            self.step_sky.addItem(f"Sky: {label}", key)
+        self.step_sky.setCurrentIndex(max(0, self.step_sky.findData(current)))
+
+    def _sky_label(self, key: str) -> str:
+        if key == timeline.SKY_OFF:
+            return "the map's own"
+        try:
+            labels = dict(self.sky_choices())
+        except Exception:
+            labels = {}
+        return labels.get(key, f"{key} (not on the Sky page)")
+
+    def _timeline_key(self, name: str) -> str:
+        """The name this map's steps are kept under (an older typed name that
+        matches it, or the map's own name for a new list)."""
+        if self._timelines:
+            found = dyn.map_rule_for(name, {k: k for k in self._timelines})
+            if found in self._timelines:
+                return found
+        return name
+
+    def _map_selected(self):
+        rows = self.map_table.selectionModel().selectedRows()
+        if rows:
+            item = self.map_table.item(rows[0].row(), 0)
+            if item is not None:
+                self._timeline_map = str(item.data(Qt.ItemDataRole.UserRole) or "")
+        self._show_timeline()
+
+    def _show_timeline(self):
+        name = self._timeline_map
+        steps = timeline.sort_steps(self._timelines.get(self._timeline_key(name), [])) if name else []
+        self.timeline_map_lbl.setText(f"Map: {name}" if name else "Pick a map in the list above.")
+        for widget in (self.step_add_btn, self.step_remove_btn, self.step_clear_btn):
+            widget.setEnabled(bool(name))
+        self.step_table.setRowCount(len(steps))
+        for row, step in enumerate(steps):
+            self.step_table.setItem(row, 0, QTableWidgetItem(f"{step.minutes_left} min"))
+            self.step_table.setItem(row, 1, QTableWidgetItem(step.describe_weather() or "-"))
+            self.step_table.setItem(row, 2, QTableWidgetItem(
+                self._sky_label(step.sky) if step.sky else "-"))
+        if name and not steps:
+            self.timeline_hint.setText("No steps for this map yet.")
+        elif steps:
+            self.timeline_hint.setText(f"{len(steps)} step(s). Each one holds until the next, "
+                                       "or the end of the map.")
+        else:
+            self.timeline_hint.setText("")
+
+    def _add_step(self):
+        name = self._timeline_map
+        if not name:
+            return
+        kind = self.step_weather.currentData() or ""
+        fog = self.step_fog.value()
+        step = timeline.TimedStep(
+            self.step_minutes.value(), kind,
+            timeline.clamp_fog(fog) if fog and kind and kind != "clear" else None,
+            self.step_sky.currentData() or "")
+        if step.is_empty():
+            self.timeline_hint.setText("That step changes nothing: pick a weather, a sky, or both.")
+            return
+        key = self._timeline_key(name)
+        # one step per minute: a new one at the same minute replaces the old
+        steps = [s for s in self._timelines.get(key, []) if s.minutes_left != step.minutes_left]
+        self._timelines[key] = timeline.sort_steps(steps + [step])
+        self._timelines_changed()
+
+    def _remove_steps(self):
+        key = self._timeline_key(self._timeline_map)
+        steps = timeline.sort_steps(self._timelines.get(key, []))
+        gone = {index.row() for index in self.step_table.selectionModel().selectedRows()}
+        if not gone:
+            self.timeline_hint.setText("Select the step(s) to remove first.")
+            return
+        keep = [s for row, s in enumerate(steps) if row not in gone]
+        if keep:
+            self._timelines[key] = keep
+        else:
+            self._timelines.pop(key, None)
+        self._timelines_changed()
+
+    def _clear_steps(self):
+        self._timelines.pop(self._timeline_key(self._timeline_map), None)
+        self._timelines_changed()
+
+    def _timelines_changed(self):
+        self._show_timeline()
+        self._fill_maps()
+        if not self._loading:
+            self.changed.emit()
+
+    def _timeline_summary(self, name: str) -> str:
+        steps = self.steps_for(name)
+        if not steps:
+            return ""
+        return ", ".join(str(s.minutes_left) for s in timeline.sort_steps(steps)) + " min"
 
     # ------------------------------------------------------------ config
     def config(self) -> dyn.DynamicConfig:
@@ -414,8 +615,10 @@ class DynamicPage(QWidget):
         only = self.only_rules_cb.isChecked()
         real_keys = {dyn.map_key(f) for f, _ in self._maps}
         rows = []
-        for typed, rule in sorted(self._map_rules.items()):
+        typed_names = sorted(set(self._map_rules) | set(self._timelines))
+        for typed in typed_names:
             if dyn.map_key(typed) not in real_keys:
+                rule = dyn.map_rule_for(typed, self._map_rules)
                 rows.append((typed, f"{typed}   (typed name)", rule))
         for file_name, title in self._maps:
             rule = dyn.map_rule_for(file_name, self._map_rules)
@@ -423,12 +626,14 @@ class DynamicPage(QWidget):
             rows.append((file_name, label, rule))
         shown = []
         for name, label, rule in rows:
-            if only and rule == dyn.MAP_NORMAL:
+            if only and rule == dyn.MAP_NORMAL and not self.steps_for(name):
                 continue
             if key and key not in dyn.map_key(label) and dyn.map_rule_for(name, {needle: "x"}) != "x":
                 continue
             shown.append((name, label, rule))
 
+        picked = self._timeline_map
+        self.map_table.blockSignals(True)
         self.map_table.setRowCount(len(shown))
         for row, (name, label, rule) in enumerate(shown):
             item = QTableWidgetItem(label)
@@ -436,6 +641,10 @@ class DynamicPage(QWidget):
             self.map_table.setItem(row, 0, item)
             self.map_table.setItem(row, 1, QTableWidgetItem(self._seen.get(dyn.map_key(name), "")))
             self.map_table.setItem(row, 2, QTableWidgetItem(dyn.MAP_RULE_LABELS[rule]))
+            self.map_table.setItem(row, 3, QTableWidgetItem(self._timeline_summary(name)))
+            if picked and name == picked:
+                self.map_table.selectRow(row)       # a refill keeps the map being edited
+        self.map_table.blockSignals(False)
         changed = sum(1 for _ in self._map_rules)
         if needle and not shown:
             self.map_hint.setText(

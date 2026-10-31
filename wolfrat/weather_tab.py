@@ -14,6 +14,7 @@ from PyQt6.QtWidgets import (
     QPushButton, QScrollArea, QSizePolicy, QSlider, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
+from wolfrat import map_timeline
 from wolfrat import weather
 from wolfrat import whisper
 from wolfrat import server_link
@@ -36,6 +37,8 @@ MOD_FALLBACK_MINUTES = 10
 ALL_COMMANDS_HELP = (
     "<b>Weather</b> - add minutes, e.g. !storm 10<br>"
     "!storm &nbsp;!rain &nbsp;!drizzle &nbsp;!overcast &nbsp;!fog &nbsp;!snow &nbsp;!blizzard<br>"
+    "!fog 80m &nbsp;- fog that close (20-1500 m) &nbsp; !fog thick 10 &nbsp;- thick (60 m), medium "
+    "(150) or light (400), for 10 min. Works on !storm, !rain... too<br>"
     "!clear 30 &nbsp;- dry sky for 30 min, then the map's own<br>"
     "!weather storm 10 &nbsp;- same as !storm 10<br>"
     "<b>Changing weather</b><br>"
@@ -137,6 +140,8 @@ class WeatherTab(QWidget):
         self._memory = None
         self._writable = False
         self._schedule = weather.WeatherSchedule()
+        self._timed = map_timeline.Runner("weather")   # the map's timed steps (Dynamic page)
+        self._timed_weather = None                       # what they put in the schedule
         self._last_problem = ""
         self._looked = False           # tried to find the server at least once
         self._server_missing = False   # last attempt: no jointops.exe at all
@@ -147,7 +152,7 @@ class WeatherTab(QWidget):
             "mods_enabled": False, "announce": True, "minutes": 10,
             "precip": 60, "snow": False, "overcast": 80, "fog_on": False,
             "fog_metres": 300, "fade": 25, "wind_on": False, "wind": 150,
-            "dynamic": {}, "seen_maps": {},
+            "dynamic": {}, "seen_maps": {}, "timelines": {},
             "linked": False,
             "wildlife": {},
         }
@@ -191,6 +196,7 @@ class WeatherTab(QWidget):
             weather_dynamic.DynamicConfig.from_json(self._settings.get("dynamic")),
             button_cls=self._button_cls,
             map_list=self._map_list,
+            timelines=self._settings.get("timelines"),
         )
         self.dynamic_page.load_seen(self._settings.get("seen_maps"))
         self.dynamic_page.changed.connect(self._dynamic_changed)
@@ -208,6 +214,11 @@ class WeatherTab(QWidget):
             button_cls=self._button_cls,
         )
         self.pages.addTab(self.sky_page, "🎨 Sky")
+        # timed steps live on the Dynamic page; their sky colours come from the Sky page
+        self.dynamic_page.sky_choices = lambda: [(s.key, s.label) for s in self.sky_page.scenes()]
+        self.dynamic_page.refresh_sky_choices()
+        self.sky_page.timeline_steps = self.dynamic_page.steps_for
+        self.pages.currentChanged.connect(self._page_shown)
         self.wildlife_page = WildlifePage(self._settings.get("wildlife"))
         self.wildlife_page.changed.connect(self._wildlife_changed)
         self.pages.addTab(self.wildlife_page, "🦈 Wildlife")
@@ -441,6 +452,7 @@ class WeatherTab(QWidget):
             "wind": self.wind_slider.value(),
             "dynamic": self.dynamic_page.config().to_json(),
             "seen_maps": self.dynamic_page.seen(),
+            "timelines": map_timeline.timelines_to_json(self.dynamic_page.timelines()),
             "wildlife": self.wildlife_page.config(),
         })
         try:
@@ -522,10 +534,17 @@ class WeatherTab(QWidget):
             writable=bool(self._writable or self._schedule.active is not None
                           or self.dynamic_page.config().enabled or self._settings.get("linked")
                           or self.wildlife_page.enabled() or self.wildlife_page.ai_ignore()
-                          or self.sky_page.wants_write()
+                          or self.sky_page.wants_write() or bool(self.dynamic_page.timelines())
                           or any(t.wants_write() for t in self._server_tickers))
         )
         if controller is None:
+            return
+        try:
+            # before the schedule re-asserts anything: a new map must drop the
+            # old map's timed weather, not write it into the new one
+            self._timeline_tick(controller)
+        except weather.WeatherError as exc:
+            self._problem(str(exc))
             return
         held = self._schedule.active
         try:
@@ -575,6 +594,49 @@ class WeatherTab(QWidget):
                 ticker.server_tick(self._memory, self._writable)
             except Exception as exc:                  # never takes the weather down
                 wire_log(f"[LIVE] {exc}")
+
+    # --------------------------------------------------------- timed steps
+    def _timeline_tick(self, controller):
+        """The map's timed weather steps, counted back from its end (Dynamic
+        page).  A step goes in like a Manual-page button held until cleared, so
+        it wins over the changing weather; a new map drops it."""
+        map_name, _players, settled = self._server_context()
+        try:
+            minutes_left = self.sky_page.time_left()
+        except Exception:
+            minutes_left = None
+        event = self._timed.tick(map_name=map_name, minutes_left=minutes_left,
+                                 steps=self.dynamic_page.steps_for(map_name),
+                                 settled=settled and self._writable)
+        if event.restarted:
+            if self._timed_weather is not None and self._schedule.active is self._timed_weather:
+                self._schedule.forget()           # the load put the map's own sky back
+            self._timed_weather = None
+        step = event.step
+        if step is None:
+            return
+        at = f"{step.minutes_left} min left"
+        if step.hands_back:
+            self._timed_weather = None
+            self._dynamic.end_front_now()
+            self._schedule.clear(controller)
+            self.log(f"Timed step ({at}): the map's own weather back.")
+            self._announce("The weather is clearing.")
+            return
+        target = step.weather_target()
+        self._schedule.start(controller, target, None)
+        self._timed_weather = target
+        self.log(f"Timed step ({at}): {step.describe_weather()} ({target.describe()}).")
+        self._announce(f"Weather: {map_timeline.WEATHER_LABELS[step.weather].lower()} rolling in.")
+
+    def _stop_timed_weather(self):
+        """The admin's Clear / a mod's !clear: no more timed weather on this map."""
+        self._timed.stop_for_this_map()
+        self._timed_weather = None
+
+    def _page_shown(self, _index=None):
+        if self.pages.currentWidget() is self.dynamic_page:
+            self.dynamic_page.refresh_sky_choices()   # scenes made on the Sky page since
 
     def add_server_ticker(self, ticker) -> None:
         """A page that works on the same server handle (see ``_server_tickers``)."""
@@ -774,6 +836,7 @@ class WeatherTab(QWidget):
 
     def _clear(self):
         self._dynamic.end_front_now()
+        self._stop_timed_weather()
         self._start(weather.CLEAR, "clear", None, "WolfRAT")
 
     def refresh_maps(self, *_):
@@ -1011,6 +1074,7 @@ class WeatherTab(QWidget):
         else:
             if request.name == "clear":
                 self._dynamic.end_front_now()
+                self._stop_timed_weather()
             minutes = request.minutes or self.minutes_spin.value() or MOD_FALLBACK_MINUTES
             ok = self._start(request.weather, request.name, minutes, sender)
         if not ok:

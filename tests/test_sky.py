@@ -389,9 +389,12 @@ def test_last_minute_option():
     keeper.tick(map_name="M", players=1, settled=True, map_scene=None)
     keeper.show(sky.BUILTIN_SCENES[0], "page")
     assert not [s for s in keeper.tick(map_name="M", players=1, settled=True, map_scene=None,
-                                       minutes_left=1, end_last_minute=False) if s.announce]
+                                       minutes_left=0, end_last_minute=False) if s.announce]
+    # "1 left" is 1:59 (Dale 2026-10-31): the sky goes at "0 left"
+    assert not [s for s in keeper.tick(map_name="M", players=1, settled=True, map_scene=None,
+                                       minutes_left=1, end_last_minute=True) if s.announce]
     steps = keeper.tick(map_name="M", players=1, settled=True, map_scene=None,
-                        minutes_left=1, end_last_minute=True)
+                        minutes_left=0, end_last_minute=True)
     assert keeper.active is None and "last minute" in steps[0].announce
 
 

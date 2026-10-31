@@ -24,6 +24,7 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+from wolfrat import map_timeline
 from wolfrat import sky
 from wolfrat import weather_dynamic as dyn
 from wolfrat.weather_wildlife_page import scroll_column
@@ -107,6 +108,9 @@ class SkyPage(QWidget):
         self._button_cls = button_cls
         self._clock = clock
         self.time_left: Callable[[], Optional[int]] = lambda: None
+        # the map's timed steps (map_timeline), kept on the Dynamic page
+        self.timeline_steps: Callable[[Optional[str]], list] = lambda _map: []
+        self._timed = map_timeline.Runner("sky")
         self.keeper = sky.SkyKeeper(clock=clock)
         self.sender = sky.Sender(clock=clock)
 
@@ -286,7 +290,7 @@ class SkyPage(QWidget):
         self.mods_cb.setChecked(bool(settings.get("mods", False)))
         self.announce_cb = QCheckBox("Tell players in chat when the sky changes")
         self.announce_cb.setChecked(bool(settings.get("announce", True)))
-        self.last_minute_cb = QCheckBox("Give the map its own sky back with 1 minute left "
+        self.last_minute_cb = QCheckBox("Give the map its own sky back for the last minute "
                                         "(maps with a timer)")
         self.last_minute_cb.setChecked(bool(settings.get("last_minute", False)))
         for box in (self.mods_cb, self.announce_cb, self.last_minute_cb):
@@ -774,10 +778,11 @@ class SkyPage(QWidget):
             minutes_left = self.time_left()
         except Exception:
             minutes_left = None
+        timed = self._timed_step(map_name, minutes_left, settled and memory is not None)
         steps = self.keeper.tick(
             map_name=map_name, players=players, settled=settled and memory is not None,
             map_scene=self.map_scene(map_name), minutes_left=minutes_left,
-            end_last_minute=self.last_minute_cb.isChecked())
+            end_last_minute=self.last_minute_cb.isChecked(), timed=timed)
         for step in steps:
             self._do_quiet(step)
         if memory is None or not self._writable or not self._capable or not self._installed:
@@ -799,6 +804,29 @@ class SkyPage(QWidget):
             self._strike = None
             self._log(f"Sky: lightning strike stopped ({exc}).")
         self._show_now()
+
+    def _timed_step(self, map_name, minutes_left, settled) -> Optional[tuple]:
+        """(scene or None, minutes) when one of the map's timed sky steps has
+        just come due, for keeper.tick."""
+        try:
+            timeline = self.timeline_steps(map_name)
+        except Exception:
+            timeline = []
+        ready = settled and not self.keeper.demo_running() and not self.keeper.timed_blocked
+        event = self._timed.tick(map_name=map_name, minutes_left=minutes_left,
+                                 steps=timeline, settled=ready)
+        if event.restarted and map_name == self.keeper.map_name:
+            self.keeper.new_round()
+        if event.step is None:
+            return None
+        if event.step.sky == map_timeline.SKY_OFF:
+            return None, event.step.minutes_left
+        scene = self.scene(event.step.sky)
+        if scene is None:
+            self._log(f"Timed step ({event.step.minutes_left} min left): no sky called "
+                      f"'{event.step.sky}' any more - skipped.")
+            return None
+        return scene, event.step.minutes_left
 
     def _do_quiet(self, step: sky.Step):
         """Keeper steps from the tick (no poll_now: we are inside one)."""

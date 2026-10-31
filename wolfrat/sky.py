@@ -679,7 +679,7 @@ def chat_lines(prefix: str, names: list, limit: int = 59) -> list:
 @dataclass
 class Active:
     scene: Scene
-    source: str                     # "page" | "mod" | "map" | "demo"
+    source: str                     # "page" | "mod" | "map" | "timed" | "demo"
     until: Optional[float] = None   # monotonic; None = until the map changes
     who: str = ""
 
@@ -702,6 +702,8 @@ class SkyKeeper:
         self.map_name: Optional[str] = None
         self.homes: dict = {}                         # map's own lightning/ceiling/floor, read first
         self.off_for_this_map = False                 # "off" / last minute: no map rule till next map
+        self.timed_on = False                         # a timed step (map_timeline) has taken over this map
+        self.timed_blocked = False                    # an "off" / the last minute: no more timed steps
         self._last_sent_at: Optional[float] = None
         self._last_players = 0
         self._showing = False                         # we have a look on the server
@@ -726,6 +728,7 @@ class SkyKeeper:
         self.stop_demo(quiet=True)
         self.active = None
         self.off_for_this_map = True
+        self.timed_blocked = True
         return self._send_off(announce="" if quiet else "Sky: back to normal.",
                               log=f"{who or 'WolfRAT'} put the map's own sky back.")
 
@@ -766,10 +769,26 @@ class SkyKeeper:
         return self._send_off(announce="Sky demo over: back to normal.", log="Sky demo finished.")
 
     # -- the tick ------------------------------------------------------------
+    def new_round(self) -> None:
+        """The same map started again: its load put the map's own colours back,
+        so the map rule and the timed steps start over.  A page or mod sky stays."""
+        if self.active is not None and self.active.source in ("map", "timed"):
+            self.active = None
+            self._showing = False
+            self._last_sent_at = None
+        self.off_for_this_map = False
+        self.timed_on = False
+        self.timed_blocked = False
+
     def tick(self, *, map_name: Optional[str], players: int, settled: bool,
              map_scene: Optional[Scene], minutes_left: Optional[int] = None,
-             end_last_minute: bool = False) -> list:
-        """Returns a list of Steps.  Call every second or so."""
+             end_last_minute: bool = False, timed: Optional[tuple] = None) -> list:
+        """Returns a list of Steps.  Call every second or so.
+
+        ``timed``: (scene, minutes left) when a timed step of the map has just
+        come due - scene None = the map's own sky.  It wins over whatever is
+        showing, except after an "off" (the Off button, !sky off, or the last
+        minute), which ends the timed steps for this map too."""
         now = self._clock()
         steps = []
         if map_name != self.map_name:
@@ -778,6 +797,8 @@ class SkyKeeper:
             self.map_name = map_name
             self.homes = {}
             self.off_for_this_map = False
+            self.timed_on = False
+            self.timed_blocked = False
             self._showing = False
             self._last_sent_at = None
             if self._demo:
@@ -800,13 +821,32 @@ class SkyKeeper:
                                         log=f"Timed sky {label} finished."))
             self.off_for_this_map = True       # the mod's time is up; no map rule till next map
 
-        if end_last_minute and minutes_left == 1 and (self.active or self._showing) \
-                and not self.off_for_this_map:
+        # GameTime counts whole minutes: "0 left" is the last 59 seconds (Dale, 2026-10-31:
+        # at "1" the sky went with nearly 2 minutes still to play).
+        if end_last_minute and minutes_left is not None and minutes_left <= 0 \
+                and (self.active or self._showing) and not self.off_for_this_map:
             self.active = None
+            # and stays off: before, the map rule put its sky straight back on
+            self.off_for_this_map = self.timed_blocked = True
             steps.append(self._send_off(announce="Sky: back to normal for the last minute.",
                                         log="Last minute of the map: sky back to normal."))
 
-        if self.active is None and map_scene is not None and not self.off_for_this_map:
+        if timed is not None and not self.timed_blocked:
+            scene, at = timed
+            self.timed_on = True
+            if scene is not None:
+                self.active = Active(scene, "timed")
+                steps.append(self._send_active(
+                    announce=f"Sky: {scene.label}.",
+                    log=f"Timed step ({at} min left): {scene.label} sky."))
+            elif self.active is not None or self._showing:
+                self.active = None
+                steps.append(self._send_off(
+                    announce="Sky: back to normal.",
+                    log=f"Timed step ({at} min left): the map's own sky."))
+
+        if self.active is None and map_scene is not None and not self.off_for_this_map \
+                and not self.timed_on:
             self.active = Active(map_scene, "map")
             steps.append(self._send_active(announce=f"Sky: {map_scene.label}.",
                                            log=f"Map rule: {map_scene.label} sky on {map_name}."))
@@ -890,6 +930,8 @@ class SkyKeeper:
             tail = f" - {left // 60}:{left % 60:02d} left"
         elif self.active.source == "map":
             tail = " - this map's rule"
+        elif self.active.source == "timed":
+            tail = " - timed step, until the map changes"
         else:
             tail = " - until the map changes"
         return f"{self.active.scene.label}{tail}"

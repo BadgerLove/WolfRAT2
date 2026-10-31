@@ -737,15 +737,39 @@ def parse_chat_command(cmd: str, args: list[str]) -> ChatRequest:
         return ChatRequest("quake", seconds=max(1, min(QUAKE_MAX_SECONDS, seconds)))
     if name not in PRESETS:
         return ChatRequest("usage", message="Weather: " + ", ".join(PRESETS))
-    minutes = None
-    if args:
-        if not args[0].isdigit() or not 1 <= int(args[0]) <= MAX_MINUTES:
-            return ChatRequest("usage", message=f"Usage: !{name} [1-{MAX_MINUTES} minutes]")
-        minutes = int(args[0])
+    minutes = fog = None
+    for word in (str(a).lower() for a in args):
+        if word.isdigit() and minutes is None:
+            if not 1 <= int(word) <= MAX_MINUTES:
+                return ChatRequest("usage", message=f"Usage: !{name} [1-{MAX_MINUTES} minutes]")
+            minutes = int(word)
+        elif name != "clear" and fog is None and _chat_fog(word) is not None:
+            fog = _chat_fog(word)
+        else:
+            return ChatRequest("usage", message=(f"Usage: !{name} [minutes]" if name == "clear"
+                                                  else f"Usage: !{name} [minutes] [100m|thick|light]"))
     # chat "!clear" holds a dry sky for a while (Dale 2026-10-09); a one-off
     # hand-back would be rained on again by the map's script within seconds.
     sky = DRY if name == "clear" else PRESETS[name]
+    if fog is not None:
+        sky = replace(sky, fog_metres=fog)
     return ChatRequest("weather", weather=sky, name=name, minutes=minutes)
+
+
+# How close the fog comes, from chat: "!fog 80m", "!fog thick 10" (Dale 2026-10-31:
+# "we don't seem to have a thickness or closeness with the fog command").
+# Players see a little further than the number (at 50 m things show at 150-200 m).
+CHAT_FOG_WORDS = {"thick": 60, "heavy": 60, "medium": 150, "light": 400, "thin": 400}
+CHAT_FOG_MIN, CHAT_FOG_MAX = 20, 1500
+
+
+def _chat_fog(word: str) -> Optional[int]:
+    """"80m" -> 80, "thick" -> 60, anything else None."""
+    if word in CHAT_FOG_WORDS:
+        return CHAT_FOG_WORDS[word]
+    if word.endswith("m") and word[:-1].isdigit():
+        return max(CHAT_FOG_MIN, min(CHAT_FOG_MAX, int(word[:-1])))
+    return None
 
 
 # ---------------------------------------------------------------------------
