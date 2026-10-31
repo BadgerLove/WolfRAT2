@@ -67,9 +67,14 @@ _HELP = (
     "<br><br><b>Best rewind</b> looks at every shot that passed close to someone and finds "
     "the rewind that lines it up best. Its middle value, minus the ping, is the <b>Extra</b> "
     "that suits your players. <b>Use suggested</b> sets it (after 300 close shots)."
+    "<br><br><b>Auto-tune Extra</b> adjusts Extra on its own from the last 1,000 close shots "
+    "(up to 30 minutes of play), moving at most 2 ms a minute inside +50 to +85 ms, and "
+    "leaving differences of 8 ms or less alone. Choose <b>Watch</b> to log what it would pick "
+    "without changing hits, or <b>On (apply)</b> to let it tune live. Switching Auto-tune mode "
+    "does not restart the session counters."
     "<br><br><b>Watch only</b> counts everything but changes no hits - handy for a first "
     "night."
-    "<br><br>Changing a setting starts the counting again, so each session row in "
+    "<br><br>Changing a manual setting starts the counting again, so each session row in "
     "<b>Past sessions</b> is one setting."
 )
 
@@ -186,7 +191,7 @@ class LagCompPanel(QWidget):
         self.tune_combo = QComboBox()
         self.tune_combo.addItem("Off - keep the Extra set above", lc.TUNE_OFF)
         self.tune_combo.addItem("Watch - calculate & log auto Extra, change nothing", lc.TUNE_WATCH)
-        self.tune_combo.addItem("On (apply) - smoothly auto-tune Extra (<=5 ms/min)", lc.TUNE_APPLY)
+        self.tune_combo.addItem("On (apply) - smoothly auto-tune Extra (<=2 ms/min, 50-85 ms)", lc.TUNE_APPLY)
         form.addRow("Auto-tune Extra (live):", self.tune_combo)
         self.min_spin = QSpinBox()
         self.min_spin.setRange(0, 500)
@@ -637,13 +642,13 @@ class LagCompPanel(QWidget):
             mode_name = lc.TUNE_MODE_NAMES.get(s.tune_mode, "off")
             if s.tune_mode == lc.TUNE_OFF:
                 self.autotune_lbl.setText(
-                    f"Auto-tune: <b>off</b> (rolling window: {s.tune_samples:,} / 300 close shots "
+                    f"Auto-tune: <b>off</b> (rolling window: {s.tune_samples:,} / 1,000 close shots "
                     f"in last {max(1, s.tune_window_mins)} min)."
                 )
             elif s.tune_median_ms is None:
                 self.autotune_lbl.setText(
                     f"Auto-tune (<b>{mode_name}</b>): holding at <b>{_signed(s.tune_value_ms)}</b> "
-                    f"- waiting for 300 close shots in last 30 min (<b>{s.tune_samples:,} / 300</b> so far)."
+                    f"- waiting for 1,000 close shots in last 30 min (<b>{s.tune_samples:,} / 1,000</b> so far)."
                 )
             else:
                 act = "applied live" if s.tune_mode == lc.TUNE_APPLY else "watched only (not applied)"

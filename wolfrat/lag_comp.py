@@ -61,7 +61,7 @@ _RETAIL_SITES = (
 )
 _LEG_TAIL = (0x4EA5C4, b"\x83\xc4\x08\x85\xc0\x75\x2d")
 
-DEFAULT_EXTRA_MS = 40
+DEFAULT_EXTRA_MS = 70
 DEFAULT_MAX_MS = 400
 DEFAULT_MIN_PING_MS = 80
 
@@ -989,7 +989,7 @@ class EventLogger:
                 self._last_tune_minute = st.minute
                 if st.median_ms is None:
                     msg = (f"Auto-tune min #{st.minute} [{mode_name}]: holding Extra {st.after_ms:+d} ms "
-                           f"(waiting for 300 close shots in 30 min: {st.samples} in {st.window_mins} min)")
+                           f"(waiting for 1,000 close shots in 30 min: {st.samples} in {st.window_mins} min)")
                 elif st.after_ms != st.before_ms:
                     msg = (f"Auto-tune min #{st.minute} [{mode_name}]: Extra {st.before_ms:+d} -> {st.after_ms:+d} ms "
                            f"(rolling best {st.median_ms:+d} ms from {st.samples} shots / {st.window_mins} min)")

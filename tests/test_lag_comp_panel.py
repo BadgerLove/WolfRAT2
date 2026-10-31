@@ -173,10 +173,10 @@ def test_autotune_status_and_live_log_on_panel(qtbot, tmp_path, monkeypatch):
     s.tune_mode = lc.TUNE_APPLY
     s.tune_value_ms = 65
     s.tune_median_ms = 68
-    s.tune_samples = 340
-    s.tune_window_mins = 9
+    s.tune_samples = 1140
+    s.tune_window_mins = 24
     s.tune_decisions = 5
-    s.tune_log = [lc.TuneStep(5, 10000, 60, 65, 68, 340, 9)]
+    s.tune_log = [lc.TuneStep(5, 10000, 63, 65, 68, 1140, 24)]
     p = _panel(qtbot, tmp_path, monkeypatch, state)
     p._refresh_stats(force=True)
     assert "+65 ms" in p.autotune_lbl.text()
