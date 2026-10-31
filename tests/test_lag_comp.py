@@ -29,7 +29,13 @@ def test_block_layout_matches_the_helper():
     assert lc._OFF["reset_seq"] == 136
     assert lc._OFF["cal"] == 188
     assert lc._OFF["players"] == 188 + 4 * lc.BINS
-    assert lc.SHARED_SIZE == lc._OFF["players"] + 64 * lc.SLOTS
+    # Version 2 appends: 250 target rows of 32 bytes, 3 band totals + 3 band
+    # histograms, 3 band rows (checked against payload.c's offsetof, 2026-10-31).
+    assert lc._OFF["targets"] == lc._OFF["players"] + 64 * lc.SLOTS == 16700
+    assert lc._OFF["band_cal_total"] == 16700 + 32 * lc.SLOTS
+    assert lc._OFF["band_cal"] == lc._OFF["band_cal_total"] + 4 * lc.BANDS
+    assert lc._OFF["band_totals"] == lc._OFF["band_cal"] + 4 * lc.BINS * lc.BANDS
+    assert lc.SHARED_SIZE == lc._OFF["band_totals"] + 32 * lc.BANDS == 26344
 
 
 def test_bundled_helper_exports_its_block():
@@ -80,6 +86,91 @@ def test_parse_stats_totals_and_players():
     assert round(s.gain_percent) == 20
     assert len(s.players) == 1 and s.players[0].name == "OscarMike247"
     assert s.players[0].slot == 3 and s.players[0].rewind_ms == 165
+
+
+def _v2(**kw):
+    b = _block(**kw)
+    b.version, b.size = 2, lc.SHARED_SIZE
+    return b
+
+
+def test_targets_and_bands_from_a_version_2_block():
+    b = _v2(stats_since=1000)
+    for slot, name, ping in ((0, b"Low", 30), (5, b"OscarMike247", 125), (9, b"Far", 210)):
+        b.players[slot].entity, b.players[slot].ping, b.players[slot].name = 1 + slot, ping, name
+    t = b.targets[9]
+    t.close_low, t.hits_low, t.close_lag, t.hits_lag = 200, 50, 100, 30
+    t.close_lag_plain, t.plain_lag, t.gained, t.lost = 100, 25, 9, 4
+    band = b.band_totals[2]                     # the helper's own totals, incl. leavers
+    band.close_low, band.hits_low = 400, 90
+    zero = -lc.BIN_MIN // lc.BIN_MS
+    b.band_cal[2][zero + 10] = 7                # +80..+88
+    b.band_cal_total[2] = 7
+    _, s = lc.parse_stats(bytes(b), now_ticks=2000)
+    assert s.has_targets
+    far = next(x for x in s.targets if x.name == "Far")
+    assert (far.ping, far.close_low, far.hits_low, far.gained, far.lost) == (210, 200, 50, 9, 4)
+    assert [x.label for x in s.bands] == ["under 80", "80-149", "150+"]
+    assert [x.players for x in s.bands] == [1, 1, 1]
+    assert (s.bands[2].close_low, s.bands[2].hits_low) == (400, 90)      # not the row sum
+    assert s.bands[2].cal_median == 84 and s.bands[2].cal_total == 7
+    assert s.bands[0].cal_median is None
+
+
+def test_a_version_1_block_has_no_targets():
+    b = _block(stats_since=1000)                # version 1, as the released helper
+    b.players[0].entity, b.players[0].ping = 1, 100
+    raw = bytes(b)[:lc._OFF["targets"]]          # all a v1 block holds
+    _, s = lc.parse_stats(raw, now_ticks=2000)
+    assert not s.has_targets and s.targets == [] and s.bands == []
+    assert len(s.players) == 1
+
+
+def test_reading_an_older_smaller_block_uses_its_size():
+    """A version 1 block is 16,700 bytes: reading 26,344 can run off the old
+    helper's image.  All 250 players must still come through."""
+    b = _block()
+    b.size = lc._OFF["targets"]
+    b.players[200].entity = 7
+    data = bytes(b)[:b.size]
+
+    class Proc:
+        def read(self, address, size):
+            if address + size > len(data):
+                raise lc.LagCompError("past the end")
+            return data[address:address + size]
+
+    raw = lc._read_block(Proc(), 0)
+    assert len(raw) == lc.SHARED_SIZE
+    assert lc._Shared.from_buffer_copy(raw).players[200].entity == 7
+
+
+def test_pending_reset_clears_the_target_numbers_too():
+    b = _v2(reset_seq=2, seen_reset_seq=1, stats_since=1000)
+    b.players[1].entity = 2
+    b.targets[1].close_low = 50
+    b.band_totals[0].close_low = 50
+    b.band_cal_total[1] = 3
+    _, s = lc.parse_stats(bytes(b), now_ticks=5000)
+    assert s.targets[0].close_low == 0
+    assert s.bands[0].close_low == 0 and s.bands[1].cal_total == 0
+
+
+def test_history_keeps_bands_and_players_who_left(tmp_path):
+    book = lc.HistoryBook(str(tmp_path / "h.json"))
+    settings = lc.Settings(False, 40, 400, 80)
+
+    def stats(names):
+        s = lc.Stats(tests=10, hits=2, since=0x10, has_targets=True,
+                     bands=[lc.BandStats(label) for label in lc.BAND_LABELS])
+        s.targets = [lc.TargetStats(i, n, 100, 5, 1, 0, 0, 0, 0, 0, 0) for i, n in enumerate(names)]
+        return s
+
+    book.record(1, stats(["A", "B"]), settings, now=1_000_000)
+    book.record(1, stats(["A"]), settings, now=1_000_030)           # B left
+    row = book.rows[0]
+    assert sorted(t["name"] for t in row["targets"]) == ["A", "B"]
+    assert [b["label"] for b in row["bands"]] == list(lc.BAND_LABELS)
 
 
 def test_a_pending_reset_reads_as_cleared():

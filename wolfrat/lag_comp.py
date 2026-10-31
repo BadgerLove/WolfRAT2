@@ -37,13 +37,15 @@ DLL_NAME = "wolfrat_lagcomp.dll"
 LOADED_PREFIX = "wolfrat_lagcomp_"
 EXPORT_NAME = b"WolfRatLagComp"
 MAGIC = 0x31434C57
-VERSION = 1
+VERSION = 2              # 2 = per-target rows + best rewind by target ping
 
 SLOTS = 250
 LEGACY_SLOTS = 64
 BINS = 128
 BIN_MS = 8
 BIN_MIN = -400
+BANDS = 3
+BAND_LABELS = ("under 80", "80-149", "150+")   # target ping, ms (as in the helper)
 
 # Retail 1.7.5.7 / TAC / FMJ call sites, so WolfRAT can spot onHook's own
 # lag compensation before loading its helper DLL.
@@ -79,6 +81,16 @@ class _Player(ctypes.LittleEndianStructure):
                 ("name", ctypes.c_char * 32)]
 
 
+class _Target(ctypes.LittleEndianStructure):
+    """The same slot as a target.  A close shot = a bullet that passed within 1 m
+    of them or hit them; hit % = hits / close shots."""
+    _pack_ = 4
+    _fields_ = [("close_low", ctypes.c_uint32), ("hits_low", ctypes.c_uint32),
+                ("close_lag", ctypes.c_uint32), ("hits_lag", ctypes.c_uint32),
+                ("close_lag_plain", ctypes.c_uint32), ("plain_lag", ctypes.c_uint32),
+                ("gained", ctypes.c_uint32), ("lost", ctypes.c_uint32)]
+
+
 class _Shared(ctypes.LittleEndianStructure):
     _pack_ = 4
     _fields_ = [("magic", ctypes.c_uint32), ("version", ctypes.c_uint32),
@@ -101,12 +113,18 @@ class _Shared(ctypes.LittleEndianStructure):
                 ("plain_hits", ctypes.c_uint32), ("gained", ctypes.c_uint32),
                 ("lost", ctypes.c_uint32),
                 ("cal_total", ctypes.c_uint32), ("cal", ctypes.c_uint32 * BINS),
-                ("players", _Player * SLOTS)]
+                ("players", _Player * SLOTS),
+                # version 2, appended:
+                ("targets", _Target * SLOTS),
+                ("band_cal_total", ctypes.c_uint32 * BANDS),
+                ("band_cal", (ctypes.c_uint32 * BINS) * BANDS),
+                ("band_totals", _Target * BANDS)]   # by the target's ping at each shot
 
 
 SHARED_SIZE = ctypes.sizeof(_Shared)
 _OFF = {name: getattr(_Shared, name).offset for name, _ in _Shared._fields_}
 _MIN_SHARED_SIZE = _OFF["players"] + LEGACY_SLOTS * ctypes.sizeof(_Player)
+_V2_SIZE = SHARED_SIZE                     # a block this big has the target rows
 
 
 @dataclass
@@ -136,6 +154,51 @@ class PlayerStats:
 
 
 @dataclass
+class TargetStats:
+    slot: int
+    name: str
+    ping: int
+    close_low: int          # shots from players under the minimum ping (plain JO)
+    hits_low: int
+    close_lag: int          # shots from rewound players, rewound answer
+    hits_lag: int
+    close_lag_plain: int    # the same shots, plain JO's answer
+    plain_lag: int
+    gained: int
+    lost: int
+
+
+@dataclass
+class BandStats:
+    """Everyone whose ping is in one band, as targets."""
+    label: str
+    players: int = 0
+    close_low: int = 0
+    hits_low: int = 0
+    close_lag: int = 0
+    hits_lag: int = 0
+    close_lag_plain: int = 0
+    plain_lag: int = 0
+    gained: int = 0
+    lost: int = 0
+    cal_total: int = 0
+    cal_median: Optional[int] = None
+
+    @staticmethod
+    def percent(hits: int, close: int) -> Optional[float]:
+        return hits * 100.0 / close if close else None
+
+    def as_dict(self) -> dict:
+        return {k: getattr(self, k) for k in (
+            "label", "players", "close_low", "hits_low", "close_lag", "hits_lag",
+            "close_lag_plain", "plain_lag", "gained", "lost", "cal_total", "cal_median")}
+
+
+def band_of(ping: int) -> int:
+    return 0 if ping < 80 else 1 if ping < 150 else 2
+
+
+@dataclass
 class Stats:
     tests: int = 0
     hits: int = 0
@@ -150,6 +213,9 @@ class Stats:
     cal_high: Optional[int] = None
     players: list = field(default_factory=list)
     since: int = 0                         # the server's tick count when counting began
+    has_targets: bool = False              # helper version 2 or later
+    targets: list = field(default_factory=list)
+    bands: list = field(default_factory=list)
 
     @property
     def gain_percent(self) -> Optional[float]:
@@ -200,6 +266,8 @@ def histogram_quantiles(cal) -> tuple[Optional[int], Optional[int], Optional[int
 def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, Stats]:
     if len(raw) < _MIN_SHARED_SIZE:
         raise LagCompError("short read of the lag compensation block")
+    has_targets = len(raw) >= _V2_SIZE and \
+        struct.unpack_from("<II", raw, 4)[0] >= 2 and struct.unpack_from("<I", raw, 8)[0] >= _V2_SIZE
     if len(raw) < SHARED_SIZE:
         raw = raw + b"\0" * (SHARED_SIZE - len(raw))
     shared = _Shared.from_buffer_copy(raw[:SHARED_SIZE])
@@ -214,6 +282,8 @@ def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, S
             shared.cal[i] = 0
         for p in shared.players:
             p.tests = p.hits = p.plain_hits = p.gained = p.lost = 0
+        ctypes.memset(ctypes.addressof(shared) + _OFF["targets"], 0,
+                      SHARED_SIZE - _OFF["targets"])
         shared.stats_since = now_ticks
     cal = list(shared.cal)
     low, mid, high = histogram_quantiles(cal)
@@ -227,6 +297,23 @@ def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, S
         name = p.name.split(b"\0")[0].decode("latin-1", "replace")
         stats.players.append(PlayerStats(i, name, p.ping, p.rewind_ms, p.tests, p.hits,
                                          p.plain_hits, p.gained, p.lost))
+    stats.has_targets = has_targets
+    if has_targets:
+        bands = [BandStats(label) for label in BAND_LABELS]
+        for p in stats.players:
+            t = shared.targets[p.slot]
+            stats.targets.append(TargetStats(p.slot, p.name, p.ping, t.close_low, t.hits_low,
+                                             t.close_lag, t.hits_lag, t.close_lag_plain,
+                                             t.plain_lag, t.gained, t.lost))
+            bands[band_of(p.ping)].players += 1        # on now
+        for i, b in enumerate(bands):
+            # The helper's own totals: kept when a player leaves.
+            t = shared.band_totals[i]
+            for k, _ in _Target._fields_:
+                setattr(b, k, getattr(t, k))
+            b.cal_total = shared.band_cal_total[i]
+            b.cal_median = histogram_quantiles(list(shared.band_cal[i]))[1]
+        stats.bands = bands
     return shared, stats
 
 
@@ -476,6 +563,22 @@ class _Helper:
 _block_at: dict = {}     # (pid, name, base) -> address of the helper's block
 
 
+def _read_block(proc: ServerProcess, address: int) -> bytes:
+    """The helper's block, as big as it says it is (an older helper's block is
+    smaller, and reading past it can fail), padded to SHARED_SIZE."""
+    try:
+        return proc.read(address, SHARED_SIZE)
+    except LagCompError:
+        pass
+    size = struct.unpack("<I", proc.read(address + 8, 4))[0]
+    size = max(_MIN_SHARED_SIZE, min(size, SHARED_SIZE))
+    try:
+        raw = proc.read(address, size)
+    except LagCompError:
+        raw = proc.read(address, _MIN_SHARED_SIZE)
+    return raw + b"\0" * (SHARED_SIZE - len(raw))
+
+
 def _helpers(proc: ServerProcess) -> list:
     """Every copy of the helper loaded in the server; the caller picks by name."""
     out = []
@@ -490,11 +593,7 @@ def _helpers(proc: ServerProcess) -> list:
                 if not address:
                     continue
                 _block_at[key] = address
-            try:
-                raw = proc.read(address, SHARED_SIZE)
-            except LagCompError:
-                raw = proc.read(address, _MIN_SHARED_SIZE) + b"\0" * (SHARED_SIZE - _MIN_SHARED_SIZE)
-            block = _Shared.from_buffer_copy(raw)
+            block = _Shared.from_buffer_copy(_read_block(proc, address))
             if block.magic == MAGIC:
                 out.append(_Helper(name, base, address, block))
         except LagCompError:
@@ -550,11 +649,7 @@ def read_state(proc: ServerProcess, wanted_name: Optional[str] = None) -> State:
     kind = _classify(proc, mine, helpers)
     if mine is None:
         return State(kind if kind in (FOREIGN, STOCK) else UNKNOWN)
-    try:
-        raw = proc.read(mine.shared, SHARED_SIZE)
-    except LagCompError:
-        raw = proc.read(mine.shared, _MIN_SHARED_SIZE)
-    block, stats = parse_stats(raw)
+    block, stats = parse_stats(_read_block(proc, mine.shared))
     alive = ((_tick_count() - block.heartbeat) & 0xFFFFFFFF) < 3000 if block.heartbeat else False
     settings = Settings(bool(block.observe), block.extra_ms, block.max_ms, block.min_ping_ms)
     return State(kind, mine.base, mine.shared, block.status == 1,
@@ -697,6 +792,16 @@ class HistoryBook:
                "hits": stats.hits, "plain_hits": stats.plain_hits,
                "gained": stats.gained, "lost": stats.lost,
                "cal_total": stats.cal_total, "cal_median": stats.cal_median}
+        if stats.has_targets:
+            row["bands"] = [b.as_dict() for b in stats.bands]
+            # Players who left keep their last numbers (the helper drops their row).
+            targets = {t.name: t.__dict__.copy() for t in stats.targets}
+            for old in self.rows:
+                if old.get("key") == key:
+                    for t in old.get("targets", []):
+                        targets.setdefault(t.get("name"), t)
+            row["targets"] = sorted(targets.values(),
+                                    key=lambda t: -(t["close_low"] + t["close_lag"]))[:64]
         for i, old in enumerate(self.rows):
             if old.get("key") == key:
                 self.rows[i] = row

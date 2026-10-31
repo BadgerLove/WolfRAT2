@@ -132,3 +132,31 @@ def test_a_failed_switch_on_after_a_restart_keeps_the_box_ticked_and_retries(
     p.server_tick(_Mem(), writable=True)                     # works
     assert len(calls) == 3 and "NOT running" not in p.state_lbl.text()
     assert p.on_cb.isChecked() and not p.wants_write()
+
+
+def test_being_shot_at_tables(qtbot, tmp_path, monkeypatch):
+    """Helper version 2: the target-ping bands and per-target rows (2026-10-31,
+    players said high-ping players felt harder to hit)."""
+    state = _loaded(alive=True)
+    s = state.stats
+    s.has_targets = True
+    s.bands = [lc.BandStats(label) for label in lc.BAND_LABELS]
+    s.bands[2].players, s.bands[2].close_low, s.bands[2].hits_low = 2, 400, 100
+    s.bands[2].cal_median = 72
+    s.targets = [lc.TargetStats(4, "Far", 210, 200, 50, 10, 4, 10, 3, 2, 1)]
+    p = _panel(qtbot, tmp_path, monkeypatch, state)
+    p._refresh_stats(force=True)
+    assert p.bands_table.rowCount() == 3
+    assert p.bands_table.item(2, 0).text() == "150+"
+    assert p.bands_table.item(2, 3).text() == "25%"
+    assert p.bands_table.item(2, 9).text() == "+72 ms"
+    assert p.bands_table.item(0, 3).text() == "-"            # nothing counted
+    assert p.targets_table.item(0, 0).text() == "Far"
+    assert p.targets_table.item(0, 5).text() == "40%"
+
+
+def test_older_helper_says_tick_again(qtbot, tmp_path, monkeypatch):
+    p = _panel(qtbot, tmp_path, monkeypatch, _loaded(alive=True))
+    p._refresh_stats(force=True)
+    assert p.bands_table.rowCount() == 0
+    assert "older helper" in p.targets_note.text()

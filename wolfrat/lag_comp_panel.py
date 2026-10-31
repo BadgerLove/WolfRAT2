@@ -74,6 +74,24 @@ _HELP = (
 )
 
 _PLAYER_COLUMNS = ["Player", "Ping", "Rewind", "Checks", "Hits", "Without", "Gain"]
+# Being shot at (helper version 2).  "Low" = shooters under the minimum ping
+# (never rewound), "Lag" = rewound shooters; % = hits / close shots.
+_BAND_COLUMNS = ["Target ping", "On", "Low shots", "Low hit %", "Lag shots", "Lag hit %",
+                 "Plain JO %", "Saved", "Cost", "Best"]
+_TARGET_COLUMNS = ["Target", "Ping", "Low shots", "Low hit %", "Lag shots", "Lag hit %",
+                   "Plain JO %", "Saved", "Cost"]
+TARGETS_HELP = (
+    "<b>Who is hard to hit?</b> Every bullet that passes within 1 m of a player (or hits "
+    "them) is a <i>close shot</i> at them; <i>hit %</i> is how many of those hit. "
+    "<b>Low</b> = shooters under the minimum ping (plain JO, never rewound). "
+    "<b>Lag</b> = rewound shooters, against where the target was on their screen; "
+    "<b>Plain JO %</b> = the same shots as plain JO would have judged them. "
+    "<b>Best</b> = best rewind for shots at that band, minus the shooter's ping. "
+    "If high-ping players really are harder to hit, their row shows a lower hit %.")
+
+
+def _pct(hits: int, close: int) -> str:
+    return "-" if not close else "%.0f%%" % (hits * 100.0 / close)
 _HISTORY_COLUMNS = ["Started", "Min", "Setting", "Hits", "Without", "Gain", "Best"]
 
 
@@ -213,6 +231,23 @@ class LagCompPanel(QWidget):
         players_box.addWidget(self.players_table)
         players_group.setLayout(players_box)
         right.addWidget(players_group)
+
+        targets_group = QGroupBox("\U0001F3AF Being shot at - by the target's ping")
+        targets_box = QVBoxLayout()
+        self.targets_note = QLabel(TARGETS_HELP)
+        self.targets_note.setWordWrap(True)
+        self.targets_note.setTextFormat(Qt.TextFormat.RichText)
+        self.targets_note.setStyleSheet("font-size: 9pt; color: #c8b040;")
+        self.targets_note.setMinimumWidth(240)
+        self.targets_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        targets_box.addWidget(self.targets_note)
+        self.bands_table = self._table(_BAND_COLUMNS)
+        self.bands_table.setMinimumHeight(110)
+        targets_box.addWidget(self.bands_table)
+        self.targets_table = self._table(_TARGET_COLUMNS)
+        targets_box.addWidget(self.targets_table)
+        targets_group.setLayout(targets_box)
+        right.addWidget(targets_group)
 
         history_group = QGroupBox("\U0001F4C5 Past sessions")
         history_box = QVBoxLayout()
@@ -481,10 +516,13 @@ class LagCompPanel(QWidget):
             self.tune_lbl.setText("")
             self.suggest_btn.setEnabled(False)
             self.players_table.setRowCount(0)
+            self.bands_table.setRowCount(0)
+            self.targets_table.setRowCount(0)
             return
         s = st.stats
         self._show_totals(st, s)
         self._show_players(s)
+        self._show_targets(s)
         now = time.time()
         if now - self._last_record >= 30 and st.settings and \
                 self._history.record(self._pid, s, st.settings, now):
@@ -539,6 +577,35 @@ class LagCompPanel(QWidget):
                 if c:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
                 self.players_table.setItem(r, c, item)
+
+    def _fill(self, table: QTableWidget, rows: list):
+        table.setRowCount(len(rows))
+        for r, cells in enumerate(rows):
+            for c, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if c:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                table.setItem(r, c, item)
+
+    def _show_targets(self, s: lc.Stats):
+        if not s.has_targets:
+            self.bands_table.setRowCount(0)
+            self.targets_table.setRowCount(0)
+            self.targets_note.setText(TARGETS_HELP + "<br><b>This server runs an older helper "
+                                      "- tick the box again to load the new one.</b>")
+            return
+        self.targets_note.setText(TARGETS_HELP)
+        self._fill(self.bands_table, [
+            [b.label, str(b.players), f"{b.close_low:,}", _pct(b.hits_low, b.close_low),
+             f"{b.close_lag:,}", _pct(b.hits_lag, b.close_lag),
+             _pct(b.plain_lag, b.close_lag_plain), f"{b.gained:,}", f"{b.lost:,}",
+             _signed(b.cal_median)] for b in s.bands])
+        rows = sorted(s.targets, key=lambda t: -t.ping)
+        self._fill(self.targets_table, [
+            [t.name, str(t.ping), f"{t.close_low:,}", _pct(t.hits_low, t.close_low),
+             f"{t.close_lag:,}", _pct(t.hits_lag, t.close_lag),
+             _pct(t.plain_lag, t.close_lag_plain), f"{t.gained:,}", f"{t.lost:,}"]
+            for t in rows])
 
     def _show_history(self):
         rows = list(reversed(self._history.rows))
