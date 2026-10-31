@@ -35,7 +35,10 @@ def test_block_layout_matches_the_helper():
     assert lc._OFF["band_cal_total"] == 16700 + 32 * lc.SLOTS
     assert lc._OFF["band_cal"] == lc._OFF["band_cal_total"] + 4 * lc.BANDS
     assert lc._OFF["band_totals"] == lc._OFF["band_cal"] + 4 * lc.BINS * lc.BANDS
-    assert lc.SHARED_SIZE == lc._OFF["band_totals"] + 32 * lc.BANDS == 26344
+    assert lc._V2_SIZE == lc._OFF["band_totals"] + 32 * lc.BANDS == 26344
+    assert lc._OFF["tune_mode"] == 26344
+    assert lc._OFF["tune_log"] == 26344 + 28
+    assert lc.SHARED_SIZE == lc._V3_SIZE == 26344 + 28 + 32 * lc.TUNE_LOG == 28420
 
 
 def test_bundled_helper_exports_its_block():
@@ -241,3 +244,30 @@ def test_preload_foreign_detection():
 
     assert lc.read_state(FakeProc(hooked=False)).kind == lc.UNKNOWN
     assert lc.read_state(FakeProc(hooked=True)).kind == lc.FOREIGN
+
+
+def test_v3_auto_tune_and_event_logger(tmp_path):
+    b = _block(stats_since=1000, tests=400, hits=110, plain_hits=90, gained=30, lost=10,
+               extra_ms=40, tune_mode=lc.TUNE_APPLY, tune_value_ms=65,
+               tune_median_ms=68, tune_have_median=1, tune_samples=340,
+               tune_window_mins=8, tune_decisions=3)
+    b.version, b.size = 3, lc.SHARED_SIZE
+    step = lc._TuneStep(minute=3, tick_count=200000, before_ms=60, after_ms=65,
+                        median_ms=68, have_median=1, samples=340, window_mins=8)
+    raw_step = (lc.ctypes.c_uint32 * 8).from_buffer_copy(bytes(step))
+    b.tune_log[2] = raw_step
+    _, s = lc.parse_stats(bytes(b), now_ticks=201000)
+    assert s.has_tuner and s.tune_mode == lc.TUNE_APPLY
+    assert (s.tune_value_ms, s.tune_median_ms, s.tune_samples, s.tune_decisions) == (65, 68, 340, 3)
+    assert len(s.tune_log) == 1 and s.tune_log[0].after_ms == 65
+
+    logger = lc.EventLogger(str(tmp_path))
+    settings = lc.Settings(False, 40, 400, 80, lc.TUNE_APPLY)
+    added = logger.record_poll(999, s, settings, include_snapshot=True, now=1_700_000_000)
+    assert len(added) == 2
+    assert "Auto-tune min #3 [apply]: Extra +60 -> +65 ms" in added[0]
+    assert "Snapshot" in added[1] and "active Extra +65 ms" in added[1]
+    # Calling again with same minute does not duplicate the tune step
+    assert logger.record_poll(999, s, settings, include_snapshot=False, now=1_700_000_005) == []
+    assert (tmp_path / "wolfrat_lag_comp_events.log").exists()
+    assert (tmp_path / "wolfrat_lag_comp_events.jsonl").exists()

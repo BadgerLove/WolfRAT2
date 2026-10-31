@@ -160,3 +160,25 @@ def test_older_helper_says_tick_again(qtbot, tmp_path, monkeypatch):
     p._refresh_stats(force=True)
     assert p.bands_table.rowCount() == 0
     assert "older helper" in p.targets_note.text()
+
+
+def test_autotune_status_and_live_log_on_panel(qtbot, tmp_path, monkeypatch):
+    state = _loaded(alive=True)
+    state.settings = lc.Settings(False, 40, 400, 80, lc.TUNE_APPLY)
+    s = state.stats
+    s.tests, s.hits, s.plain_hits = 500, 120, 100
+    s.has_targets = True
+    s.bands = [lc.BandStats(label) for label in lc.BAND_LABELS]
+    s.has_tuner = True
+    s.tune_mode = lc.TUNE_APPLY
+    s.tune_value_ms = 65
+    s.tune_median_ms = 68
+    s.tune_samples = 340
+    s.tune_window_mins = 9
+    s.tune_decisions = 5
+    s.tune_log = [lc.TuneStep(5, 10000, 60, 65, 68, 340, 9)]
+    p = _panel(qtbot, tmp_path, monkeypatch, state)
+    p._refresh_stats(force=True)
+    assert "+65 ms" in p.autotune_lbl.text()
+    assert "rolling best" in p.autotune_lbl.text()
+    assert "Auto-tune min #5" in p.event_log_edit.toPlainText()

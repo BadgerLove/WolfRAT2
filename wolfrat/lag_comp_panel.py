@@ -19,9 +19,9 @@ from typing import Callable, Optional
 
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QCheckBox, QFormLayout, QGroupBox, QHBoxLayout, QHeaderView,
-    QLabel, QPushButton, QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem,
-    QVBoxLayout, QWidget,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFormLayout, QGroupBox,
+    QHBoxLayout, QHeaderView, QLabel, QPlainTextEdit, QPushButton, QSizePolicy,
+    QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from wolfrat import lag_comp as lc
@@ -116,13 +116,15 @@ class LagCompPanel(QWidget):
         self._log = log
         self._poll_now = poll_now
         self._history = lc.HistoryBook(str(history_file))
+        self._events = lc.EventLogger(str(Path(history_file).parent))
         self._helper_name = lc.loaded_name(self._data_dir)
         saved = self._load()
         self._wish_on = bool(saved.get("on", False))
         self._settings = lc.Settings(bool(saved.get("observe", False)),
                                      int(saved.get("extra_ms", lc.DEFAULT_EXTRA_MS)),
                                      int(saved.get("max_ms", lc.DEFAULT_MAX_MS)),
-                                     int(saved.get("min_ping_ms", lc.DEFAULT_MIN_PING_MS))).clamp()
+                                     int(saved.get("min_ping_ms", lc.DEFAULT_MIN_PING_MS)),
+                                     int(saved.get("tune_mode", lc.TUNE_OFF))).clamp()
         self._reapply = bool(saved.get("reapply", False))
         self._dirty = False             # a click waits to be written into the server
         self._retry_at = 0.0            # a failed switch-on tries again from then (0 = none)
@@ -137,6 +139,7 @@ class LagCompPanel(QWidget):
         self._build()
         self._show_wish()
         self._show_history()
+        self._show_event_log()
         self.no_server(NO_SERVER)
         self._stats_timer = QTimer(self)
         self._stats_timer.setInterval(1000)
@@ -180,6 +183,11 @@ class LagCompPanel(QWidget):
         self.extra_spin.setSingleStep(10)
         self.extra_spin.setSuffix(" ms")
         form.addRow("Extra (added to each player's ping):", self.extra_spin)
+        self.tune_combo = QComboBox()
+        self.tune_combo.addItem("Off - keep the Extra set above", lc.TUNE_OFF)
+        self.tune_combo.addItem("Watch - calculate & log auto Extra, change nothing", lc.TUNE_WATCH)
+        self.tune_combo.addItem("On (apply) - smoothly auto-tune Extra (<=5 ms/min)", lc.TUNE_APPLY)
+        form.addRow("Auto-tune Extra (live):", self.tune_combo)
         self.min_spin = QSpinBox()
         self.min_spin.setRange(0, 500)
         self.min_spin.setSingleStep(10)
@@ -212,6 +220,11 @@ class LagCompPanel(QWidget):
         self.tune_lbl.setTextFormat(Qt.TextFormat.RichText)
         self.tune_lbl.setStyleSheet("font-size: 10pt; color: #c8b040; padding: 4px;")
         stats_box.addWidget(self.tune_lbl)
+        self.autotune_lbl = QLabel()
+        self.autotune_lbl.setWordWrap(True)
+        self.autotune_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.autotune_lbl.setStyleSheet("font-size: 10pt; color: #90e090; padding: 4px;")
+        stats_box.addWidget(self.autotune_lbl)
         buttons = QHBoxLayout()
         self.suggest_btn = QPushButton("Use suggested")
         self.suggest_btn.setEnabled(False)
@@ -224,6 +237,32 @@ class LagCompPanel(QWidget):
         stats_box.addLayout(buttons)
         stats_group.setLayout(stats_box)
         left.addWidget(stats_group)
+
+        log_group = QGroupBox("\U0001F4CB Live activity & auto-tune log")
+        log_box = QVBoxLayout()
+        log_note = QLabel(
+            "Timestamped log of every auto-tune step, setting change and 30 s snapshot "
+            "(also saved to <code>wolfrat_lag_comp_events.log</code> &amp; <code>.jsonl</code>)."
+        )
+        log_note.setWordWrap(True)
+        log_note.setTextFormat(Qt.TextFormat.RichText)
+        log_note.setStyleSheet("font-size: 9pt; color: #c8b040;")
+        log_box.addWidget(log_note)
+        self.event_log_edit = QPlainTextEdit()
+        self.event_log_edit.setReadOnly(True)
+        self.event_log_edit.setMinimumHeight(180)
+        self.event_log_edit.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 9pt; color: #e8dca0; "
+            "background: #141414; border: 1px solid #554420;"
+        )
+        log_box.addWidget(self.event_log_edit)
+        log_btns = QHBoxLayout()
+        self.copy_log_btn = QPushButton("Copy log")
+        log_btns.addWidget(self.copy_log_btn)
+        log_btns.addStretch()
+        log_box.addLayout(log_btns)
+        log_group.setLayout(log_box)
+        left.addWidget(log_group)
         left.addStretch()
 
         players_group = QGroupBox("\U0001F465 Players")
@@ -273,11 +312,13 @@ class LagCompPanel(QWidget):
         self.on_cb.toggled.connect(self._on_clicked)
         self.observe_cb.toggled.connect(self._setting_changed)
         self.extra_spin.valueChanged.connect(self._setting_changed)
+        self.tune_combo.currentIndexChanged.connect(self._setting_changed)
         self.min_spin.valueChanged.connect(self._setting_changed)
         self.max_spin.valueChanged.connect(self._setting_changed)
         self.reapply_cb.toggled.connect(self._reapply_clicked)
         self.suggest_btn.clicked.connect(self._use_suggested)
         self.reset_btn.clicked.connect(self._reset_clicked)
+        self.copy_log_btn.clicked.connect(self._copy_log)
 
     @staticmethod
     def _table(columns, stretch: int = 0) -> QTableWidget:
@@ -299,6 +340,8 @@ class LagCompPanel(QWidget):
             self.on_cb.setChecked(self._wish_on)
             self.observe_cb.setChecked(self._settings.observe)
             self.extra_spin.setValue(self._settings.extra_ms)
+            idx = self.tune_combo.findData(self._settings.tune_mode)
+            self.tune_combo.setCurrentIndex(max(0, idx))
             self.min_spin.setValue(self._settings.min_ping_ms)
             self.max_spin.setValue(self._settings.max_ms)
             self.reapply_cb.setChecked(self._reapply)
@@ -328,13 +371,18 @@ class LagCompPanel(QWidget):
         self._settings_timer.start()        # write once the spin box settles
 
     def _settings_settled(self):
+        mode_val = self.tune_combo.currentData()
         new = lc.Settings(self.observe_cb.isChecked(), self.extra_spin.value(),
-                          self.max_spin.value(), self.min_spin.value()).clamp()
+                          self.max_spin.value(), self.min_spin.value(),
+                          lc.TUNE_OFF if mode_val is None else int(mode_val)).clamp()
         if new == self._settings:
             return
         self._settings = new
         self._save()
-        self._log("Lag compensation: " + lc.describe_setting(new) + ".")
+        desc = lc.describe_setting(new)
+        self._log("Lag compensation: " + desc + ".")
+        self._events.note("Settings updated: " + desc, kind="settings")
+        self._show_event_log()
         if self._wish_on:
             self._dirty = True
             if self._poll_now:
@@ -371,6 +419,8 @@ class LagCompPanel(QWidget):
             self._show_reset_button(False)
             return
         self._log("Lag compensation: counting started again.")
+        self._events.note("Counting started again (stats reset).", kind="reset")
+        self._show_event_log()
         self._reset_note = "✔ Counting started again at " + time.strftime("%H:%M:%S") + "."
         if self._state is not None and not self._state.alive:
             self._reset_note += " Nobody is on yet: it counts from the first player."
@@ -455,12 +505,17 @@ class LagCompPanel(QWidget):
                 state = lc.turn_on(pid, memory, self._data_dir, self._settings)
                 if not was_on:
                     lc.reset_stats(pid, self._helper_name)
-                    self._log("Lag compensation ON: " + lc.describe_setting(self._settings) + ".")
-                elif before != self._settings:
+                    desc = lc.describe_setting(self._settings)
+                    self._log("Lag compensation ON: " + desc + ".")
+                    self._events.note(f"Lag compensation ON (pid {pid}): {desc}", kind="on", pid=pid)
+                    self._show_event_log()
+                elif not self._settings.same_core(before):
                     lc.reset_stats(pid, self._helper_name)
             elif state.on or state.kind == lc.OLD:
                 state = lc.turn_off(pid, memory)
                 self._log("Lag compensation OFF: the server is back to normal JO hits.")
+                self._events.note(f"Lag compensation OFF (pid {pid}).", kind="off", pid=pid)
+                self._show_event_log()
         except lc.LagCompError as exc:
             # Never untick on a failure: the admin asked for it on, so it stays
             # ticked (and saved) and WolfRAT keeps trying.  Unticking here once
@@ -492,7 +547,8 @@ class LagCompPanel(QWidget):
             self._set_available(False)
         elif st.on:
             mode = "WATCH ONLY - counting, no hits changed" if st.observe else "ON"
-            text = "\U0001F7E2 " + mode + " (" + lc.describe_setting(st.settings) + ")."
+            live_extra = st.stats.tune_value_ms if (st.stats and st.stats.has_tuner) else None
+            text = "\U0001F7E2 " + mode + " (" + lc.describe_setting(st.settings, live_extra) + ")."
             if not st.alive:
                 text += " Waiting for players - an empty server does not run it."
         elif st.kind == lc.OLD:
@@ -515,6 +571,7 @@ class LagCompPanel(QWidget):
         if not st.stats:
             self.totals_lbl.setText("No numbers yet - switch it on.")
             self.tune_lbl.setText("")
+            self.autotune_lbl.setText("")
             self.suggest_btn.setEnabled(False)
             self.players_table.setRowCount(0)
             self.bands_table.setRowCount(0)
@@ -525,7 +582,16 @@ class LagCompPanel(QWidget):
         self._show_players(s)
         self._show_targets(s)
         now = time.time()
-        if now - self._last_record >= 30 and st.settings and \
+        snap_due = (now - self._last_record >= 30)
+        if st.settings:
+            added_lines = self._events.record_poll(
+                self._pid, s, st.settings, include_snapshot=snap_due, now=now)
+            if added_lines:
+                for ln in added_lines:
+                    if "Auto-tune min #" in ln and "->" in ln:
+                        self._log("Lag compensation: " + ln.split("] ", 1)[-1])
+                self._show_event_log()
+        if snap_due and st.settings and \
                 self._history.record(self._pid, s, st.settings, now):
             self._last_record = now
             try:
@@ -565,6 +631,28 @@ class LagCompPanel(QWidget):
             self.tune_lbl.setText(text)
         self.suggest_btn.setEnabled(suggestion is not None and bool(st.settings) and
                                     suggestion != st.settings.extra_ms)
+        if not s.has_tuner:
+            self.autotune_lbl.setText("")
+        else:
+            mode_name = lc.TUNE_MODE_NAMES.get(s.tune_mode, "off")
+            if s.tune_mode == lc.TUNE_OFF:
+                self.autotune_lbl.setText(
+                    f"Auto-tune: <b>off</b> (rolling window: {s.tune_samples:,} / 300 close shots "
+                    f"in last {max(1, s.tune_window_mins)} min)."
+                )
+            elif s.tune_median_ms is None:
+                self.autotune_lbl.setText(
+                    f"Auto-tune (<b>{mode_name}</b>): holding at <b>{_signed(s.tune_value_ms)}</b> "
+                    f"- waiting for 300 close shots in last 30 min (<b>{s.tune_samples:,} / 300</b> so far)."
+                )
+            else:
+                act = "applied live" if s.tune_mode == lc.TUNE_APPLY else "watched only (not applied)"
+                self.autotune_lbl.setText(
+                    f"Auto-tune (<b>{act}</b>): Extra <b>{_signed(s.tune_value_ms)}</b> · "
+                    f"rolling best <b>{_signed(s.tune_median_ms)}</b> "
+                    f"({s.tune_samples:,} shots over {s.tune_window_mins} min · "
+                    f"{s.tune_decisions} min decisions)."
+                )
 
     def _show_players(self, s: lc.Stats):
         rows = sorted(s.players, key=lambda p: -p.ping)
@@ -631,10 +719,24 @@ class LagCompPanel(QWidget):
             pass
         return {}
 
+    def _show_event_log(self):
+        text = "\n".join(self._events.lines[-80:]) if self._events.lines else "No events logged yet."
+        if self.event_log_edit.toPlainText() != text:
+            self.event_log_edit.setPlainText(text)
+            sb = self.event_log_edit.verticalScrollBar()
+            if sb:
+                sb.setValue(sb.maximum())
+
+    def _copy_log(self):
+        cb = QApplication.clipboard()
+        if cb:
+            cb.setText("\n".join(self._events.lines))
+
     def _save(self):
         s = self._settings
         data = {"on": self._wish_on, "observe": s.observe, "extra_ms": s.extra_ms,
-                "max_ms": s.max_ms, "min_ping_ms": s.min_ping_ms, "reapply": self._reapply}
+                "max_ms": s.max_ms, "min_ping_ms": s.min_ping_ms,
+                "tune_mode": s.tune_mode, "reapply": self._reapply}
         try:
             self._file.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception as exc:

@@ -37,7 +37,7 @@ DLL_NAME = "wolfrat_lagcomp.dll"
 LOADED_PREFIX = "wolfrat_lagcomp_"
 EXPORT_NAME = b"WolfRatLagComp"
 MAGIC = 0x31434C57
-VERSION = 2              # 2 = per-target rows + best rewind by target ping
+VERSION = 3              # 3 = auto-tune of Extra + decision log (2 = per-target rows)
 
 SLOTS = 250
 LEGACY_SLOTS = 64
@@ -46,6 +46,11 @@ BIN_MS = 8
 BIN_MIN = -400
 BANDS = 3
 BAND_LABELS = ("under 80", "80-149", "150+")   # target ping, ms (as in the helper)
+TUNE_LOG = 64
+TUNE_OFF = 0
+TUNE_WATCH = 1
+TUNE_APPLY = 2
+TUNE_MODE_NAMES = {TUNE_OFF: "off", TUNE_WATCH: "watch", TUNE_APPLY: "apply"}
 
 # Retail 1.7.5.7 / TAC / FMJ call sites, so WolfRAT can spot onHook's own
 # lag compensation before loading its helper DLL.
@@ -118,13 +123,31 @@ class _Shared(ctypes.LittleEndianStructure):
                 ("targets", _Target * SLOTS),
                 ("band_cal_total", ctypes.c_uint32 * BANDS),
                 ("band_cal", (ctypes.c_uint32 * BINS) * BANDS),
-                ("band_totals", _Target * BANDS)]   # by the target's ping at each shot
+                ("band_totals", _Target * BANDS),   # by the target's ping at each shot
+                # version 3, appended (auto-tune of Extra + decision log):
+                ("tune_mode", ctypes.c_int32),
+                ("tune_value_ms", ctypes.c_int32),
+                ("tune_median_ms", ctypes.c_int32),
+                ("tune_have_median", ctypes.c_int32),
+                ("tune_samples", ctypes.c_uint32),
+                ("tune_window_mins", ctypes.c_uint32),
+                ("tune_decisions", ctypes.c_uint32),
+                ("tune_log", (ctypes.c_uint32 * 8) * TUNE_LOG)]
+
+
+class _TuneStep(ctypes.LittleEndianStructure):
+    _pack_ = 4
+    _fields_ = [("minute", ctypes.c_uint32), ("tick_count", ctypes.c_uint32),
+                ("before_ms", ctypes.c_int32), ("after_ms", ctypes.c_int32),
+                ("median_ms", ctypes.c_int32), ("have_median", ctypes.c_int32),
+                ("samples", ctypes.c_uint32), ("window_mins", ctypes.c_uint32)]
 
 
 SHARED_SIZE = ctypes.sizeof(_Shared)
 _OFF = {name: getattr(_Shared, name).offset for name, _ in _Shared._fields_}
 _MIN_SHARED_SIZE = _OFF["players"] + LEGACY_SLOTS * ctypes.sizeof(_Player)
-_V2_SIZE = SHARED_SIZE                     # a block this big has the target rows
+_V2_SIZE = _OFF["tune_mode"]               # 26,344: a block this big has the target rows
+_V3_SIZE = SHARED_SIZE                     # 28,420: a block this big has the auto-tuner
 
 
 @dataclass
@@ -133,11 +156,20 @@ class Settings:
     extra_ms: int = DEFAULT_EXTRA_MS
     max_ms: int = DEFAULT_MAX_MS
     min_ping_ms: int = DEFAULT_MIN_PING_MS
+    tune_mode: int = TUNE_OFF
 
     def clamp(self) -> "Settings":
         return Settings(bool(self.observe), max(-200, min(300, int(self.extra_ms))),
                         max(50, min(900, int(self.max_ms))),
-                        max(0, min(500, int(self.min_ping_ms))))
+                        max(0, min(500, int(self.min_ping_ms))),
+                        max(TUNE_OFF, min(TUNE_APPLY, int(self.tune_mode))))
+
+    def same_core(self, other: Optional["Settings"]) -> bool:
+        """True when only tune_mode changed (so counters do not need to restart)."""
+        if other is None:
+            return False
+        return (self.observe, self.extra_ms, self.max_ms, self.min_ping_ms) == (
+            other.observe, other.extra_ms, other.max_ms, other.min_ping_ms)
 
 
 @dataclass
@@ -199,6 +231,22 @@ def band_of(ping: int) -> int:
 
 
 @dataclass
+class TuneStep:
+    minute: int
+    tick_count: int
+    before_ms: int
+    after_ms: int
+    median_ms: Optional[int]
+    samples: int
+    window_mins: int
+
+    def as_dict(self) -> dict:
+        return {k: getattr(self, k) for k in (
+            "minute", "tick_count", "before_ms", "after_ms",
+            "median_ms", "samples", "window_mins")}
+
+
+@dataclass
 class Stats:
     tests: int = 0
     hits: int = 0
@@ -216,6 +264,14 @@ class Stats:
     has_targets: bool = False              # helper version 2 or later
     targets: list = field(default_factory=list)
     bands: list = field(default_factory=list)
+    has_tuner: bool = False                # helper version 3 or later
+    tune_mode: int = TUNE_OFF
+    tune_value_ms: int = DEFAULT_EXTRA_MS
+    tune_median_ms: Optional[int] = None
+    tune_samples: int = 0
+    tune_window_mins: int = 0
+    tune_decisions: int = 0
+    tune_log: list = field(default_factory=list)
 
     @property
     def gain_percent(self) -> Optional[float]:
@@ -266,8 +322,9 @@ def histogram_quantiles(cal) -> tuple[Optional[int], Optional[int], Optional[int
 def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, Stats]:
     if len(raw) < _MIN_SHARED_SIZE:
         raise LagCompError("short read of the lag compensation block")
-    has_targets = len(raw) >= _V2_SIZE and \
-        struct.unpack_from("<II", raw, 4)[0] >= 2 and struct.unpack_from("<I", raw, 8)[0] >= _V2_SIZE
+    ver, sz = struct.unpack_from("<II", raw, 4)
+    has_targets = len(raw) >= _V2_SIZE and ver >= 2 and sz >= _V2_SIZE
+    has_tuner = len(raw) >= _V3_SIZE and ver >= 3 and sz >= _V3_SIZE
     if len(raw) < SHARED_SIZE:
         raw = raw + b"\0" * (SHARED_SIZE - len(raw))
     shared = _Shared.from_buffer_copy(raw[:SHARED_SIZE])
@@ -282,8 +339,11 @@ def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, S
             shared.cal[i] = 0
         for p in shared.players:
             p.tests = p.hits = p.plain_hits = p.gained = p.lost = 0
+        saved_mode = shared.tune_mode
         ctypes.memset(ctypes.addressof(shared) + _OFF["targets"], 0,
                       SHARED_SIZE - _OFF["targets"])
+        shared.tune_mode = saved_mode
+        shared.tune_value_ms = shared.extra_ms
         shared.stats_since = now_ticks
     cal = list(shared.cal)
     low, mid, high = histogram_quantiles(cal)
@@ -314,6 +374,26 @@ def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, S
             b.cal_total = shared.band_cal_total[i]
             b.cal_median = histogram_quantiles(list(shared.band_cal[i]))[1]
         stats.bands = bands
+    stats.has_tuner = has_tuner
+    if has_tuner:
+        stats.tune_mode = int(shared.tune_mode)
+        stats.tune_value_ms = int(shared.tune_value_ms)
+        stats.tune_median_ms = int(shared.tune_median_ms) if shared.tune_have_median else None
+        stats.tune_samples = int(shared.tune_samples)
+        stats.tune_window_mins = int(shared.tune_window_mins)
+        stats.tune_decisions = int(shared.tune_decisions)
+        steps = []
+        raw_log = bytes(shared.tune_log)
+        step_sz = ctypes.sizeof(_TuneStep)
+        for i in range(TUNE_LOG):
+            st = _TuneStep.from_buffer_copy(raw_log[i * step_sz:(i + 1) * step_sz])
+            if st.minute > 0:
+                steps.append(TuneStep(
+                    int(st.minute), int(st.tick_count), int(st.before_ms), int(st.after_ms),
+                    int(st.median_ms) if st.have_median else None,
+                    int(st.samples), int(st.window_mins)))
+        steps.sort(key=lambda x: x.minute)
+        stats.tune_log = steps
     return shared, stats
 
 
@@ -651,7 +731,8 @@ def read_state(proc: ServerProcess, wanted_name: Optional[str] = None) -> State:
         return State(kind if kind in (FOREIGN, STOCK) else UNKNOWN)
     block, stats = parse_stats(_read_block(proc, mine.shared))
     alive = ((_tick_count() - block.heartbeat) & 0xFFFFFFFF) < 3000 if block.heartbeat else False
-    settings = Settings(bool(block.observe), block.extra_ms, block.max_ms, block.min_ping_ms)
+    settings = Settings(bool(block.observe), block.extra_ms, block.max_ms, block.min_ping_ms,
+                        block.tune_mode if stats.has_tuner else TUNE_OFF)
     return State(kind, mine.base, mine.shared, block.status == 1,
                  block.error.split(b"\0")[0].decode("latin-1"), bool(block.observe),
                  settings, stats, alive)
@@ -662,6 +743,12 @@ def _write_settings(proc: ServerProcess, shared: int, settings: Settings, enable
     s = settings.clamp()
     proc.write(shared + _OFF["observe"], struct.pack("<iiii", int(s.observe), s.extra_ms,
                                                      s.max_ms, s.min_ping_ms))
+    try:
+        ver, sz = struct.unpack("<II", proc.read(shared + 4, 8))
+        if ver >= 3 and sz >= _V3_SIZE:
+            proc.write(shared + _OFF["tune_mode"], struct.pack("<i", int(s.tune_mode)))
+    except LagCompError:
+        pass
     proc.write(shared + _OFF["enabled"], struct.pack("<i", 1 if enabled else 0))
 
 
@@ -754,9 +841,23 @@ def server_state(pid: int, wanted_name: Optional[str] = None) -> State:
         return read_state(proc, wanted_name)
 
 
-def describe_setting(s: Settings) -> str:
+def describe_setting(s: Settings, live_extra_ms: Optional[int] = None) -> str:
     sign = "+" if s.extra_ms >= 0 else ""
-    text = f"ping {sign}{s.extra_ms} ms, none under {s.min_ping_ms}, max {s.max_ms}"
+    if s.tune_mode == TUNE_APPLY:
+        if live_extra_ms is not None:
+            lsign = "+" if live_extra_ms >= 0 else ""
+            extra_part = f"ping {lsign}{live_extra_ms} ms (auto from {sign}{s.extra_ms})"
+        else:
+            extra_part = f"ping {sign}{s.extra_ms} ms (auto-tune)"
+    elif s.tune_mode == TUNE_WATCH:
+        if live_extra_ms is not None:
+            lsign = "+" if live_extra_ms >= 0 else ""
+            extra_part = f"ping {sign}{s.extra_ms} ms (auto-watch: {lsign}{live_extra_ms})"
+        else:
+            extra_part = f"ping {sign}{s.extra_ms} ms (auto-watch)"
+    else:
+        extra_part = f"ping {sign}{s.extra_ms} ms"
+    text = f"{extra_part}, none under {s.min_ping_ms}, max {s.max_ms}"
     return ("watch only, " + text) if s.observe else text
 
 
@@ -785,13 +886,21 @@ class HistoryBook:
             return False
         now = time.time() if now is None else now
         key = f"{pid}-{stats.since:08x}"
+        live_extra = stats.tune_value_ms if stats.has_tuner else None
         row = {"key": key,
                "started": time.strftime("%Y-%m-%d %H:%M", time.localtime(now - stats.seconds)),
                "minutes": round(stats.seconds / 60.0),
-               "setting": describe_setting(settings),
+               "setting": describe_setting(settings, live_extra),
                "hits": stats.hits, "plain_hits": stats.plain_hits,
                "gained": stats.gained, "lost": stats.lost,
                "cal_total": stats.cal_total, "cal_median": stats.cal_median}
+        if stats.has_tuner:
+            row["tune_mode"] = TUNE_MODE_NAMES.get(stats.tune_mode, "off")
+            row["tune_value_ms"] = stats.tune_value_ms
+            row["tune_median_ms"] = stats.tune_median_ms
+            row["tune_samples"] = stats.tune_samples
+            row["tune_decisions"] = stats.tune_decisions
+            row["tune_log"] = [st.as_dict() for st in stats.tune_log]
         if stats.has_targets:
             row["bands"] = [b.as_dict() for b in stats.bands]
             # Players who left keep their last numbers (the helper drops their row).
@@ -816,6 +925,116 @@ class HistoryBook:
         with open(tmp, "w", encoding="utf-8") as fh:
             self._json.dump(self.rows, fh, indent=1)
         os.replace(tmp, self.path)
+
+
+class EventLogger:
+    """Timestamped event and auto-tune log for WolfRAT2 (human .log + structured .jsonl)."""
+
+    MAX_LINES = 200
+
+    def __init__(self, base_dir: str):
+        import json
+        self._json = json
+        self.log_path = os.path.join(base_dir, "wolfrat_lag_comp_events.log")
+        self.jsonl_path = os.path.join(base_dir, "wolfrat_lag_comp_events.jsonl")
+        self.lines: list[str] = []
+        self._last_session_key: Optional[str] = None
+        self._last_tune_minute: int = 0
+        try:
+            if os.path.exists(self.log_path):
+                with open(self.log_path, encoding="utf-8", errors="replace") as fh:
+                    self.lines = [ln.rstrip("\r\n") for ln in fh.readlines()[-self.MAX_LINES:] if ln.strip()]
+        except Exception:
+            self.lines = []
+
+    @staticmethod
+    def _stamp(now: Optional[float] = None) -> str:
+        import time
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() if now is None else now))
+
+    def _append(self, line: str, payload: dict) -> None:
+        self.lines.append(line)
+        if len(self.lines) > self.MAX_LINES:
+            self.lines = self.lines[-self.MAX_LINES:]
+        try:
+            os.makedirs(os.path.dirname(self.log_path) or ".", exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+            with open(self.jsonl_path, "a", encoding="utf-8") as fh:
+                fh.write(self._json.dumps(payload) + "\n")
+        except Exception:
+            pass
+
+    def note(self, message: str, kind: str = "event", now: Optional[float] = None, **extra) -> str:
+        ts = self._stamp(now)
+        line = f"[{ts}] {message}"
+        payload = {"time": ts, "kind": kind, "message": message}
+        payload.update(extra)
+        self._append(line, payload)
+        return line
+
+    def record_poll(self, pid: int, stats: Stats, settings: Settings,
+                    include_snapshot: bool = False, now: Optional[float] = None) -> list[str]:
+        """Log any new per-minute auto-tune decisions, plus an optional periodic snapshot."""
+        added: list[str] = []
+        session_key = f"{pid}-{stats.since:08x}"
+        if session_key != self._last_session_key:
+            self._last_session_key = session_key
+            self._last_tune_minute = 0
+        mode_name = TUNE_MODE_NAMES.get(stats.tune_mode if stats.has_tuner else settings.tune_mode, "off")
+        if stats.has_tuner and stats.tune_log:
+            for st in stats.tune_log:
+                if st.minute <= self._last_tune_minute:
+                    continue
+                self._last_tune_minute = st.minute
+                if st.median_ms is None:
+                    msg = (f"Auto-tune min #{st.minute} [{mode_name}]: holding Extra {st.after_ms:+d} ms "
+                           f"(waiting for 300 close shots in 30 min: {st.samples} in {st.window_mins} min)")
+                elif st.after_ms != st.before_ms:
+                    msg = (f"Auto-tune min #{st.minute} [{mode_name}]: Extra {st.before_ms:+d} -> {st.after_ms:+d} ms "
+                           f"(rolling best {st.median_ms:+d} ms from {st.samples} shots / {st.window_mins} min)")
+                else:
+                    msg = (f"Auto-tune min #{st.minute} [{mode_name}]: kept Extra {st.after_ms:+d} ms "
+                           f"(rolling best {st.median_ms:+d} ms from {st.samples} shots / {st.window_mins} min)")
+                added.append(self.note(msg, kind="tune_step", now=now, pid=pid,
+                                       tune_mode=mode_name, step=st.as_dict()))
+        if include_snapshot and stats.tests > 0:
+            gain = stats.gain_percent
+            gain_str = "-" if gain is None else f"{gain:+.0f}%"
+            best_str = "-" if stats.cal_median is None else f"{stats.cal_median:+d} ms"
+            live_extra = stats.tune_value_ms if (stats.has_tuner and settings.tune_mode == TUNE_APPLY) else settings.extra_ms
+            band_parts = []
+            for b in stats.bands:
+                lag_pct = b.percent(b.hits_lag, b.close_lag)
+                plain_pct = b.percent(b.plain_lag, b.close_lag_plain)
+                b_best = "-" if b.cal_median is None else f"{b.cal_median:+d}"
+                if lag_pct is not None or b.close_low:
+                    l_str = "-" if lag_pct is None else f"{lag_pct:.0f}%"
+                    p_str = "-" if plain_pct is None else f"{plain_pct:.0f}%"
+                    band_parts.append(f"{b.label}: lag {l_str}/plain {p_str} (best {b_best})")
+            bands_summary = (" | Bands " + ", ".join(band_parts)) if band_parts else ""
+            msg = (f"Snapshot ({stats.seconds // 60}m): {stats.hits} hits vs {stats.plain_hits} plain ({gain_str}), "
+                   f"saved {stats.gained} / cost {stats.lost}, best {best_str} ({stats.cal_total} shots), "
+                   f"active Extra {live_extra:+d} ms [{mode_name}]{bands_summary}")
+            added.append(self.note(
+                msg, kind="snapshot", now=now, pid=pid,
+                setting=describe_setting(settings, stats.tune_value_ms if stats.has_tuner else None),
+                tick_ms=round(stats.tick_us / 1000.0, 2),
+                seconds=stats.seconds, tests=stats.tests,
+                hits=stats.hits, plain_hits=stats.plain_hits,
+                gained=stats.gained, lost=stats.lost,
+                cal_total=stats.cal_total, cal_median=stats.cal_median,
+                cal_low=stats.cal_low, cal_high=stats.cal_high,
+                tune_mode=mode_name,
+                tune_value_ms=stats.tune_value_ms if stats.has_tuner else settings.extra_ms,
+                tune_median_ms=stats.tune_median_ms if stats.has_tuner else None,
+                tune_samples=stats.tune_samples if stats.has_tuner else 0,
+                tune_decisions=stats.tune_decisions if stats.has_tuner else 0,
+                bands=[b.as_dict() for b in stats.bands] if stats.has_targets else [],
+                players=[p.__dict__ for p in stats.players],
+                targets=[t.__dict__ for t in stats.targets] if stats.has_targets else [],
+            ))
+        return added
 
 
 def loaded_name(data_dir: str) -> Optional[str]:
