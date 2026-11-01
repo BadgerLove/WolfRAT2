@@ -258,3 +258,44 @@ def test_the_dynamic_page_lists_timed_maps_and_removes_steps(qtbot, tmp_path):
     assert page.steps_for("TD-Adale.bms") == [] and page.timelines() == {}
     # sky choices come from the Sky page
     assert page.step_sky.findData("sundownshowdown") >= 0
+
+
+# ------------------------------------------------------------- the map clock
+def test_a_coop_map_saying_0_left_all_game_is_not_the_last_minute():
+    # Dale, 2026-11-01: zombie.bms says "0/30" from the start; every !sky was undone
+    clock = t.MapClock()
+    for now in (0, 30, 600):
+        assert clock.minutes_left(map_name="zombie.bms", remaining=0,
+                                  read_at=now, now=now) is None
+
+
+def test_a_timed_map_counting_down_to_0_is_the_last_minute():
+    clock = t.MapClock()
+    assert clock.minutes_left(map_name=SALFORD, remaining=30, read_at=20, now=20) == 30
+    assert clock.minutes_left(map_name=SALFORD, remaining=1, read_at=1700, now=1700) == 1
+    assert clock.minutes_left(map_name=SALFORD, remaining=0, read_at=1750, now=1750) == 0
+
+
+def test_the_old_maps_clock_read_just_after_a_switch_does_not_count():
+    clock = t.MapClock()
+    clock.minutes_left(map_name=SALFORD, remaining=12, read_at=100, now=100)
+    # !map to the co-op map: the first poll still has the old map's 12 left
+    assert clock.minutes_left(map_name="zombie.bms", remaining=12, read_at=103, now=105) == 12
+    assert clock.minutes_left(map_name="zombie.bms", remaining=0, read_at=110, now=110) is None
+    assert clock.minutes_left(map_name="zombie.bms", remaining=0, read_at=900, now=900) is None
+
+
+def test_a_new_map_forgets_the_old_clock_and_unknown_stays_unknown():
+    clock = t.MapClock()
+    clock.minutes_left(map_name=SALFORD, remaining=5, read_at=100, now=100)
+    assert clock.minutes_left(map_name=SALFORD, remaining=None, read_at=0, now=200) is None
+    assert clock.minutes_left(map_name="zombie.bms", remaining=0, read_at=300, now=300) is None
+
+
+def test_no_timed_step_fires_on_a_coop_map():
+    clock, runner = t.MapClock(), t.Runner("weather")
+    plan = steps((20, "overcast"), (10, "fog", 100), (0, "clear"))
+    for now in (0, 30, 60):
+        left = clock.minutes_left(map_name="zombie.bms", remaining=0, read_at=now, now=now)
+        event = runner.tick(map_name="zombie.bms", minutes_left=left, steps=plan, settled=True)
+        assert event.step is None

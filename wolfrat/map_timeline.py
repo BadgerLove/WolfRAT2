@@ -195,7 +195,37 @@ class Runner:
         return Event(step=step, restarted=restarted)
 
 
+class MapClock:
+    """Minutes left as the timed steps and the last-minute sky may use them.
+
+    A co-op map has no timer, but the server still says "0/30" all game,
+    which read as the last minute: every !sky was undone in the same second
+    and every timed step came due at once (Dale, 2026-11-01).  So a 0 only
+    counts once this map's clock has been seen above 0; until then the time
+    is unknown (None).  A reading from the first ``GRACE`` seconds of a map may
+    still be the old map's, so it doesn't count as seen."""
+
+    GRACE = 15.0
+
+    def __init__(self):
+        self.map_name: Optional[str] = None
+        self._map_at: Optional[float] = None
+        self._running = False
+
+    def minutes_left(self, *, map_name: Optional[str], remaining: Optional[int],
+                     read_at: float, now: float) -> Optional[int]:
+        if map_name != self.map_name:
+            self.map_name, self._map_at, self._running = map_name, now, False
+        if remaining is None:
+            return None
+        if remaining > 0 and read_at >= self._map_at + self.GRACE:
+            self._running = True
+        if remaining <= 0 and not self._running:
+            return None
+        return remaining
+
+
 __all__ = [
-    "Event", "Runner", "SKY_OFF", "TimedStep", "WEATHER_CHOICES", "WEATHER_LABELS", "clamp_fog",
+    "Event", "MapClock", "Runner", "SKY_OFF", "TimedStep", "WEATHER_CHOICES", "WEATHER_LABELS", "clamp_fog",
     "due", "sort_steps", "steps_for", "timelines_from_json", "timelines_to_json",
 ]
