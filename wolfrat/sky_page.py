@@ -108,6 +108,9 @@ class SkyPage(QWidget):
         self._button_cls = button_cls
         self._clock = clock
         self.time_left: Callable[[], Optional[int]] = lambda: None
+        # the server's map right now, not as of the last 5 s poll (see _pump)
+        self.live_context: Optional[Callable[[], tuple]] = None
+        self.map_loads: Callable[[], int] = lambda: 0
         # the map's timed steps (map_timeline), kept on the Dynamic page
         self.timeline_steps: Callable[[Optional[str]], list] = lambda _map: []
         self._timed = map_timeline.Runner("sky")
@@ -290,8 +293,8 @@ class SkyPage(QWidget):
         self.mods_cb.setChecked(bool(settings.get("mods", False)))
         self.announce_cb = QCheckBox("Tell players in chat when the sky changes")
         self.announce_cb.setChecked(bool(settings.get("announce", True)))
-        self.last_minute_cb = QCheckBox("Give the map its own sky back for the last minute "
-                                        "(maps with a timer)")
+        self.last_minute_cb = QCheckBox("Give the map its own sky and weather back for the last "
+                                        "minute (maps with a timer)")
         self.last_minute_cb.setChecked(bool(settings.get("last_minute", False)))
         for box in (self.mods_cb, self.announce_cb, self.last_minute_cb):
             box.toggled.connect(self._save)
@@ -773,7 +776,12 @@ class SkyPage(QWidget):
     def _pump(self):
         """Every half second: run the keeper and send one command if the script is free."""
         memory = self._memory
-        map_name, players, settled = self._context
+        # Read fresh: the clock is live, so a map name up to 5 s old made a new
+        # map's clock look like the old map starting again (Dale, 2026-11-02).
+        try:
+            map_name, players, settled = (self.live_context or (lambda: self._context))()
+        except Exception:
+            map_name, players, settled = self._context
         try:
             minutes_left = self.time_left()
         except Exception:
@@ -814,9 +822,11 @@ class SkyPage(QWidget):
             timeline = []
         ready = settled and not self.keeper.demo_running() and not self.keeper.timed_blocked
         event = self._timed.tick(map_name=map_name, minutes_left=minutes_left,
-                                 steps=timeline, settled=ready)
-        if event.restarted and map_name == self.keeper.map_name:
-            self.keeper.new_round()
+                                 steps=timeline, settled=ready, load=self.map_loads())
+        if event.restarted:
+            self._drop_old_map_looks()
+            if map_name == self.keeper.map_name:
+                self.keeper.new_round()
         if event.step is None:
             return None
         if event.step.sky == map_timeline.SKY_OFF:
@@ -827,6 +837,12 @@ class SkyPage(QWidget):
                       f"'{event.step.sky}' any more - skipped.")
             return None
         return scene, event.step.minutes_left
+
+    def _drop_old_map_looks(self):
+        try:
+            self.sender.drop_looks(self._memory if self._writable else None)
+        except Exception as exc:
+            self._log(f"Sky: could not take back the old map's colours ({exc}).")
 
     def _do_quiet(self, step: sky.Step):
         """Keeper steps from the tick (no poll_now: we are inside one)."""

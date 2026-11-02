@@ -365,6 +365,10 @@ class DynamicWeather:
     def front(self) -> Optional[Front]:
         return self._front
 
+    @property
+    def hands_on(self) -> bool:
+        return self._hands_on
+
     def reset(self) -> None:
         self._front = None
         self._next_front_at = self._next_kind = None

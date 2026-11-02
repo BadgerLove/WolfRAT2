@@ -81,9 +81,13 @@ def test_runner_fires_once_catches_up_and_starts_over_on_a_new_map():
 
     assert tick(25, map_name="TD-Adale.bms").restarted
     assert runner.applied is None
-    # the same map again: the clock jumps back up
+    # a clock that goes back up is not a load: it may be the next map's clock, or !gametime
     tick(9, map_name="TD-Adale.bms")
-    event = tick(30, map_name="TD-Adale.bms")
+    assert runner.applied is not None
+    assert not tick(30, map_name="TD-Adale.bms").restarted
+    assert runner.applied is not None
+    # the same map loading again is
+    event = runner.tick(map_name="TD-Adale.bms", minutes_left=30, steps=plan, settled=True, load=1)
     assert event.restarted and runner.applied is None
 
 
@@ -280,7 +284,7 @@ def test_the_old_maps_clock_read_just_after_a_switch_does_not_count():
     clock = t.MapClock()
     clock.minutes_left(map_name=SALFORD, remaining=12, read_at=100, now=100)
     # !map to the co-op map: the first poll still has the old map's 12 left
-    assert clock.minutes_left(map_name="zombie.bms", remaining=12, read_at=103, now=105) == 12
+    assert clock.minutes_left(map_name="zombie.bms", remaining=12, read_at=103, now=105) is None
     assert clock.minutes_left(map_name="zombie.bms", remaining=0, read_at=110, now=110) is None
     assert clock.minutes_left(map_name="zombie.bms", remaining=0, read_at=900, now=900) is None
 

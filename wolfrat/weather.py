@@ -95,6 +95,8 @@ class Addr:
 
     # The loaded map's 616-byte BMS header (OpenNova libs/mission bms.h).
     BMS_HEADER = 0x00A761D0
+    MAP_FILE_NAME = 0x024D1F3E         # g_MapFileName, the name "CURRENT MAP: %s" prints
+    ROUND_OVER = 0x024C1928            # g_RoundOver: set at a round's end, cleared at Game_StartMission
 
     # Lightning handshake slots: unused .data, zero until something writes them.
     LIGHTNING_MARKER = 0x0334BF00
@@ -528,6 +530,19 @@ class WeatherController:
             self._wind_home = cloud
             self._wind_to(cloud, seconds, ours=False)
             self.step_wind()
+
+    def loaded_map(self) -> tuple[Optional[str], bool]:
+        """(the map file the server has loaded, whether its round is over).  The
+        name is None when memory does not hold a plausible one."""
+        if not self._verified:
+            self.verify()
+        raw = self._mem.read(Addr.MAP_FILE_NAME, 32).split(b"\x00")[0]
+        try:
+            name = raw.decode("ascii").strip()
+        except UnicodeDecodeError:
+            name = ""
+        plausible = "." in name and name.isprintable()
+        return (name if plausible else None), self._get(Addr.ROUND_OVER) != 0
 
     def map_info(self) -> MapInfo:
         if not self._verified:

@@ -510,6 +510,14 @@ class Sender:
     def clear(self) -> None:
         self._queue.clear()
 
+    def drop_looks(self, memory=None) -> None:
+        """A map load: nothing meant for the old map may reach the new one, whether
+        it is still queued or written and not yet read by the script."""
+        self._queue = [c for c in self._queue if c.code not in (CMD_LOOK, CMD_ALL_OFF)]
+        if memory is not None:
+            self.take_back(memory, CMD_LOOK)
+            self.take_back(memory, CMD_ALL_OFF)
+
     def push(self, command: Command, replace_looks: bool = True) -> None:
         if replace_looks and command.code in (CMD_LOOK, CMD_ALL_OFF):
             # only the newest look matters
@@ -823,8 +831,8 @@ class SkyKeeper:
 
         # GameTime counts whole minutes: "0 left" is the last 59 seconds (Dale, 2026-10-31:
         # at "1" the sky went with nearly 2 minutes still to play).
-        if end_last_minute and minutes_left is not None and minutes_left <= 0 \
-                and (self.active or self._showing) and not self.off_for_this_map:
+        last_minute = end_last_minute and minutes_left is not None and minutes_left <= 0
+        if last_minute and (self.active or self._showing) and not self.off_for_this_map:
             self.active = None
             # and stays off: before, the map rule put its sky straight back on
             self.off_for_this_map = self.timed_blocked = True
@@ -846,7 +854,7 @@ class SkyKeeper:
                     log=f"Timed step ({at} min left): the map's own sky."))
 
         if self.active is None and map_scene is not None and not self.off_for_this_map \
-                and not self.timed_on:
+                and not self.timed_on and not last_minute:
             self.active = Active(map_scene, "map")
             steps.append(self._send_active(announce=f"Sky: {map_scene.label}.",
                                            log=f"Map rule: {map_scene.label} sky on {map_name}."))

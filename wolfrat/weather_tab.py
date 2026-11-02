@@ -107,6 +107,7 @@ class WeatherTab(QWidget):
 
     POLL_MS = 5000
     SETTLE_SECONDS = 20      # after a (re)connect or map change, before writing
+    ADMIN_NAME_WAIT = 90     # longest wait for the admin list to agree with the server's map
 
     link_changed = pyqtSignal()   # after every poll: the Server tab's link box redraws
 
@@ -142,6 +143,9 @@ class WeatherTab(QWidget):
         self._schedule = weather.WeatherSchedule()
         self._timed = map_timeline.Runner("weather")   # the map's timed steps (Dynamic page)
         self._timed_weather = None                       # what they put in the schedule
+        self._map_watch = map_timeline.MapWatch()        # the map the server really has loaded
+        self._map_changing = False                       # round over, loading or just loaded
+        self._map_end_done = False                       # this map's last-minute clear has run
         self._last_problem = ""
         self._looked = False           # tried to find the server at least once
         self._server_missing = False   # last attempt: no jointops.exe at all
@@ -218,6 +222,8 @@ class WeatherTab(QWidget):
         self.dynamic_page.sky_choices = lambda: [(s.key, s.label) for s in self.sky_page.scenes()]
         self.dynamic_page.refresh_sky_choices()
         self.sky_page.timeline_steps = self.dynamic_page.steps_for
+        self.sky_page.live_context = self._server_context
+        self.sky_page.map_loads = lambda: self._map_watch.loads
         self.pages.currentChanged.connect(self._page_shown)
         self.wildlife_page = WildlifePage(self._settings.get("wildlife"))
         self.wildlife_page.changed.connect(self._wildlife_changed)
@@ -543,12 +549,15 @@ class WeatherTab(QWidget):
             # before the schedule re-asserts anything: a new map must drop the
             # old map's timed weather, not write it into the new one
             self._timeline_tick(controller)
+            self._map_end_tick(controller)
         except weather.WeatherError as exc:
             self._problem(str(exc))
             return
         held = self._schedule.active
         try:
-            outcome = self._schedule.tick(controller) if self._writable else None
+            # A manual weather waits out a map load, then goes back on.
+            outcome = self._schedule.tick(controller) \
+                if self._writable and not self._map_changing else None
             reading = controller.read()
         except weather.WeatherError as exc:
             self._problem(str(exc))
@@ -607,7 +616,8 @@ class WeatherTab(QWidget):
             minutes_left = None
         event = self._timed.tick(map_name=map_name, minutes_left=minutes_left,
                                  steps=self.dynamic_page.steps_for(map_name),
-                                 settled=settled and self._writable)
+                                 settled=settled and self._writable and not self._map_is_ending(),
+                                 load=self._map_watch.loads)
         if event.restarted:
             if self._timed_weather is not None and self._schedule.active is self._timed_weather:
                 self._schedule.forget()           # the load put the map's own sky back
@@ -633,6 +643,40 @@ class WeatherTab(QWidget):
         """The admin's Clear / a mod's !clear: no more timed weather on this map."""
         self._timed.stop_for_this_map()
         self._timed_weather = None
+
+    def _map_is_ending(self) -> bool:
+        """The last minute of the map, or a round that ended early (objectives, kill
+        limit, a mod's !next), when the Sky page's last-minute box is ticked."""
+        if not self.sky_page.last_minute_cb.isChecked():
+            return False
+        if self._controller is not None and self._map_watch.round_over:
+            return True
+        try:
+            minutes_left = self.sky_page.time_left()
+        except Exception:
+            return False
+        return minutes_left is not None and minutes_left <= 0
+
+    def _map_end_tick(self, controller):
+        """Clear the weather for the end of the map, as the Clear button does, so
+        the next map opens on its own weather.  A load only resets the weather's
+        targets, not what is showing (Environment_SnapStateToTargets @0x57D1E0),
+        so 100 m of fog left on at the end opens the next map in fog (Dale,
+        2026-11-02).  A map's own scripted weather is not ours and is left alone."""
+        if not self._map_is_ending():
+            self._map_end_done = False
+            return
+        if self._map_end_done or not self._writable:
+            return
+        self._map_end_done = True
+        ours = self._schedule.active is not None or self._dynamic.hands_on
+        self._dynamic.end_front_now()
+        self._stop_timed_weather()
+        self._sky_before = None
+        if ours:
+            self._schedule.clear(controller)
+            self.log("End of the map: weather back to the map's own.")
+            self._announce("The weather is clearing.")
 
     def _page_shown(self, _index=None):
         if self.pages.currentWidget() is self.dynamic_page:
@@ -694,12 +738,37 @@ class WeatherTab(QWidget):
         except Exception:
             info = {}
         connected = bool(info.get("connected"))
-        key = (connected, info.get("map"))
+        admin_map = info.get("map")
+        watch = self._read_map_watch()
+        map_name = (watch.name or admin_map) if watch is not None else admin_map
+        round_over = watch is not None and watch.round_over
+        key = (connected, map_name, admin_map, self._map_watch.loads, round_over)
         now = time.monotonic()
         if key != self._settled_key:
             self._settled_key, self._settled_since = key, now
-        settled = connected and now - self._settled_since >= self.SETTLE_SECONDS
-        return info.get("map"), int(info.get("players") or 0), settled
+        # The admin list names a new map only once the load is over, so the settle
+        # time starts from when it agrees; a name it never agrees on can't hold us up.
+        lagging = bool(map_name and admin_map) and map_name.lower() != str(admin_map).lower()
+        waited = now - self._settled_since
+        self._map_changing = round_over or waited < (self.ADMIN_NAME_WAIT if lagging
+                                                     else self.SETTLE_SECONDS)
+        settled = connected and not self._map_changing
+        return map_name, int(info.get("players") or 0), settled
+
+    def _read_map_watch(self) -> Optional[map_timeline.MapWatch]:
+        """The server's own idea of its map, None without a server to read.  A read
+        that fails keeps the last answer, or one bad read would look like a map change."""
+        if self._controller is None:
+            return None
+        before = self._map_watch.name
+        try:
+            name, round_over = self._controller.loaded_map()
+        except weather.WeatherError:
+            return self._map_watch
+        self._map_watch.update(name, round_over)
+        if self._map_watch.name != before:
+            wire_log(f"[WEATHER] server has loaded {self._map_watch.name}")
+        return self._map_watch
 
     def _dynamic_tick(self, controller, reading):
         config = self.dynamic_page.config()
@@ -721,7 +790,8 @@ class WeatherTab(QWidget):
             if self.dynamic_page.show_current_map(map_name, info, snow, rule):
                 self._save()
             decision = self._dynamic.tick(
-                config, map_name=map_name, players=players, in_game=settled,
+                config, map_name=map_name, players=players,
+                in_game=settled and not self._map_is_ending(),
                 manual_active=self._schedule.active is not None,
                 sky_is_dry=reading.precip_percent < 2, sky_is_snow=reading.snow,
                 map_is_snow=snow if info.terrain else None,

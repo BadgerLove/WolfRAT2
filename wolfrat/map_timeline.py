@@ -166,25 +166,23 @@ class Runner:
         self.map_name: Optional[str] = None
         self.applied: Optional[TimedStep] = None
         self.stopped = False                     # a mod's !clear / the admin's Clear: done for this map
-        self._last_minutes: Optional[int] = None
+        self._load = 0
 
     def stop_for_this_map(self) -> None:
         self.stopped = True
 
     def tick(self, *, map_name: Optional[str], minutes_left: Optional[int], steps,
-             settled: bool) -> Event:
+             settled: bool, load: int = 0) -> Event:
+        """``load``: MapWatch.loads, which goes up when the same map loads again."""
         restarted = False
         if map_name != self.map_name:
             restarted = self.map_name is not None
             self.map_name = map_name
-            self.applied, self.stopped, self._last_minutes = None, False, None
-        elif minutes_left is not None and self._last_minutes is not None \
-                and minutes_left > self._last_minutes + 1:
-            # the clock went back up: the same map started again
+            self.applied, self.stopped = None, False
+        elif load != self._load:
             restarted = True
             self.applied, self.stopped = None, False
-        if minutes_left is not None:
-            self._last_minutes = minutes_left
+        self._load = load
         if not settled or self.stopped or minutes_left is None:
             return Event(restarted=restarted)
         weather_step, sky_step = due(steps, minutes_left)
@@ -216,8 +214,8 @@ class MapClock:
                      read_at: float, now: float) -> Optional[int]:
         if map_name != self.map_name:
             self.map_name, self._map_at, self._running = map_name, now, False
-        if remaining is None:
-            return None
+        if remaining is None or read_at < self._map_at:
+            return None                 # a reading from before this map says nothing about it
         if remaining > 0 and read_at >= self._map_at + self.GRACE:
             self._running = True
         if remaining <= 0 and not self._running:
@@ -225,7 +223,36 @@ class MapClock:
         return remaining
 
 
+class MapWatch:
+    """Which map the server really has loaded, from its own memory.
+
+    The admin list only names a new map once the load is over, and the game's
+    clock can arrive first: on 2026-11-01 the old map's sky went onto the next
+    map every time because the two disagreed.  The server's own map name changes
+    when the next map starts and its round-over latch goes up when a round ends
+    (timer, objectives, kill limit or MISSION CYCLE) and down at the next
+    Game_StartMission, so nothing here has to be guessed from the clock.
+
+    ``loads`` goes up once per map load, the same map loading again included."""
+
+    def __init__(self):
+        self.name: Optional[str] = None
+        self.round_over = False
+        self.loads = 0
+        self._counted = False           # this round's end has had its load counted
+
+    def update(self, name: Optional[str], round_over: bool) -> None:
+        changed = bool(name) and self.name is not None and name != self.name
+        same_again = self.round_over and not round_over and not self._counted
+        if changed or same_again:
+            self.loads += 1
+        if name:
+            self.name = name
+        self._counted = round_over and (self._counted or changed)
+        self.round_over = round_over
+
+
 __all__ = [
-    "Event", "MapClock", "Runner", "SKY_OFF", "TimedStep", "WEATHER_CHOICES", "WEATHER_LABELS", "clamp_fog",
+    "Event", "MapClock", "MapWatch", "Runner", "SKY_OFF", "TimedStep", "WEATHER_CHOICES", "WEATHER_LABELS", "clamp_fog",
     "due", "sort_steps", "steps_for", "timelines_from_json", "timelines_to_json",
 ]
