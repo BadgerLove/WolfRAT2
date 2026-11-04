@@ -55,6 +55,7 @@ from wolfrat.runtime import DesktopRuntime, parse_launch_args
 from wolfrat.qt_dispatcher import CompletionPolicy, QtAdminDispatcher
 from wolfrat.bans_tab import BansTab
 from wolfrat.auto_balance_panel import AutoBalancePanel
+from wolfrat.keep_stats_panel import KeepStatsPanel
 from wolfrat.server_link_panel import ServerLinkPanel
 from wolfrat.server_patches_panel import ServerPatchesPanel
 from wolfrat.server_patcher_panel import ServerPatcherPanel
@@ -4264,6 +4265,25 @@ class StatsStore:
         except Exception as e:
             print(f"[StatsStore] Update error: {e}")
 
+    def note_restored(self, name, kills, deaths):
+        """A rejoining player's score just went back (keep_stats).  Their rejoin at
+        zero looked like a map reset, so move the baseline: the lifetime total
+        already holds those kills and must not count them twice."""
+        if not self._db or not name:
+            return
+        try:
+            name_key = name.strip().lower()
+            existing = self._db.execute(
+                'SELECT kills, deaths FROM players WHERE name_lower = ?', (name_key,)
+            ).fetchone()
+            if existing:
+                self._db.execute(
+                    'UPDATE players SET baseline_k = ?, baseline_d = ? WHERE name_lower = ?',
+                    (existing[0] - kills, existing[1] - deaths, name_key))
+                self._db.commit()
+        except Exception as e:
+            print(f"[StatsStore] Restore error: {e}")
+
     def get_player(self, name):
         """Look up a player by name (case-insensitive). Returns dict or None."""
         if not self._db or not name:
@@ -4763,6 +4783,9 @@ class MessagesTab(QWidget):
             f"[{time.strftime('%H:%M:%S')}] WELCOME SENT: {name}"
         )
 
+STATS_RESTORE_SETTLE_SECONDS = 12.0          # the player list comes every 5 s
+
+
 class SpreeTab(QWidget):
     """Killing Spree Announcer Tab"""
 
@@ -4840,6 +4863,7 @@ class SpreeTab(QWidget):
         self.team_caps_source = lambda: None      # {1: caps, 2: caps} on CTF / Flagball
         self._spree_table_loading = False
         self._player_stats = {}
+        self._stats_restored_until = {}           # name -> time: their score just came back (keep_stats)
         self._load_config()
         self._build_ui()
 
@@ -5325,6 +5349,15 @@ class SpreeTab(QWidget):
                 lower += 1
         return had == 0 or lower * 2 >= had
 
+    def note_stats_restored(self, name, kills, deaths):
+        """Those kills are old ones coming back: no spree, no first blood, and
+        one player list either side of the write is ignored (it may be stale)."""
+        name = name.strip()
+        self._stats_restored_until[name] = time.time() + STATS_RESTORE_SETTLE_SECONDS
+        store = getattr(self.messages_tab, 'stats_store', None)
+        if store and self.messages_tab._kd_enabled:
+            store.note_restored(name, kills, deaths)
+
     def check_sprees(self, players):
         kd_enabled = self.messages_tab._kd_enabled
         if not self._spree_enabled and not kd_enabled:
@@ -5357,8 +5390,13 @@ class SpreeTab(QWidget):
             except ValueError:
                 continue
 
+            if self._stats_restored_until.get(name, 0) > time.time():
+                self._player_stats[pid] = {'kills': kills, 'deaths': deaths, 'streak': 0, 'name': name}
+                continue
+
             if pid not in self._player_stats and fresh_map:
                 self._player_stats[pid] = {'kills': 0, 'deaths': 0, 'streak': 0, 'name': name}
+
             if pid not in self._player_stats:
                 self._player_stats[pid] = {'kills': kills, 'deaths': deaths, 'streak': 0, 'name': name}
                 if kd_enabled and getattr(self.messages_tab, 'stats_store', None):
@@ -9293,6 +9331,19 @@ class MainWindow(QMainWindow):
         self.auto_balance_panel.current_map_source = lambda: self.map_voting_tab._current_map
         self.auto_balance_panel.vote_active_source = lambda: self.map_voting_tab._vote_active
         self.players_tab.balance_layout.addWidget(self.auto_balance_panel)
+
+        # Stats back for a player who drops and rejoins.
+        def _keep_stats_log(text):
+            wire_log(f"[KEEP STATS] {text}")
+            self.server._log(f"Keep stats: {text}")
+
+        self.keep_stats_panel = KeepStatsPanel(
+            os.path.dirname(str(self.runtime.path("wolfrat_keep_stats.json"))),
+            log=_keep_stats_log,
+            restored=self.spree_tab.note_stats_restored,
+        )
+        self.players_tab.layout().addWidget(self.keep_stats_panel)
+        self.weather_tab.add_server_ticker(self.keep_stats_panel)
 
         # Wire up cross-tab references
         self.missions_tab._main_window = self
