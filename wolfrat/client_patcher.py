@@ -35,11 +35,67 @@ def out_names(exe_path: str) -> tuple:
 
 # ---- the patches (bytes from jo-server-patches) --------------------------------------
 
+# 02 vehicle weapon.  Version 1 (2026-09) made the seat exit always mount the
+# live weapon slot (g_CurrentWeaponSlot) instead of the stale one saved at
+# entity+0x308.  Single player never writes the live slot before the first
+# weapon key (only the multiplayer 0x5A loadout sync does), so it can still name
+# Player_InitPlayer's default slot 195, which can be empty.  Mounting an empty
+# slot does nothing and the vehicle gun stayed in the player's hands
+# (2026-11-07).  Version 2 jumps from the exit to a cave that takes the live
+# slot only when it holds a weapon, else the saved slot under the game's own
+# checks (a def, category < 11), else the live slot as retail would.
 _VEHICLE_VA, _VEHICLE_OFF, _VEHICLE_ON = 0x435640, bytes.fromhex("3bc2740c"), bytes.fromhex("eb0e9090")
+_VEHICLE_SITE, _VEHICLE_BACK, _VEHICLE_CAVE = 0x43563A, 0x43565E, 0x7BFF80
+_VEHICLE_SITE_OFF = bytes.fromhex("8b8608030000")              # mov eax,[esi+308h]
+_CURRENT_WEAPON_SLOT, _WEAPON_SLOT_BASE = 0xB76474, 0xB75FD4
+
+
+def _vehicle_cave() -> bytes:
+    code = (b"\xa1" + struct.pack("<I", _CURRENT_WEAPON_SLOT)      # eax = live slot
+            + bytes.fromhex("6bc064")
+            + b"\x03\x05" + struct.pack("<I", _WEAPON_SLOT_BASE)
+            + bytes.fromhex("395020"    # cmp [eax+20h],edx    edx is 0 here
+                            "7516"      # jne back             live slot has a weapon
+                            "8b8e08030000"  # mov ecx,[esi+308h]  saved slot
+                            "e30e"      # jecxz back
+                            "8b5120"    # mov edx,[ecx+20h]
+                            "85d2"      # test edx,edx
+                            "7407"      # jz back
+                            "833a0b"    # cmp dword [edx],11
+                            "7d02"      # jge back
+                            "8bc1"))    # mov eax,ecx
+    return code + b"\xe9" + _rel(_VEHICLE_CAVE + len(code), _VEHICLE_BACK)
+
+
+def _vehicle_site_on() -> bytes:
+    return b"\xe9" + _rel(_VEHICLE_SITE, _VEHICLE_CAVE) + b"\x90"
+
+
+def vehicle_room(img: Image) -> bool:
+    return img.is_(_VEHICLE_CAVE, bytes(len(_vehicle_cave())))
+
+
+def _vehicle_state(img: Image) -> tuple:
+    """(vehicle, version 1 in): vehicle True = version 2, None = cannot tell."""
+    if img.is_(_VEHICLE_SITE, _vehicle_site_on()):
+        cave = img.is_(_VEHICLE_CAVE, _vehicle_cave()) and img.is_(_VEHICLE_VA, _VEHICLE_OFF)
+        return (True if cave else None), False
+    if not img.is_(_VEHICLE_SITE, _VEHICLE_SITE_OFF):
+        return None, False
+    v1 = _two_way(img, _VEHICLE_VA, _VEHICLE_OFF, _VEHICLE_ON)
+    return (None if v1 is None else False), bool(v1)
 
 
 def _vehicle(img: Image) -> None:                                     # 02
-    img.put(_VEHICLE_VA, _VEHICLE_OFF, _VEHICLE_ON, "Vehicle weapon fix")
+    what = "Vehicle weapon fix"
+    if img.is_(_VEHICLE_VA, _VEHICLE_ON):                           # version 1 back out first
+        img.put(_VEHICLE_VA, _VEHICLE_ON, _VEHICLE_OFF, what)
+    _map_cave_tail(img, what)
+    if not vehicle_room(img):
+        raise PatchError(f"{what}: the space it needs in the exe is already used.")
+    cave = _vehicle_cave()
+    img.put(_VEHICLE_CAVE, bytes(len(cave)), cave, what)
+    img.put(_VEHICLE_SITE, _VEHICLE_SITE_OFF, _vehicle_site_on(), what)
 
 
 _SPEC_CAVE, _SPEC_END = 0x7BFA20, 0x7BFD00
@@ -161,6 +217,7 @@ class State:
     server_spectator_chat: bool = False   # server patches sharing that space
     server_spawn_config: bool = False
     spectator_fast: Optional[bool] = None
+    vehicle_old: bool = False       # version 1 in (vehicle is False): building updates it
 
     @property
     def known(self) -> bool:
@@ -184,8 +241,9 @@ def state_of(exe_path: str, data: bytes) -> State:
     img = Image(data)
     radius = img.read(_GRASS_RADIUS_VA, 4)
     grass = {struct.pack("<f", 128.0): True, struct.pack("<f", 42.0): False}.get(radius)
+    vehicle, vehicle_old = _vehicle_state(img)
     return State(exe_path=exe_path, laa=bool(img.characteristics & 0x20),
-                 vehicle=_two_way(img, _VEHICLE_VA, _VEHICLE_OFF, _VEHICLE_ON),
+                 vehicle=vehicle, vehicle_old=vehicle_old,
                  spectator=_two_way(img, _SPEC_A_VA, _SPEC_A_OFF, _SPEC_A_ON),
                  grass=grass, spectator_room=spectator_room(img), grass_room=grass_room(img),
                  server_spectator_chat=img.is_(0x5137C7, bytes.fromhex("e9")),
@@ -251,7 +309,8 @@ def plan_exe(data: bytes, state: State, choice: Choice) -> tuple:
         changed.append("4 GB fix (Large Address Aware)")
     if choice.vehicle and state.vehicle is False:
         _vehicle(img)
-        changed.append("Vehicle weapon fix")
+        changed.append("Vehicle weapon fix (update: single player fix)" if state.vehicle_old
+                       else "Vehicle weapon fix")
     if choice.spectator and state.spectator is False:
         if why_not(state, "spectator"):
             raise PatchError("Spectator mode 2: " + why_not(state, "spectator"))

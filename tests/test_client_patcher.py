@@ -16,7 +16,7 @@ from wolfrat import server_patcher as P
 
 CLIENT = dict(STOCK)
 CLIENT.update({
-    0x435640: "3bc2740c",                                            # 02 vehicle weapon
+    0x43563A: "8b8608030000", 0x435640: "3bc2740c",                  # 02 vehicle weapon
     0x42E410: "6a03c705bc204d0203000000",                            # 13 A
     0x5CAB95: "e806f9e7ff", 0x5A426D: "83c41885ed",                  # 13 B, C
     0x49A6CA: "740d833d28194c02", 0x49A91A: "740d833d28194c02",      # 13 D
@@ -87,6 +87,57 @@ def test_spectator_from_before_the_fast_camera_gets_just_that(tmp_path):
     result = C.build(path, all_on(grass=False))
     assert result.changed == ["Spectator mode 2 (update: adds the fast camera)"]
     assert open(result.exe_path, "rb").read() == open(first.exe_path, "rb").read()
+
+
+def v1_vehicle_exe(tmp_path):
+    """An exe with the 2026-09 vehicle weapon fix (version 1, 4 bytes)."""
+    data = bytearray(fake_exe(CLIENT, laa=True))
+    off = P.Image(bytes(data)).offset(0x435640)
+    data[off:off + 4] = bytes.fromhex("eb0e9090")
+    folder = tmp_path / "v1"
+    folder.mkdir()
+    return game(folder, data=bytes(data))
+
+
+def test_vehicle_fix_version_1_is_updated(tmp_path):
+    """2026-11-07: version 1 left the vehicle gun in your hands in single
+    player (the live slot is still the empty default 195 there).  Building
+    replaces it with version 2, the same bytes a stock exe gets."""
+    stock = fake_exe(CLIENT, laa=True)
+    fresh = C.build(game(tmp_path, data=stock), all_on(spectator=False, grass=False))
+    assert fresh.changed == ["Vehicle weapon fix"]
+    path = v1_vehicle_exe(tmp_path)
+    state = C.read_state(path)
+    assert state.known and state.vehicle is False and state.vehicle_old
+    assert C.default_choice(state).vehicle
+    result = C.build(path, all_on(spectator=False, grass=False))
+    assert result.changed == ["Vehicle weapon fix (update: single player fix)"]
+    assert open(result.exe_path, "rb").read() == open(fresh.exe_path, "rb").read()
+    after = C.read_state(result.exe_path)
+    assert after.vehicle is True and not after.vehicle_old
+
+
+def test_vehicle_fix_version_2_bytes(tmp_path):
+    """The exit jumps to the cave, and every branch of the cave lands on the
+    game's own `push eax; call Player_MountWeaponSlot` at 0x43565E."""
+    result = C.build(game(tmp_path), all_on(laa=False, spectator=False, grass=False))
+    img = P.Image(open(result.exe_path, "rb").read())
+    site = img.read(0x43563A, 6)
+    assert site[0] == 0xE9 and site[5] == 0x90
+    assert 0x43563F + struct.unpack("<i", site[1:5])[0] == 0x7BFF80
+    assert img.read(0x435640, 4) == bytes.fromhex("3bc2740c")          # version 1 not used
+    cave = img.read(0x7BFF80, 46)
+    assert cave[:5] == b"\xa1" + struct.pack("<I", 0xB76474)
+    assert 0x7BFF80 + 46 + struct.unpack("<i", cave[42:46])[0] == 0x43565E
+    for at, rel in ((17, 0x16), (25, 0x0E), (32, 0x07), (37, 0x02)):  # short jumps to `back`
+        assert cave[at + 1] == rel and at + 2 + rel == 41
+
+
+def test_vehicle_fix_refuses_a_used_cave(tmp_path):
+    data = bytearray(fake_exe(CLIENT, laa=False))
+    data[P.Image(bytes(data)).offset(0x7BFF90)] = 0x12
+    with pytest.raises(P.PatchError, match="Vehicle weapon fix: the space"):
+        C.build(game(tmp_path, data=bytes(data)), all_on(spectator=False, grass=False))
 
 
 def test_fast_camera_refuses_bytes_it_does_not_know(tmp_path):
@@ -243,6 +294,17 @@ def test_page_offers_the_fast_camera_on_an_older_spectator_exe(qapp, tmp_path):
     assert spec.isChecked() and spec.isEnabled() and "fast camera" in spec.text()
     panel.build()
     assert panel.result.changed == ["Spectator mode 2 (update: adds the fast camera)"]
+
+
+def test_page_offers_the_vehicle_update_on_a_version_1_exe(qapp, tmp_path):
+    from wolfrat.client_patcher_panel import ClientPatcherPanel
+    panel = ClientPatcherPanel(None)
+    panel.choose(v1_vehicle_exe(tmp_path))
+    box = panel.boxes["vehicle"]
+    assert box.isChecked() and box.isEnabled() and "single player fix" in box.text()
+    panel.boxes["spectator"].setChecked(False)
+    panel.build()
+    assert panel.result.changed == ["Vehicle weapon fix (update: single player fix)"]
 
 
 def test_page_explains_what_cannot_go_in(qapp, tmp_path):

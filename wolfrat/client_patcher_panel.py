@@ -180,7 +180,9 @@ class ClientPatcherPanel(QWidget):
             check.setText(label + ("  (already in - untick to remove)" if have[key] and removable
                                    else "  (already in)" if have[key]
                                    else "  (version 1 in - this updates it to 2: fast camera)"
-                                   if key == "spectator" and state.spectator_needs_fast else ""))
+                                   if key == "spectator" and state.spectator_needs_fast
+                                   else "  (version 1 in - this updates it to 2: single player fix)"
+                                   if key == "vehicle" and state.vehicle_old else ""))
             note.setText(blocked or what)
             note.setStyleSheet(_WARN if blocked else _NOTE)
 
