@@ -182,3 +182,45 @@ def test_autotune_status_and_live_log_on_panel(qtbot, tmp_path, monkeypatch):
     assert "+65 ms" in p.autotune_lbl.text()
     assert "rolling best" in p.autotune_lbl.text()
     assert "Auto-tune min #5" in p.event_log_edit.toPlainText()
+
+
+def test_one_time_auto_enable_switches_everyone_on_once_then_respects_user_choice(
+        qtbot, tmp_path, monkeypatch):
+    import json
+    cfg = tmp_path / "lc.json"
+    # Existing install that had lag comp off and old +40 default, before migration:
+    cfg.write_text(json.dumps({"on": False, "reapply": False, "extra_ms": 40, "tune_mode": 0}),
+                   encoding="utf-8")
+    p1 = _panel(qtbot, tmp_path, monkeypatch, lc.State(lc.STOCK))
+    assert p1.on_cb.isChecked() and p1.reapply_cb.isChecked()
+    assert p1._settings.tune_mode == lc.TUNE_APPLY and p1._settings.extra_ms == 70
+    saved1 = _saved(tmp_path)
+    assert saved1["on"] is True and saved1["auto_enabled_once"] is True
+
+    # User now unticks On: next launch must respect their choice and keep it off!
+    p1.on_cb.setChecked(False)
+    assert _saved(tmp_path)["on"] is False
+    p2 = _panel(qtbot, tmp_path, monkeypatch, lc.State(lc.STOCK))
+    assert not p2.on_cb.isChecked()
+
+
+def test_server_tick_records_history_and_events_even_when_tab_is_hidden(
+        qtbot, tmp_path, monkeypatch):
+    state = _loaded(alive=True)
+    state.settings = lc.Settings(False, 70, 400, 80, lc.TUNE_APPLY)
+    s = state.stats
+    s.tests, s.hits, s.plain_hits = 500, 120, 100
+    s.has_targets = True
+    s.bands = [lc.BandStats(label) for label in lc.BAND_LABELS]
+    s.targets = [lc.TargetStats(2, "Leaver", 150, 20, 5, 10, 4, 10, 3, 1, 0)]
+    s.has_tuner = True
+    s.tune_mode = lc.TUNE_APPLY
+    s.tune_value_ms = 70
+    s.tune_log = [lc.TuneStep(1, 50000, 70, 70, None, 120, 1)]
+    p = _panel(qtbot, tmp_path, monkeypatch, state)
+    p.hide()  # tab is NOT visible
+    assert not p.isVisible()
+    p.server_tick(_Mem(), writable=False)
+    assert (tmp_path / "lc_history.json").exists()
+    assert (tmp_path / "wolfrat_lag_comp_events.log").exists()
+    assert "Auto-tune min #1" in (tmp_path / "wolfrat_lag_comp_events.log").read_text(encoding="utf-8")

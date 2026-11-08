@@ -725,7 +725,7 @@ def read_state(proc: ServerProcess, wanted_name: Optional[str] = None) -> State:
     helpers = _helpers(proc)
     mine = next((h for h in helpers if h.name == wanted_name), None) if wanted_name else None
     if mine is None and helpers and wanted_name is None:
-        mine = helpers[-1]
+        mine = next((h for h in helpers if _classify(proc, h, helpers) == ON), helpers[-1])
     kind = _classify(proc, mine, helpers)
     if mine is None:
         return State(kind if kind in (FOREIGN, STOCK) else UNKNOWN)
@@ -989,7 +989,7 @@ class EventLogger:
                 self._last_tune_minute = st.minute
                 if st.median_ms is None:
                     msg = (f"Auto-tune min #{st.minute} [{mode_name}]: holding Extra {st.after_ms:+d} ms "
-                           f"(waiting for 1,000 close shots in 30 min: {st.samples} in {st.window_mins} min)")
+                           f"(waiting for 450 close shots in 30 min: {st.samples} in {st.window_mins} min)")
                 elif st.after_ms != st.before_ms:
                     msg = (f"Auto-tune min #{st.minute} [{mode_name}]: Extra {st.before_ms:+d} -> {st.after_ms:+d} ms "
                            f"(rolling best {st.median_ms:+d} ms from {st.samples} shots / {st.window_mins} min)")

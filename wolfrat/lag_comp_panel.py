@@ -67,7 +67,7 @@ _HELP = (
     "<br><br><b>Best rewind</b> looks at every shot that passed close to someone and finds "
     "the rewind that lines it up best. Its middle value, minus the ping, is the <b>Extra</b> "
     "that suits your players. <b>Use suggested</b> sets it (after 300 close shots)."
-    "<br><br><b>Auto-tune Extra</b> adjusts Extra on its own from the last 1,000 close shots "
+    "<br><br><b>Auto-tune Extra</b> adjusts Extra on its own from the last 450 close shots "
     "(up to 30 minutes of play), moving at most 2 ms a minute inside +50 to +85 ms, and "
     "leaving differences of 8 ms or less alone. Choose <b>Watch</b> to log what it would pick "
     "without changing hits, or <b>On (apply)</b> to let it tune live. Switching Auto-tune mode "
@@ -124,13 +124,25 @@ class LagCompPanel(QWidget):
         self._events = lc.EventLogger(str(Path(history_file).parent))
         self._helper_name = lc.loaded_name(self._data_dir)
         saved = self._load()
-        self._wish_on = bool(saved.get("on", False))
+        self._auto_enabled_once = True
+        migrated = bool(saved.get("auto_enabled_once", False))
+        if not migrated:
+            self._wish_on = True
+            self._reapply = True
+            tune_mode = lc.TUNE_APPLY
+            extra_ms = int(saved.get("extra_ms", lc.DEFAULT_EXTRA_MS))
+            if extra_ms == 40:
+                extra_ms = lc.DEFAULT_EXTRA_MS
+        else:
+            self._wish_on = bool(saved.get("on", True))
+            self._reapply = bool(saved.get("reapply", True))
+            tune_mode = int(saved.get("tune_mode", lc.TUNE_APPLY))
+            extra_ms = int(saved.get("extra_ms", lc.DEFAULT_EXTRA_MS))
         self._settings = lc.Settings(bool(saved.get("observe", False)),
-                                     int(saved.get("extra_ms", lc.DEFAULT_EXTRA_MS)),
+                                     extra_ms,
                                      int(saved.get("max_ms", lc.DEFAULT_MAX_MS)),
                                      int(saved.get("min_ping_ms", lc.DEFAULT_MIN_PING_MS)),
-                                     int(saved.get("tune_mode", lc.TUNE_OFF))).clamp()
-        self._reapply = bool(saved.get("reapply", False))
+                                     tune_mode).clamp()
         self._dirty = False             # a click waits to be written into the server
         self._retry_at = 0.0            # a failed switch-on tries again from then (0 = none)
         self._last_error = ""           # logged once, not every retry
@@ -143,6 +155,8 @@ class LagCompPanel(QWidget):
         self._updating = False
         self._build()
         self._show_wish()
+        if not migrated:
+            self._save()
         self._show_history()
         self._show_event_log()
         self.no_server(NO_SERVER)
@@ -500,6 +514,7 @@ class LagCompPanel(QWidget):
         if self._failed_text and not state.on:
             self.state_lbl.setText(self._failed_text)
         self._show_reset_button(bool(state.shared))
+        self._record_background(state)
 
     def _write(self, pid: int, memory, state: lc.State) -> lc.State:
         self._dirty = False
@@ -586,18 +601,22 @@ class LagCompPanel(QWidget):
         self._show_totals(st, s)
         self._show_players(s)
         self._show_targets(s)
+        self._record_background(st)
+
+    def _record_background(self, st: lc.State) -> None:
+        if not self._pid or not st.stats or not st.settings:
+            return
+        s = st.stats
         now = time.time()
         snap_due = (now - self._last_record >= 30)
-        if st.settings:
-            added_lines = self._events.record_poll(
-                self._pid, s, st.settings, include_snapshot=snap_due, now=now)
-            if added_lines:
-                for ln in added_lines:
-                    if "Auto-tune min #" in ln and "->" in ln:
-                        self._log("Lag compensation: " + ln.split("] ", 1)[-1])
-                self._show_event_log()
-        if snap_due and st.settings and \
-                self._history.record(self._pid, s, st.settings, now):
+        added_lines = self._events.record_poll(
+            self._pid, s, st.settings, include_snapshot=snap_due, now=now)
+        if added_lines:
+            for ln in added_lines:
+                if "Auto-tune min #" in ln and "->" in ln:
+                    self._log("Lag compensation: " + ln.split("] ", 1)[-1])
+            self._show_event_log()
+        if snap_due and self._history.record(self._pid, s, st.settings, now):
             self._last_record = now
             try:
                 self._history.save()
@@ -642,13 +661,13 @@ class LagCompPanel(QWidget):
             mode_name = lc.TUNE_MODE_NAMES.get(s.tune_mode, "off")
             if s.tune_mode == lc.TUNE_OFF:
                 self.autotune_lbl.setText(
-                    f"Auto-tune: <b>off</b> (rolling window: {s.tune_samples:,} / 1,000 close shots "
+                    f"Auto-tune: <b>off</b> (rolling window: {s.tune_samples:,} / 450 close shots "
                     f"in last {max(1, s.tune_window_mins)} min)."
                 )
             elif s.tune_median_ms is None:
                 self.autotune_lbl.setText(
                     f"Auto-tune (<b>{mode_name}</b>): holding at <b>{_signed(s.tune_value_ms)}</b> "
-                    f"- waiting for 1,000 close shots in last 30 min (<b>{s.tune_samples:,} / 1,000</b> so far)."
+                    f"- waiting for 450 close shots in last 30 min (<b>{s.tune_samples:,} / 450</b> so far)."
                 )
             else:
                 act = "applied live" if s.tune_mode == lc.TUNE_APPLY else "watched only (not applied)"
@@ -741,7 +760,8 @@ class LagCompPanel(QWidget):
         s = self._settings
         data = {"on": self._wish_on, "observe": s.observe, "extra_ms": s.extra_ms,
                 "max_ms": s.max_ms, "min_ping_ms": s.min_ping_ms,
-                "tune_mode": s.tune_mode, "reapply": self._reapply}
+                "tune_mode": s.tune_mode, "reapply": self._reapply,
+                "auto_enabled_once": self._auto_enabled_once}
         try:
             self._file.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception as exc:
