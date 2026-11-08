@@ -10,7 +10,8 @@ Scores:
 Rules (Dale): a tie is nobody's lead.  CTF / Flagball change slowly, so every
 new leader is announced at once, plus the first flag / goal of the map.  In
 TDM / DM the lead can swap every few seconds, so a new leader must hold it
-for 30 seconds and there is at most one lead line a minute.  The first
+for 10 seconds and there is at most one lead line every 30 seconds (was 30 s
+and a minute; Dale 2026-11-08: too slow).  The first
 reading after a map change is only remembered (it can still be the last
 map's scores).  Every line fits JO's 59-character chat.
 """
@@ -32,8 +33,8 @@ CAPS_MODES = (CTF, FB)
 LABELS = {CTF: "Capture the Flag", FB: "Flagball", TDM: "Team Deathmatch", DM: "Deathmatch"}
 TEAM_NAMES = {1: "Joint Ops", 2: "Rebels"}
 CHAT_LIMIT = MAX_CHAT_LEN   # 59: JO cuts every line there
-HOLD_SECONDS = {TDM: 30.0, DM: 30.0}
-MIN_GAP_SECONDS = {TDM: 60.0, DM: 60.0}
+HOLD_SECONDS = {TDM: 10.0, DM: 10.0}
+MIN_GAP_SECONDS = {TDM: 30.0, DM: 30.0}
 
 DEFAULT_LINES = {
     CTF: ["{team} take the lead, {score} flags to {other}",

@@ -1876,9 +1876,17 @@ class ServerManager:
             ):
                 return
         try:
+            # The mission list before the player list: a map change has to be
+            # seen before that poll's scores are, or the first kill of the new
+            # map is read against the old map's totals (first blood, 2026-11-08).
             futures = (
                 self._execute(
                     AdminCommands.game_state(),
+                    quiet=True,
+                    expected_session=session,
+                ),
+                self._execute(
+                    AdminCommands.missions(),
                     quiet=True,
                     expected_session=session,
                 ),
@@ -1889,11 +1897,6 @@ class ServerManager:
                 ),
                 self._execute(
                     AdminCommands.chat(),
-                    quiet=True,
-                    expected_session=session,
-                ),
-                self._execute(
-                    AdminCommands.missions(),
                     quiet=True,
                     expected_session=session,
                 ),

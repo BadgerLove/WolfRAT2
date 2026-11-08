@@ -4673,6 +4673,9 @@ class MessagesTab(QWidget):
 class SpreeTab(QWidget):
     """Killing Spree Announcer Tab"""
 
+    FIRST_BLOOD_POLL = 1.0          # seconds between player reads while first blood is due
+    FIRST_BLOOD_FAST_FOR = 180.0    # ...for at most this long after a map change
+
     def __init__(
         self,
         server,
@@ -4711,6 +4714,18 @@ class SpreeTab(QWidget):
         ]
         self._first_blood_ready = True
         self._first_blood_pending = False
+        # A new map: the next player list that shows its scores reset is
+        # read against 0 kills, not the last map's totals (2026-11-08: the
+        # first kill of a map was swallowed and the second killer got first
+        # blood, one poll late).  None = no map change waiting.
+        self._new_map_since = None
+        # Until first blood is said, the player list is read every
+        # FIRST_BLOOD_POLL seconds instead of every 5 (for FIRST_BLOOD_FAST_FOR
+        # seconds after a map change), so it is said within a second or two.
+        self._fast_poll_until = 0.0
+        self._fast_poll_timer = QTimer(self)
+        self._fast_poll_timer.setInterval(int(self.FIRST_BLOOD_POLL * 1000))
+        self._fast_poll_timer.timeout.connect(self._fast_poll)
         self._zone_capture_enabled = True
         self._zone_line_player = "{player} takes {zone} for the {team} - first zone!"
         self._zone_line_team = "{team} take {zone} - first zone of the map!"
@@ -4999,12 +5014,16 @@ class SpreeTab(QWidget):
         if not current:
             return
 
-        if current != getattr(self, '_last_map', None):
+        previous = getattr(self, '_last_map', None)
+        if current != previous:
             self._last_map = current
             self._first_blood_ready = True
             self._first_blood_pending = False
             for stat in self._player_stats.values():
                 stat['streak'] = 0
+            if previous is not None:              # a real change, not WolfRAT starting up
+                self._new_map_since = time.monotonic()
+                self._start_fast_poll()
             self._lead_watch.reset()
             wire_log(f"[SPREE] Map changed to {current} - first blood + streaks reset")
 
@@ -5074,8 +5093,9 @@ class SpreeTab(QWidget):
         hint = QLabel("One line per row, picked at random. {team} = Joint Ops / Rebels ({player} in "
                       "Deathmatch), {score} = the leader's score, {other} = the next best. Lines longer "
                       f"than {score_lead.CHAT_LIMIT} characters once filled in are skipped. A tie is nobody's lead. Team "
-                      "Deathmatch and Deathmatch wait until a new leader has held it for 30 seconds "
-                      "and say at most one lead line a minute.")
+                      "Deathmatch and Deathmatch wait until a new leader has held it for "
+                      f"{score_lead.HOLD_SECONDS[score_lead.DM]:.0f} seconds and say at most one lead "
+                      f"line every {score_lead.MIN_GAP_SECONDS[score_lead.DM]:.0f} seconds.")
         hint.setWordWrap(True)
         hint.setStyleSheet("font-size: 9pt; color: #a89830;")
         box.addWidget(hint)
@@ -5161,10 +5181,64 @@ class SpreeTab(QWidget):
             "Announce first zone capture",
         )
 
+    def _start_fast_poll(self):
+        if not self._first_blood_enabled:
+            return
+        self._fast_poll_until = time.monotonic() + self.FIRST_BLOOD_FAST_FOR
+        if not self._fast_poll_timer.isActive():
+            self._fast_poll_timer.start()
+
+    def _fast_poll(self):
+        """Read the player list now while first blood is still to be said."""
+        if (not self._first_blood_enabled or not self._first_blood_ready
+                or time.monotonic() >= self._fast_poll_until):
+            self._fast_poll_timer.stop()
+            return
+        if self._first_blood_pending:
+            return
+        try:
+            if self.server.is_connected:
+                self.server.refresh_players(quiet=True)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _scores_reset(players, stats) -> bool:
+        """Does this player list show the new map's scores yet?  At least half
+        of the players who had kills or deaths on the old map now have fewer.
+        (A total alone is not enough: a player leaving lowers it too.)"""
+        had, lower = 0, 0
+        for p in players:
+            prev = stats.get(p.get('id', ''))
+            if not prev or prev['kills'] + prev['deaths'] <= 0:
+                continue
+            try:
+                k_val, d_val = p.get('kills', '0'), p.get('deaths', '0')
+                now = (int(k_val) if k_val != '-' else 0) + (int(d_val) if d_val != '-' else 0)
+            except ValueError:
+                continue
+            had += 1
+            if now < prev['kills'] + prev['deaths']:
+                lower += 1
+        return had == 0 or lower * 2 >= had
+
     def check_sprees(self, players):
         kd_enabled = self.messages_tab._kd_enabled
         if not self._spree_enabled and not kd_enabled:
             return
+
+        # After a map change: once the list shows the new map's scores, count
+        # from 0 - the first kill of the map is a gain from 0, not a drop from
+        # the last map's total, and players new to the list count from 0 too.
+        fresh_map = False
+        if self._new_map_since is not None:
+            if time.monotonic() - self._new_map_since > self.FIRST_BLOOD_FAST_FOR:
+                self._new_map_since = None
+            elif self._scores_reset(players, self._player_stats):
+                self._new_map_since = None
+                fresh_map = True
+                for stat in self._player_stats.values():
+                    stat['kills'] = stat['deaths'] = stat['streak'] = 0
 
         for p in players:
             name = p.get('name', '').strip()
@@ -5180,6 +5254,8 @@ class SpreeTab(QWidget):
             except ValueError:
                 continue
 
+            if pid not in self._player_stats and fresh_map:
+                self._player_stats[pid] = {'kills': 0, 'deaths': 0, 'streak': 0, 'name': name}
             if pid not in self._player_stats:
                 self._player_stats[pid] = {'kills': kills, 'deaths': deaths, 'streak': 0, 'name': name}
                 if kd_enabled and getattr(self.messages_tab, 'stats_store', None):

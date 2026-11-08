@@ -1,6 +1,6 @@
 """Lead announcer for CTF / Flagball / TDM / DM (Dale, 2026-09-23).  A tie is
 nobody's lead; CTF / Flagball say every new leader at once plus the first
-flag / goal; TDM / DM need 30 s in front and at most one line a minute; every
+flag / goal; TDM / DM need 10 s in front and at most one line every 30 s; every
 line fits 62 characters."""
 
 import json
@@ -72,30 +72,30 @@ def test_joining_mid_map_never_claims_a_first_capture():
     assert w.update(sl.FB, {1: 2, 2: 3}) == [LeadChange(sl.FB, 2, 3, 2)]
 
 
-# ---- TDM / DM: 30 s hold, one line a minute ----------------------------------------------
+# ---- TDM / DM: 10 s hold, one line every 30 s (Dale 2026-11-08) ---------------------------
 
-def test_tdm_leader_must_hold_30_seconds():
+def test_tdm_leader_must_hold_10_seconds():
     w, clock = watch()
     w.update(sl.TDM, {1: 10, 2: 10})
     assert w.update(sl.TDM, {1: 12, 2: 10}) == []
-    clock.now += 15
+    clock.now += 5
     assert w.update(sl.TDM, {1: 12, 2: 13}) == []                # swapped - Rebels start from zero
-    clock.now += 20
-    assert w.update(sl.TDM, {1: 13, 2: 15}) == []                # Rebels only 20 s in front
-    clock.now += 10
+    clock.now += 6
+    assert w.update(sl.TDM, {1: 13, 2: 15}) == []                # Rebels only 6 s in front
+    clock.now += 4
     assert w.update(sl.TDM, {1: 14, 2: 16}) == [LeadChange(sl.TDM, 2, 16, 14)]
 
 
-def test_tdm_at_most_one_line_a_minute():
+def test_tdm_at_most_one_line_every_30_seconds():
     w, clock = watch()
     w.update(sl.TDM, {1: 0, 2: 0})
     w.update(sl.TDM, {1: 1, 2: 0})
-    clock.now += 30
+    clock.now += 10
     assert w.update(sl.TDM, {1: 2, 2: 0})                        # Joint Ops announced
     w.update(sl.TDM, {1: 2, 2: 3})
-    clock.now += 30                                              # Rebels held 30 s, but only 30 s since the last line
+    clock.now += 15                                              # Rebels held 15 s, but only 15 s since the last line
     assert w.update(sl.TDM, {1: 2, 2: 4}) == []
-    clock.now += 30
+    clock.now += 15
     assert w.update(sl.TDM, {1: 3, 2: 5}) == [LeadChange(sl.TDM, 2, 5, 3)]
 
 
@@ -103,7 +103,7 @@ def test_deathmatch_names_the_player():
     w, clock = watch()
     w.update(sl.DM, {"Dale": 3, "Ham": 3})
     w.update(sl.DM, {"Dale": 5, "Ham": 3})
-    clock.now += 31
+    clock.now += 11
     assert w.update(sl.DM, {"Dale": 6, "Ham": 3}) == [LeadChange(sl.DM, "Dale", 6, 3)]
 
 
