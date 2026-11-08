@@ -5005,9 +5005,15 @@ class SpreeTab(QWidget):
         current = None
         for m in missions:
             if '<CURRENT MISSION>' in m:
-                current = m.split(' - ')[0].strip()
-                if ':' in current[:5]:
-                    current = current.split(':', 1)[1].strip()
+                # The whole file name up to its extension: splitting on ' - '
+                # turned 'AS - Black Rock TAC.npj' into 'AS' (2026-11-08).
+                found = re.search(r'^\s*(?:\d+\s*[:.]\s*)?(.+?\.(?:bms|npj|npz|mis))\b', m, re.IGNORECASE)
+                if found:
+                    current = found.group(1).strip()
+                else:
+                    current = m.split(' - ')[0].strip()
+                    if ':' in current[:5]:
+                        current = current.split(':', 1)[1].strip()
                 current = re.sub(r'<[^>]*>', '', current).strip()
                 break
 

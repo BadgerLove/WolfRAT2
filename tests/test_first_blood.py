@@ -146,6 +146,14 @@ def test_no_fast_reads_when_first_blood_is_off(sprees):
     assert not sprees._fast_poll_timer.isActive()
 
 
+def test_spaced_map_names_are_read_whole(sprees):
+    sprees.on_missions_updated(["0: AS - Black Rock TAC.npj - (1x) () () <CURRENT MISSION> <>"])
+    assert sprees._last_map == "AS - Black Rock TAC.npj"
+    sprees.on_missions_updated(["3: AS - Dormant Volcano TAC.npj - () () () <> <CURRENT MISSION>"])
+    assert sprees._last_map == "AS - Dormant Volcano TAC.npj"
+    assert sprees._new_map_since is not None                  # two spaced maps in a row: still a change
+
+
 def test_the_poll_asks_for_the_mission_list_before_the_player_list():
     import inspect
     text = inspect.getsource(protocol.ServerManager._poll_tick)
