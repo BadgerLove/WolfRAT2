@@ -578,6 +578,17 @@ class LagCompPanel(QWidget):
             text = "⚪ Off - normal JO hits."
         self.state_lbl.setText(text)
 
+    # ------------------------------------------------------------- !mycomp
+    def mycomp_line(self, name: str, limit: int) -> str:
+        """The chat line for a player's !mycomp, read fresh from the server."""
+        state = self._state
+        if self._pid:
+            try:
+                state = lc.server_state(self._pid, self._helper_name)
+            except lc.LagCompError:
+                pass
+        return lc.mycomp_line(state, name, limit)
+
     # ------------------------------------------------------------- numbers
     def _refresh_stats(self, force: bool = False):
         if not self._pid or not (force or self.isVisible()):

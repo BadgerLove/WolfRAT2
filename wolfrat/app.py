@@ -28,6 +28,7 @@ from wolfrat import score_lead
 from wolfrat import whisper
 from wolfrat import join_country
 from wolfrat import map_weapons
+from wolfrat import lag_comp
 from wolfrat.weather_tab import WeatherTab, scroll_column
 from wolfrat.mod_entrance_panel import ModEntrancePanel
 from wolfrat.mod_ranks import ModRoster
@@ -45,6 +46,7 @@ from wolfrat.admin_commands import (
 )
 
 # The server side of the Chat tab's "long chat" tick box.
+MYCOMP_COOLDOWN = 30  # seconds between one player's !mycomp lines
 LONG_CHAT_URL = ("https://github.com/BadgerLove/jo-server-patches/blob/main/"
                  "docs/patches/15-long-chat-server.md")
 from wolfrat.sounds import generate_all_sounds
@@ -5519,6 +5521,8 @@ class ModsTab(QWidget):
         )
         self.missions_store = missions_store
         self.messages_tab = None  # set by MainWindow cross-tab wiring
+        self.lag_comp_panel = None  # set by MainWindow cross-tab wiring (!mycomp)
+        self._mycomp_last = {}  # lowercase player name -> time of their last !mycomp
         self.roster = ModRoster()  # who is a mod, at which rank
         self._seen_chat_ids = set()  # for dedup
         self._chat_initialized = False
@@ -5882,6 +5886,8 @@ class ModsTab(QWidget):
             ("!kd [player]", "Kill/death stats", False),
             ("!list", "Show the map rotation", False),
             ("!ping", "Show your own ping", False),
+            ("!mycomp", "Your lag compensation: P ping, R rewind (ms), hits since you "
+             "joined, hits it added (or took), and that as a %. Once per 30 s each", False),
         )),
     )
 
@@ -6137,6 +6143,28 @@ class ModsTab(QWidget):
                     f"{sender}: ping unavailable", "Send ping response"
                 )
                 wire_log(f"[MODS] !ping: ping unavailable for '{sender}'")
+            return
+
+        # !mycomp - any player: their ping, rewind and what lag compensation
+        # has done to their hits (Dale, 2026-11-10).  Public chat (JO has no
+        # private reply), so the line starts with their name.  Once per
+        # MYCOMP_COOLDOWN seconds per player so nobody can flood chat with it.
+        if cmd == '!mycomp':
+            if sender == 'web_admin':
+                return
+            now_s = time.time()
+            last = self._mycomp_last.get(sender, 0)
+            if now_s - last < MYCOMP_COOLDOWN:
+                wire_log(f"[MODS] !mycomp: {sender} on cooldown")
+                return
+            self._mycomp_last[sender] = now_s
+            panel = self.lag_comp_panel
+            if panel is None:
+                line = lag_comp.MYCOMP_OFF
+            else:
+                line = panel.mycomp_line(sender, chat_limit())
+            self._send_mod_chat(line, "Send mycomp response")
+            wire_log(f"[MODS] !mycomp: sent '{line}'")
             return
 
         # !list - available to ALL players, shows current map rotation
@@ -9128,6 +9156,7 @@ class MainWindow(QMainWindow):
         self.missions_store._missions_tab = self.missions_tab
         self.settings_tab.mods_tab = self.mods_tab
         self.mods_tab.messages_tab = self.messages_tab
+        self.mods_tab.lag_comp_panel = self.lag_comp_panel
         self.settings_tab.load_vote_settings()
         self.settings_tab.load_skip_settings()
 
