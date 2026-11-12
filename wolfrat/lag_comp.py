@@ -861,6 +861,64 @@ def describe_setting(s: Settings, live_extra_ms: Optional[int] = None) -> str:
     return ("watch only, " + text) if s.observe else text
 
 
+# ------------------------------------------------------------- !mycomp
+MYCOMP_OFF = "Lag comp is off on this server"
+
+
+def find_player_stats(stats: Optional[Stats], name: str) -> Optional[PlayerStats]:
+    """The helper's row for this player name: exact (any case) first, then the
+    only row whose name contains it."""
+    if not stats or not name:
+        return None
+    want = name.strip().lower()
+    for p in stats.players:
+        if p.name.strip().lower() == want:
+            return p
+    partial = [p for p in stats.players if want in p.name.lower()]
+    return partial[0] if len(partial) == 1 else None
+
+
+def _fit_name(name: str, rest: str, limit: int) -> Optional[str]:
+    """name + rest within limit, cutting the name if it must (never below 6)."""
+    room = limit - len(rest)
+    if room >= len(name):
+        return name + rest
+    if room >= 6:
+        return name[:room] + rest
+    return None
+
+
+def mycomp_line(state: Optional[State], name: str, limit: int = 118) -> str:
+    """One chat line for !mycomp: what lag compensation is doing for this player.
+
+    Counts are the helper's own row for them: since they joined (a row starts
+    afresh when they leave or change name), or since the counters last started
+    again (switched on, settings changed, the tab's Reset).  A map change does
+    not clear it (2026-10-31..11-10 snapshots: 3 drops in 51,285 carried pairs).
+
+        BadgerLove P142 R212 Hits 48 +9 comp (+23%)
+        BadgerLove P45 No comp needed (under 80)
+    """
+    if state is None or not state.on or not state.stats or not state.settings:
+        return MYCOMP_OFF
+    row = find_player_stats(state.stats, name)
+    shown = (row.name if row else name).strip() or name
+    if row is None:
+        return _fit_name(shown, ": no lag comp numbers yet", limit) or MYCOMP_OFF
+    if state.observe or state.settings.observe:
+        return _fit_name(shown, f" P{row.ping} Lag comp is watch-only (no hits changed)",
+                         limit) or _fit_name(shown, f" P{row.ping} watch-only", limit) or MYCOMP_OFF
+    if row.rewind_ms <= 0:
+        minimum = state.settings.min_ping_ms
+        return (_fit_name(shown, f" P{row.ping} No comp needed (under {minimum})", limit)
+                or _fit_name(shown, f" P{row.ping} no comp", limit) or MYCOMP_OFF)
+    net = row.hits - row.plain_hits
+    pct = f" ({net * 100.0 / row.plain_hits:+.0f}%)" if row.plain_hits else ""
+    long = f" P{row.ping} R{row.rewind_ms} Hits {row.hits} {net:+d} comp{pct}"
+    short = f" P{row.ping} R{row.rewind_ms} {row.hits}h {net:+d}{pct}"
+    return _fit_name(shown, long, limit) or _fit_name(shown, short, limit) or MYCOMP_OFF
+
+
 class HistoryBook:
     """One row per counting session (a server run, or since the last restart
     of the counters), kept in a small JSON file.  A row is updated in place
