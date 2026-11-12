@@ -1266,6 +1266,144 @@ class ServerManager:
 
         return self._serialize_mutation(workflow)
 
+    def set_mission_side_switch(self, index_or_entry, switch_sides) -> Future:
+        """Change a queued map between x1 and x2 (swap sides) in place.
+
+        Retail keeps the side-switch flag (LIST's ``(2x)``) on the CATALOG
+        row, not on the queue entry (OpenNova novaworld-net-re.md 5.70.2,
+        ``HostDialog_SelectedMissionsTableEvent @0x557FB0``), and the only
+        admin verb that writes it is ``MISSION ADD <file> <0|1>``
+        (``CAdminServer_HandleMissionAdd @0x403D90``). So: append one copy
+        with the new flag, then remove that copy again (the last index).
+        Append never moves existing entries or the cursor, and removing the
+        last entry steps no cursor (``MissionList_RemoveEntry @0x4FC6C0``),
+        so the queue order is untouched. Append's regrow can drop a pending
+        SETNEXT (``MissionRotation_Append @0x5019D0``); it is set again.
+        Every queue entry of the same map shares the flag.
+        """
+        target = self._resolve_mission(index_or_entry)
+        switch_sides = bool(switch_sides)
+        available = self._resolve_available_mission(target.filename)
+        AdminCommands.add_mission(available, auto_switch_sides=switch_sides)
+
+        def workflow(session: RetailAdminSession) -> Future:
+            mission = self._resolve_current_mission(target)
+            before = tuple(self.mission_entries)
+            pending_next = next(
+                (item for item in before if item.is_next), None
+            )
+            output: Future = Future()
+
+            def fail(error: BaseException) -> None:
+                _settle_future(output, error=error)
+
+            def restore_next(remove_result) -> None:
+                if pending_next is None:
+                    _settle_future(output, result=remove_result)
+                    return
+                try:
+                    reread = self.refresh_missions(quiet=True)
+                except BaseException as error:  # noqa: BLE001
+                    fail(error)
+                    return
+
+                def reread_done(done: Future) -> None:
+                    try:
+                        entries = tuple(done.result().value or ())
+                        still_next = any(
+                            item.is_next
+                            and item.queue_index == pending_next.queue_index
+                            for item in entries
+                        )
+                        if still_next:
+                            _settle_future(output, result=remove_result)
+                            return
+                        self._log(
+                            "[MISSIONS] the queued next map was dropped by "
+                            "the server; setting it again"
+                        )
+                        again = self._set_next_mission_now(
+                            pending_next, session
+                        )
+                        again.add_done_callback(
+                            lambda _d: _settle_future(
+                                output, result=remove_result
+                            )
+                        )
+                    except BaseException as error:  # noqa: BLE001
+                        fail(error)
+
+                reread.add_done_callback(reread_done)
+
+            def added(add_done: Future) -> None:
+                try:
+                    add_result = add_done.result()
+                    reread = self.refresh_missions(quiet=True)
+                except BaseException as error:  # noqa: BLE001
+                    fail(error)
+                    return
+
+                def check(done: Future) -> None:
+                    try:
+                        entries = tuple(done.result().value or ())
+                        if len(entries) != len(before) + 1:
+                            _settle_future(output, result=add_result)
+                            return
+                        last = max(entries, key=lambda item: item.queue_index)
+                        if (
+                            last.filename.casefold()
+                            != mission.filename.casefold()
+                        ):
+                            raise ValueError(
+                                "the copy added to change x1/x2 is not the "
+                                "last map in the queue; not removing anything"
+                            )
+                        if last.double_time is not switch_sides:
+                            self._log(
+                                f"[MISSIONS] the server kept "
+                                f"{mission.filename} at "
+                                f"{'x2' if last.double_time else 'x1'} "
+                                "(retail clears x2 on objective and "
+                                "non-team maps)"
+                            )
+                        removing = self._execute(
+                            AdminCommands.remove_mission(last),
+                            confirm=self.refresh_missions,
+                            verify=lambda ack, readback: (
+                                _ack_is(ack, "OK - Mission Removed.")
+                                and len(readback.value) == len(before)
+                            ),
+                            expected_session=session,
+                        )
+
+                        def removed(remove_done: Future) -> None:
+                            try:
+                                restore_next(remove_done.result())
+                            except BaseException as error:  # noqa: BLE001
+                                fail(error)
+
+                        removing.add_done_callback(removed)
+                    except BaseException as error:  # noqa: BLE001
+                        fail(error)
+
+                reread.add_done_callback(check)
+
+            try:
+                adding = self._execute(
+                    AdminCommands.add_mission(
+                        self._resolve_current_available_mission(available),
+                        auto_switch_sides=switch_sides,
+                    ),
+                    expected_session=session,
+                )
+            except BaseException as error:  # noqa: BLE001
+                fail(error)
+                return output
+            adding.add_done_callback(added)
+            return output
+
+        return self._serialize_mutation(workflow)
+
     def clear_missions(self) -> Future:
         return self._serialize_mutation(
             lambda session: self._execute(
