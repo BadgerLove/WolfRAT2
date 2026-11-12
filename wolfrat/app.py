@@ -2274,6 +2274,33 @@ class MissionsTab(QWidget):
 
         menu.addSeparator()
 
+        # x1 / x2 (play twice, swapping sides) without remove + re-add.
+        once_action = menu.addAction("Play Once (x1)")
+        twice_action = menu.addAction("Play Twice, Swap Sides (x2)")
+        once_action.setCheckable(True)
+        twice_action.setCheckable(True)
+        once_action.setChecked(not mission.double_time)
+        twice_action.setChecked(mission.double_time)
+        if mission.is_current:
+            # Untested what a change does to the half being played now.
+            for action in (once_action, twice_action):
+                action.setEnabled(False)
+                action.setToolTip("Change it once this map has finished")
+            once_action.setText("Play Once (x1) - not on the running map")
+            twice_action.setText(
+                "Play Twice, Swap Sides (x2) - not on the running map"
+            )
+        else:
+            once_action.triggered.connect(
+                lambda checked=False, m=mission: self._set_side_switch(m, False)
+            )
+            twice_action.triggered.connect(
+                lambda checked=False, m=mission: self._set_side_switch(m, True)
+            )
+        menu.setToolTipsVisible(True)
+
+        menu.addSeparator()
+
         remove_action = menu.addAction("Remove from Rotation")
         remove_action.triggered.connect(
             lambda checked=False, m=mission: self._remove_mission(m)
@@ -2386,6 +2413,32 @@ class MissionsTab(QWidget):
         r_item = self.rotation_table.item(row, 1)
         if r_item:
             r_item.setText(str(count))
+
+    def _set_side_switch(self, mission, switch_sides):
+        """Change one queued map between x1 and x2 in place."""
+        name = mission.filename
+        if bool(mission.double_time) == bool(switch_sides):
+            return
+        label = "x2 (swap sides)" if switch_sides else "x1"
+        shared = sum(
+            1
+            for item in self.server.mission_entries
+            if item.filename.casefold() == name.casefold()
+        )
+        note = (
+            f" (all {shared} entries of this map change: the server keeps "
+            "one setting per map)"
+            if shared > 1
+            else ""
+        )
+        submit_admin(
+            self,
+            lambda: self.server.set_mission_side_switch(mission, switch_sides),
+            lambda _result: self.server._log(
+                f"Set {name} to {label}{note}"
+            ),
+            f"Set {name} to {label}",
+        )
 
     def _remove_from_rotation_at(self, row):
         """Remove a specific map by row index."""
