@@ -16,6 +16,7 @@ from typing import Callable, Optional
 from PyQt6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QSpinBox, QVBoxLayout, QWidget
 
 from wolfrat import coop_guard
+from wolfrat import manual_mode
 from wolfrat.auto_balance import (DEFAULT_GAP, MODE_JOINTOPS, MODE_LABELS, MODE_OFF, MODE_WOLFRAT,
                                   TEAM_NAMES, VOLUNTEER, Balancer, Move, Say, is_team_game, teams)
 
@@ -111,7 +112,8 @@ class AutoBalancePanel(QWidget):
     def on_players(self, players) -> None:
         self._players = list(players or [])
         allowed = (self.mode == MODE_WOLFRAT and self._team_game()
-                   and not self.vote_active_source())
+                   and not self.vote_active_source()
+                   and not manual_mode.quiet())
         self._do(self.balancer.tick(self._players, allowed))
         self.refresh_status()
 
@@ -130,6 +132,8 @@ class AutoBalancePanel(QWidget):
                 continue
             who, said = text.split(":", 1)
             if said.strip().lower() == VOLUNTEER:
+                if manual_mode.skip("Auto-balance"):
+                    continue
                 self._do(self.balancer.volunteer(who.strip()))
         if len(self._seen_chat) > 1000:
             self._seen_chat = set(list(self._seen_chat)[-500:])

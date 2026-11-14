@@ -200,6 +200,9 @@ class ServerManager:
         self._on_log = None
         self._on_disconnect_ui = None
         self._on_connect_done = None
+        # Called on the connecting thread once logged in, before the first
+        # player list and chat are read (Manual mode decides here).
+        self.on_session_ready = None
         self._parse_warnings_seen: set[str] = set()
         # coop_guard.CoopGuard, set by the Chat Bot tab. Every swap asks it.
         self.swap_guard = None
@@ -312,6 +315,11 @@ class ServerManager:
                 self._wire_seen.clear()
             self._apply_result(first)
             self._log(f"Connected to {host}:{port}")
+            if self.on_session_ready is not None:
+                try:
+                    self.on_session_ready()
+                except Exception as error:
+                    self._log(f"Session-ready hook failed: {error}")
             if (
                 self._on_connect_done
                 and self._connection_is_current(session, generation)

@@ -61,6 +61,8 @@ from wolfrat.server_patcher_panel import ServerPatcherPanel
 from wolfrat.live_patches_panel import LivePatchesPanel
 from wolfrat.lag_comp_panel import LagCompPanel
 from wolfrat.client_patcher_panel import ClientPatcherPanel
+from wolfrat import manual_mode
+from wolfrat.manual_mode_panel import ManualModeDialog, ManualModePanel
 from PyQt6.QtMultimedia import QSoundEffect
 from PyQt6.QtCore import QUrl
 
@@ -493,6 +495,7 @@ class LogSignals(QObject):
     available_maps_signal = pyqtSignal(str)
     weapons_signal = pyqtSignal(list)
     connect_signal = pyqtSignal(bool, str)
+    manual_mode_signal = pyqtSignal()
 
 
 def _admin_dispatcher(owner):
@@ -667,6 +670,9 @@ class ServerTab(QWidget):
         self._pending_connect = None
         self._connect_thread = None
         self._closing = False
+        # MainWindow sets this: told (host, port) before the socket opens,
+        # so Manual mode is decided before the first player list arrives.
+        self.before_connect = None
         self.signals.connect_signal.connect(
             self._finish_connect, Qt.ConnectionType.QueuedConnection
         )
@@ -781,6 +787,7 @@ class ServerTab(QWidget):
         info_layout.addWidget(QLabel("Players:"), 3, 0)
         info_layout.addWidget(self.player_count_label, 3, 1)
 
+        self._info_layout = info_layout
         info_group.setLayout(info_layout)
         left.addWidget(info_group)
 
@@ -809,6 +816,11 @@ class ServerTab(QWidget):
     def add_link_panel(self, panel: QWidget) -> None:
         """'Game server on this PC' sits beside Connection and Status."""
         self._link_slot.addWidget(panel)
+
+    def add_manual_mode_panel(self, panel: QWidget) -> None:
+        """Full / Manual mode is one more row of Server Status."""
+        self._info_layout.addWidget(QLabel("Automatic:"), 4, 0)
+        self._info_layout.addWidget(panel, 4, 1)
 
     def add_patches_panel(self, panel: QWidget) -> None:
         """'Server patches' has the Patches page to itself."""
@@ -852,6 +864,11 @@ class ServerTab(QWidget):
 
         self.connect_btn.setEnabled(False)
         self.log(f"Connecting to {host}:{port} as {username}...")
+        if self.before_connect is not None:
+            try:
+                self.before_connect(host, port)
+            except Exception as error:      # never let this stop a connect
+                self.log(f"Manual mode check failed: {error}")
 
         self._pending_connect = (host, port, username, password)
         self._connect_thread = threading.Thread(
@@ -3946,6 +3963,10 @@ class ChatBotTab(QWidget):
             formatted = f"[{time_str}] {text}"
             self.chat_display.append(f"<span style='color: #a89830'>{formatted}</span>")
 
+            # Manual mode: the chat log is all this WolfRAT does with chat.
+            if manual_mode.quiet():
+                continue
+
             # Check for auto-swap trigger
             if self.auto_swap_cb.isChecked():
                 trigger = self.trigger_input.text().strip().lower()
@@ -4125,6 +4146,8 @@ class ChatBotTab(QWidget):
         )
 
     def _send_automod_announcement(self, message):
+        if manual_mode.skip("Auto-moderation announcement"):
+            return
         submit_admin(
             self,
             lambda: self.server.send_chat(message),
@@ -4584,6 +4607,8 @@ class MessagesTab(QWidget):
     def _send_next_recurring(self):
         if not self._recurring_messages:
             return
+        if manual_mode.skip("Timed messages"):
+            return
         msg = self._recurring_messages[self._recurring_index % len(self._recurring_messages)]
         submit_admin(
             self,
@@ -4666,6 +4691,8 @@ class MessagesTab(QWidget):
             self._country_timer.stop()
 
     def _send_country(self, text):
+        if manual_mode.skip("Where-from line"):
+            return
         submit_admin(
             self,
             lambda: self.server.announce(text),
@@ -4678,10 +4705,19 @@ class MessagesTab(QWidget):
         self._refresh_kd_hint()
         if not (self._welcome_enabled or self._country_enabled):
             return
+        if manual_mode.state.mode == manual_mode.UNDECIDED:
+            # The admin has not answered yet: hold, do not mark anyone as
+            # seen. Full then welcomes them as usual; Manual marks them below.
+            return
         for p in players:
             name = p.get('name', '').strip()
             if name and name not in self._seen_players:
                 self._seen_players.add(name)
+                if manual_mode.skip("Welcome messages"):
+                    # Seen, so a later switch to Full does not welcome
+                    # everyone who is already playing.
+                    self._save_config()
+                    continue
                 if self._country_enabled:
                     if self.bans_tab is not None and self.bans_tab.returning_player(name):
                         self.log_text.append(
@@ -4710,6 +4746,8 @@ class MessagesTab(QWidget):
 
     def _send_welcome(self, msg, name):
         """Actually send the welcome message after the delay."""
+        if manual_mode.skip("Welcome messages"):
+            return
         submit_admin(
             self,
             lambda: self.server.announce(msg),
@@ -5215,6 +5253,8 @@ class SpreeTab(QWidget):
             msg = score_lead.pick_line(templates, event, mode, self._lead_rng)
             if not msg:
                 continue
+            if manual_mode.skip("Lead announcements"):
+                continue
             submit_admin(
                 self,
                 lambda message=msg: self.server.send_chat(message),
@@ -5234,6 +5274,8 @@ class SpreeTab(QWidget):
             if not self._zone_capture_enabled or not getattr(event, "first", False):
                 return
             msg = zone_rules.capture_line(event, self._zone_line_player, self._zone_line_team)
+        if manual_mode.skip("Zone announcements"):
+            return
         submit_admin(
             self,
             lambda message=msg: self.server.send_chat(message),
@@ -5340,6 +5382,15 @@ class SpreeTab(QWidget):
                     and self._first_blood_ready
                     and not self._first_blood_pending
                     and new_streak >= 1
+                    and manual_mode.skip("First blood")
+                ):
+                    # Said by the other WolfRAT: it is no longer to come here.
+                    self._first_blood_ready = False
+                elif (
+                    self._first_blood_enabled
+                    and self._first_blood_ready
+                    and not self._first_blood_pending
+                    and new_streak >= 1
                 ):
                     fb_msg = self._first_blood_line(name)
                     self._first_blood_pending = True
@@ -5357,6 +5408,8 @@ class SpreeTab(QWidget):
                     thresholds = sorted(self._spree_thresholds.keys(), reverse=True)
                     for t in thresholds:
                         if old_streak < t <= new_streak:
+                            if manual_mode.skip("Killing sprees"):
+                                break
                             template = self._spree_thresholds[t]
                             msg = template.replace('{player}', name)
                             submit_admin(
@@ -5677,6 +5730,10 @@ class ModsTab(QWidget):
     def _start_skip_transition(self, announcement, log_message):
         if self._skip_transition_pending:
             return
+        if manual_mode.skip("Skip vote"):
+            self._skip_timer.stop()
+            self._skip_active = False
+            return
         self._skip_transition_pending = True
         self._skip_timer.stop()
         self._submit_mod_action(
@@ -5699,6 +5756,10 @@ class ModsTab(QWidget):
 
     def _start_vote_transition(self, announcement, log_message):
         if self._vote_transition_pending:
+            return
+        if manual_mode.skip("Player map vote"):
+            self._vote_timer.stop()
+            self._vote_active = False
             return
         self._vote_transition_pending = True
         self._vote_timer.stop()
@@ -6065,6 +6126,12 @@ class ModsTab(QWidget):
                 continue
             self._seen_chat_ids.add(msg_id)
             text = msg.get('text', '')
+            if manual_mode.quiet():
+                # Marked as seen, so a later switch to Full does not run
+                # commands typed while this WolfRAT was in Manual mode.
+                if '!' in text:
+                    manual_mode.skip("Chat commands")
+                continue
             if text.strip():
                 wire_log(f"[MODS] New chat: {text[:200]}")
             self._check_mod_command(text)
@@ -7712,6 +7779,13 @@ class MapVotingTab(QWidget):
         every rule. True when the vote was started."""
         import time
         enabled = self.enable_cb.isChecked()
+        if enabled and manual_mode.quiet():
+            enabled = False
+            if decision.fire:
+                manual_mode.skip("Automatic map vote")
+            decision = vote_rules.Decision(
+                decision.fire, decision.reason,
+                "Status: Manual mode - no automatic vote. Press Start Vote to run one.")
         players = len(self.server.players or ())
         held = vote_rules.hold_for_players(players, self.min_players_spin.value())
         if held is not None:
@@ -9123,6 +9197,22 @@ class MainWindow(QMainWindow):
         self.server_tab.add_patcher_panel(self.server_patcher_panel)
         self.client_patcher_panel = ClientPatcherPanel(self.runtime.path("wolfrat_client_patcher.json"))
         self.server_tab.add_client_patcher_panel(self.client_patcher_panel)
+        # Manual mode (manual_mode.py): a second WolfRAT on a server only
+        # does what its admin clicks.
+        self._manual_mode_dialog_open = False
+        manual_mode.state.reset()
+        manual_mode.state.configure(
+            self.runtime.path("wolfrat_manual_mode.json"),
+            log=lambda text: self.server._log(text),
+        )
+        self.manual_mode_panel = ManualModePanel(
+            self._manual_mode_switch)
+        self.server_tab.add_manual_mode_panel(self.manual_mode_panel)
+        self.server_tab.before_connect = self._manual_mode_before_connect
+        self.server.on_session_ready = self._manual_mode_session_ready
+        self.signals.manual_mode_signal.connect(self._manual_mode_changed)
+        manual_mode.state.on_change(self.signals.manual_mode_signal.emit)
+        self.signals.connected_signal.connect(self._manual_mode_connected)
         # "checks it once you are connected" must turn over the moment you are
         self.signals.connected_signal.connect(self.server_link_panel.refresh)
         self.signals.disconnected_signal.connect(self.server_link_panel.refresh)
@@ -9257,6 +9347,15 @@ class MainWindow(QMainWindow):
         self.status_connected_label.setStyleSheet("font-size: 9pt; color: #ff6040; padding: 2px 8px;")
         status_bar.addWidget(self.status_connected_label)
 
+        self.status_manual_label = QLabel("")
+        self.status_manual_label.setStyleSheet(
+            "font-size: 9pt; font-weight: bold; color: #1a1000; background: #ff9040; padding: 2px 8px;")
+        self.status_manual_label.setToolTip(
+            "This WolfRAT only does what you click on this server. Change it on the Server tab.")
+        self.status_manual_label.setVisible(False)
+        status_bar.addWidget(self.status_manual_label)
+        self._manual_mode_changed()
+
         sep1 = QLabel("│")
         sep1.setStyleSheet("color: #333; padding: 0 4px;")
         status_bar.addWidget(sep1)
@@ -9347,6 +9446,78 @@ class MainWindow(QMainWindow):
             self._autoconnect_timer.start(500)
         # Check for updates in background (non-blocking, silent if up to date)
         QTimer.singleShot(2000, self._auto_check_updates)
+
+    # ---- Manual mode ----------------------------------------------------
+    def _manual_mode_before_connect(self, host, port):
+        # Tests and the smoke run cannot answer a question: they stay Full.
+        can_ask = self.runtime.auto_connect_enabled or self.runtime.telemetry_enabled
+        manual_mode.state.begin_connect(host, port, can_ask=can_ask)
+
+    def _manual_mode_session_ready(self):
+        """Connecting thread, logged in, nothing read yet: a server on this
+        PC is never asked about, so settle that before the first poll."""
+        from wolfrat import server_process
+        manual_mode.state.resolve(server_process.server_pid() is not None)
+
+    def _manual_mode_connected(self):
+        state = manual_mode.state
+        if state.mode == manual_mode.MANUAL:
+            self.server_tab.log(
+                "Manual mode: this WolfRAT only does what you click on this server. "
+                "Change it on the Server tab.")
+        elif state.mode == manual_mode.UNDECIDED:
+            self.server_tab.log(
+                "Connected from another PC: automatic features are paused until you answer.")
+            schedule_once(self, 400, self._manual_mode_ask)
+
+    def _manual_mode_ask(self, by_hand=False):
+        state = manual_mode.state
+        if self._manual_mode_dialog_open or not state.key:
+            return
+        if not by_hand and state.mode != manual_mode.UNDECIDED:
+            return
+        self._manual_mode_dialog_open = True
+        try:
+            dialog = ManualModeDialog(state.key, self, by_hand=by_hand)
+            dialog.exec()
+            choice = dialog.choice
+        except Exception as error:          # the question must never take WolfRAT down
+            self.server_tab.log(f"Could not show the Manual mode question: {error}")
+            choice = None
+        finally:
+            self._manual_mode_dialog_open = False
+        if choice is None:
+            if state.mode == manual_mode.UNDECIDED:
+                self.server_tab.log(
+                    "No answer: automatic features stay paused. Answer on the Server tab.")
+            return
+        if choice == state.mode:
+            return
+        self._manual_mode_switch(choice)
+
+    def _manual_mode_switch(self, mode):
+        from wolfrat.manual_mode_panel import ASK
+        if mode == ASK:
+            self._manual_mode_ask(by_hand=True)
+            return
+        manual_mode.state.choose(mode)
+        if mode == manual_mode.MANUAL:
+            self.server_tab.log(
+                "Manual mode ON for this server: nothing is sent unless you click it.")
+        else:
+            self.server_tab.log(
+                "Full mode for this server: automatic features work as normal.")
+
+    def _manual_mode_changed(self):
+        panel = getattr(self, "manual_mode_panel", None)
+        if panel is not None:
+            panel.refresh()
+        label = getattr(self, "status_manual_label", None)
+        if label is not None:
+            mode = manual_mode.state.mode
+            label.setVisible(mode != manual_mode.FULL)
+            label.setText({manual_mode.MANUAL: " MANUAL ",
+                           manual_mode.UNDECIDED: " PAUSED "}.get(mode, ""))
 
     def _refresh_web_led(self):
         self.update_web_led(self.web_server.is_running)

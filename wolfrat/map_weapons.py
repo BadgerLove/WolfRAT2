@@ -42,6 +42,8 @@ import os
 import re
 import threading
 import time
+
+from wolfrat import manual_mode
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Sequence
@@ -405,6 +407,10 @@ class MapWeaponsKeeper:
             self._applies_this_map = 0
         if not self.config.enabled:
             return
+        if manual_mode.quiet():
+            if map_name != self.applied_map:
+                manual_mode.skip("Map Weapons")
+            return
         if map_name != self.applied_map:
             self._ask(map_name, "new map")
         elif self._recheck_after_connect and not self._manual:
@@ -422,6 +428,8 @@ class MapWeaponsKeeper:
         next_map = next_map or self.next_map
         if not self.config.enabled or not next_map or not entries:
             return []
+        if manual_mode.quiet():
+            return []
         rule = rule_for(next_map, self.config.rules)
         wanted = targets(entries, rule, self.config.no_rule)
         if wanted is None:
@@ -436,6 +444,8 @@ class MapWeaponsKeeper:
         """The server's round just ended (it loads the next map in ~20 s):
         put the next map's weapons on now, so players load in with them."""
         if not self.config.enabled or not self.next_map:
+            return
+        if manual_mode.quiet():
             return
         recent = self._prepared
         if recent and recent[0] == map_key(self.next_map) and \

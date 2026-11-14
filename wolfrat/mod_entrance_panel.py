@@ -18,6 +18,7 @@ from PyQt6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QGroupBox,
                              QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout)
 
 from wolfrat import chat_markup
+from wolfrat import manual_mode
 from wolfrat.chat_preview import ChatPreview
 from wolfrat.colour_codes import show_colour_codes
 from wolfrat.mod_entrance import (DEFAULT_LINES, EntranceConfig, ModEntrance,
@@ -281,6 +282,8 @@ class ModEntrancePanel(QGroupBox):
         self._known_mods = sorted(str(m) for m in mods)
         due = self.engine.update(names, self._known_mods)
         for entrance in due:
+            if manual_mode.skip("Moderator entrance"):
+                continue
             self._perform(entrance.player, entrance.message, entrance.lightning)
         if due:
             self._save()

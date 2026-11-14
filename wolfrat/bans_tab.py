@@ -26,6 +26,7 @@ from PyQt6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboB
                              QTabWidget, QVBoxLayout, QWidget)
 
 from wolfrat import ban_rules as br
+from wolfrat import manual_mode
 from wolfrat import idle_rules
 from wolfrat import ip_checks
 from wolfrat import zone_rules
@@ -404,6 +405,8 @@ class BansTab(QWidget):
         return names
 
     def _idle_tick(self, now: float) -> None:
+        if manual_mode.quiet():
+            return
         for event in self.idle.tick(self.idle_cfg, self._online, self._positions, self._idle_exempt(), now):
             if event.kind == "warn":
                 self.log(f"Idle warning to {event.name} ({event.idle_seconds // 60} min without moving)")
@@ -640,6 +643,8 @@ class BansTab(QWidget):
         poll and again when a lookup lands."""
         if not self.checks.enabled:
             return
+        if manual_mode.quiet():
+            return                       # Manual mode: nobody is removed automatically
         now = self._clock()
         present = set()
         for player in self._online:
@@ -759,6 +764,8 @@ class BansTab(QWidget):
 
     def _enforce(self, now: float) -> None:
         """Punt everyone online who trips the ban list (once per visit)."""
+        if manual_mode.quiet():
+            return                       # Manual mode: the other WolfRAT keeps the bans
         for removal in self.enforcer.decide(self.bans, self._online, self._ips, now):
             why = removal.why()
             self.log(f"Removed {why}")
@@ -817,6 +824,9 @@ class BansTab(QWidget):
             self.log(f"Banned {entry.kind} {entry.value}" + (f" ({entry.linked})" if entry.linked else "")
                      + (f" - {entry.reason}" if entry.reason else "")
                      + f" (by {entry.added_by}, until {br.format_expiry(entry.expires_at)})")
+        if added and manual_mode.quiet():
+            self.log("Manual mode: this WolfRAT is not keeping banned players out. Ask the admin "
+                     "of the server's own WolfRAT to add this ban too.")
         self._dirty = True
         self._refresh_ban_table()
         self.save()
