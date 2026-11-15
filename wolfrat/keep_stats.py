@@ -122,10 +122,12 @@ class StatsKeeper:
         self._restored = restored
         self.enabled = True
         self.linked = False
+        self.watch: Optional[Callable[[list, frozenset], None]] = None   # career.CareerTracker.observe
         self._handle = None
         self._tracked: dict = {}
         self._saved: dict = {}
         self._guards: dict = {}
+        self._rebased: set = set()
 
     # ---- what the panel shows --------------------------------------------------------
     @property
@@ -140,25 +142,49 @@ class StatsKeeper:
         self._tracked, self._saved, self._guards = {}, {}, {}
 
     # ---- the once-a-second pass ------------------------------------------------------
-    def tick(self, mem) -> None:
+    def tick(self, mem, reader=None) -> None:
+        """``reader`` is a handle that can at least read: all the watcher needs when
+        saving is off or the handle isn't writable."""
         if not self.enabled:
             self.forget()
+            self._watch_only(reader if reader is not None else mem)
             return
         self.linked = mem is not None
         if mem is not self._handle:              # a different server, or the link went
             self.forget()
             self._handle = mem
         if mem is None:
+            self._watch_only(reader)
             return
         try:
-            if self._dword(mem, ROUND_OVER_FLAG):
-                self.forget()
-                return
+            over = self._dword(mem, ROUND_OVER_FLAG)
             limit = self._dword(mem, FRIENDLY_KILL_LIMIT_VA)
             live = self._read_slots(mem)
         except Exception:                        # mid map load or the server closed: decide nothing on this
             return
+        if over:
+            self.forget()
+            self._tell_watcher(live, frozenset())
+            return
         self._step(mem, live, limit)
+        self._tell_watcher(list(self._tracked.values()), frozenset(self._rebased))
+
+    def _watch_only(self, mem) -> None:
+        if self.watch is None or mem is None:
+            return
+        try:
+            live = self._read_slots(mem)
+        except Exception:
+            return
+        self._tell_watcher(live, frozenset())
+
+    def _tell_watcher(self, slots: list, rebased: frozenset) -> None:
+        if self.watch is None:
+            return
+        try:
+            self.watch(slots, rebased)
+        except Exception as exc:                 # the watcher never stops stats being saved
+            self._log(f"stats watcher failed: {exc}")
 
     @staticmethod
     def _dword(mem, address: int) -> int:
@@ -188,6 +214,7 @@ class StatsKeeper:
 
     def _step(self, mem, live: list, limit: int) -> None:
         now = self._clock()
+        self._rebased = set()
         by_key = {slot.key: slot for slot in live}
         if self._everyone_wiped(by_key):
             self._saved.clear()
@@ -201,6 +228,7 @@ class StatsKeeper:
                 saved = self._saved.get(slot.name)
                 if saved is not None and slot.state in IN_MATCH:
                     slot = self._put_back(mem, slot, saved)
+                    self._rebased.add(slot.key)
                     del self._saved[slot.name]
                     self._guards[slot.key] = _Guard(saved, slot.team, now + TEAM_PICK_SECONDS)
                     self._log(f"{slot.name} rejoined: stats back ({slot.kills} kills, {slot.deaths} deaths)")
@@ -246,6 +274,7 @@ class StatsKeeper:
             return slot
         guard.team = slot.team
         slot = self._put_back(mem, slot, guard.saved)
+        self._rebased.add(slot.key)
         self._log(f"{slot.name} changed team after rejoining: stats back again ({slot.kills} kills, {slot.deaths} deaths)")
         self._restored(slot.name, slot.kills, slot.deaths)
         return slot

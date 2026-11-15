@@ -30,6 +30,7 @@ class KeepStatsPanel(QGroupBox):
         self.keeper.enabled = self._load().get("enabled", True) is not False
         self._log = log
         self._memory = None
+        self._reader = None                       # the same handle, writable or not
         self._build()
         self._timer = QTimer(self)                # the Weather tab only polls every 5 s
         self._timer.timeout.connect(self._tick)
@@ -81,15 +82,21 @@ class KeepStatsPanel(QGroupBox):
     def wants_write(self) -> bool:
         return self.keeper.enabled
 
+    def set_watcher(self, watch) -> None:
+        """Hand every player's counters on once a second (the Stats, XP and ranks box)."""
+        self.keeper.watch = watch
+
     def no_server(self, _text: str) -> None:
         self._memory = None
+        self._reader = None
 
     def server_tick(self, memory, writable: bool) -> None:
         self._memory = memory if writable else None
+        self._reader = memory
 
     def _tick(self) -> None:
         try:
-            self.keeper.tick(self._memory)
+            self.keeper.tick(self._memory, reader=self._reader)
         except Exception as exc:                 # never let the timer die
             self._log(f"tick failed: {exc}")
         self.refresh_status()

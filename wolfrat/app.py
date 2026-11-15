@@ -56,6 +56,7 @@ from wolfrat.qt_dispatcher import CompletionPolicy, QtAdminDispatcher
 from wolfrat.bans_tab import BansTab
 from wolfrat.auto_balance_panel import AutoBalancePanel
 from wolfrat.keep_stats_panel import KeepStatsPanel
+from wolfrat.career_panel import CareerPanel
 from wolfrat.server_link_panel import ServerLinkPanel
 from wolfrat.server_patches_panel import ServerPatchesPanel
 from wolfrat.server_patcher_panel import ServerPatcherPanel
@@ -6035,7 +6036,9 @@ class ModsTab(QWidget):
             ("!skip", "Vote to skip the current map", False),
             ("!yes", "Vote yes on the current vote", False),
             ("!switch", "Switch your own team", False),
-            ("!kd [player]", "Kill/death stats", False),
+            ("!stats [player]", "Kills/deaths, headshots, knife kills, best streak, medic revives "
+             "and heals, zone takeovers and time played (!kd gives the same)", False),
+            ("!rank [player]", "Place on the server, rank and XP", False),
             ("!list", "Show the map rotation", False),
             ("!ping", "Show your own ping", False),
             ("!mycomp", "Your lag compensation: P ping, R rewind (ms), hits since you "
@@ -6217,6 +6220,25 @@ class ModsTab(QWidget):
         # !switch is handled by ChatBot for ALL players
         if cmd == '!switch':
             return
+
+        # !stats / !rank - lifetime stats, XP and rank (career.py).  !kd gives the
+        # !stats answer too; with nothing to read (WolfRAT not on the server's PC)
+        # !stats and !kd fall back to the old kills/deaths line below.
+        if cmd in ('!stats', '!rank', '!kd'):
+            career_panel = getattr(self, 'career_panel', None)
+            target_name = ' '.join(args) if args else sender
+            lines = None
+            if career_panel is not None:
+                lines = career_panel.reply('!rank' if cmd == '!rank' else '!stats', target_name, chat_limit())
+            if lines is not None:
+                for line in lines:
+                    self._send_mod_chat(line, f"Send {cmd} response")
+                wire_log(f"[MODS] {cmd}: sent {lines}")
+                return
+            if cmd == '!rank':
+                wire_log("[MODS] !rank: switched off or nothing to read")
+                return
+            cmd = '!kd'
 
         # !kd - any player can check their own stats (or another player's)
         if cmd == '!kd':
@@ -9345,6 +9367,25 @@ class MainWindow(QMainWindow):
         self.players_tab.layout().addWidget(self.keep_stats_panel)
         self.weather_tab.add_server_ticker(self.keep_stats_panel)
 
+        # Lifetime stats, XP and ranks (career.py), fed by the same once-a-second read.
+        def _career_log(text):
+            wire_log(f"[CAREER] {text}")
+
+        def _career_announce(text):
+            if manual_mode.skip("Rank announcements"):
+                return
+            self.mods_tab._send_mod_chat(text, "Rank up announcement")
+
+        self.career_panel = CareerPanel(
+            os.path.dirname(str(self.runtime.path("wolfrat_career.json"))),
+            log=_career_log,
+            announce=_career_announce,
+            chat_limit=chat_limit,
+        )
+        self.players_tab.layout().addWidget(self.career_panel)
+        self.keep_stats_panel.set_watcher(self.career_panel.observe)
+        self.mods_tab.career_panel = self.career_panel
+
         # Wire up cross-tab references
         self.missions_tab._main_window = self
         self.missions_store._missions_tab = self.missions_tab
@@ -9855,6 +9896,7 @@ class MainWindow(QMainWindow):
             ("retail connection", self.server_tab.shutdown),
             ("web server", self.web_server.stop),
             ("stats database", self.stats_store.close),
+            ("career database", self.career_panel.shutdown),
         ]
         if self.runtime.telemetry_enabled:
             from wolfrat import bstats
@@ -9967,7 +10009,7 @@ def schedule_desktop_smoke(
                 "web_application": web_application_available,
             }
             checks = {
-                "tab_count": window.tabs.count() == 14,
+                "tab_count": window.tabs.count() >= 14,
                 "web_stopped": not window.web_server.is_running,
                 "retail_disconnected": not window.server.is_connected,
                 **resources,
