@@ -487,7 +487,7 @@ def _spree_tab(store=None):
         messages_tab=SimpleNamespace(_kd_enabled=bool(store), stats_store=store),
         _spree_enabled=True, _spree_thresholds={5: "{player} spree"}, _first_blood_enabled=False,
         _first_blood_ready=False, _first_blood_pending=False, _player_stats={},
-        _stats_restored_until={}, log_text=None, server=None)
+        _stats_restored_until={}, _new_map_since=None, log_text=None, server=None)
 
 
 def _list(name, kills, deaths=0, pid="3"):
