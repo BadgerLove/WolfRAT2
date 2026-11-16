@@ -21,7 +21,7 @@ from wolfrat.chat_preview import ChatPreview
 from wolfrat.colour_codes import show_colour_codes
 
 FIRST_LINE_HINT = "<c40c0ff>Welcome<co> to my server!"
-SUGGESTED_SECOND_LINE = "<cffff00>Chat commands:<co> !kd  !switch  !vote mapname  !skip"
+SUGGESTED_SECOND_LINE = "<cffff00>Commands:<co> !stats !rank !switch !vote mapname !skip"
 
 
 class _Line:

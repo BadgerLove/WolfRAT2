@@ -353,6 +353,34 @@ def played_text(seconds: float) -> str:
     return f"{minutes}m" if minutes < 60 else f"{compact(minutes // 60)}h"
 
 
+# ---- colours (long chat servers only) ---------------------------------------------------
+# A stock server strips colour codes from chat, so colour is only asked for where
+# the long chat patch is in (chat_markup.py; First Blood does the same).  A code is
+# 9 characters of the line and sits against a word, so it never adds a word.
+
+NAME_COLOUR, PLACE_COLOUR, XP_COLOUR, QUIET_COLOUR = "ffff00", "40c0ff", "00ff00", "808080"
+# The rank's colour climbs with the ladder, a tenth of the ranks each:
+# grey, bronze, green, cyan, light blue, purple, pink, orange, red, gold.
+TIER_COLOURS = ("c0c0c0", "cd7f32", "00ff00", "00ffff", "40c0ff", "8080ff", "ff80c0", "ff8000", "ff3030", "ffd700")
+STAT_COLOURS = ("00ff00", "ff3030", "ff8000", "ff80c0", "00ffff", "40c0ff", "8080ff", "c0c0c0")
+
+
+def tier_colour(rank: Rank, ranks: Sequence[Rank]) -> str:
+    """The top rank is always gold and the first always grey, however many ranks there are."""
+    if rank.number >= len(ranks):
+        return TIER_COLOURS[-1]
+    return TIER_COLOURS[min(len(TIER_COLOURS) - 1, (rank.number - 1) * len(TIER_COLOURS) // len(ranks))]
+
+
+def _c(colour: str, text: str) -> str:
+    return f"<c{colour}>{text}"
+
+
+def colour_name(name: str) -> str:
+    """A < or > in a name would be read as the start of a colour code."""
+    return chat_safe(name).replace("<", "(").replace(">", ")")
+
+
 def fits(line: str, limit: int) -> bool:
     return len(line) <= limit and len(line.split()) <= MAX_CHAT_TOKENS
 
@@ -365,13 +393,31 @@ def _first_fit(candidates: Iterable[str], limit: int) -> str:
     return " ".join(last.split()[:MAX_CHAT_TOKENS])[:limit].rstrip()
 
 
-def rank_line(name: str, place: int, players: int, xp: int, ranks: Sequence[Rank], limit: int) -> str:
-    name = chat_safe(name)
+def rank_line(name: str, place: int, players: int, xp: int, ranks: Sequence[Rank], limit: int,
+              colour: bool = False) -> str:
     rank = rank_for(xp, ranks)
     after = next_rank(xp, ranks)
     title = f"Rank {rank.number} {rank.name}"
     points = f"{xp_text(xp)} XP"
     candidates = []
+    if colour:
+        who = _c(NAME_COLOUR, colour_name(name))
+        where = _c(PLACE_COLOUR, f"#{place} of {players}")
+        what = _c(tier_colour(rank, ranks), title)
+        worth = _c(XP_COLOUR, points)
+        bar = _c(QUIET_COLOUR, "|")
+        if after is not None:
+            ahead = f"Next {after.name} in {xp_text(after.xp - xp)}"
+            ahead = _c(tier_colour(after, ranks), ahead)     # in the colour of the rank to come
+            candidates += [
+                f"{who} {where} {bar} {what} {bar} {worth} {bar} {ahead}",
+                f"{who} {where} {what} {worth} {ahead}",
+                f"{who} {_c(PLACE_COLOUR, f'#{place}')} {what} {worth} {ahead}",
+                f"{who} #{place} of {players} {what} {worth} {ahead}",
+                f"{who} #{place} {what} {worth} {ahead}",
+            ]
+        candidates += [f"{who} {where} {bar} {what} {bar} {worth}", f"{who} {where} {what} {worth}"]
+    name = chat_safe(name)
     if after is not None:
         candidates.append(f"{name}: #{place} of {players} | {title} | {points} | "
                           f"Next {after.name} in {xp_text(after.xp - xp)}")
@@ -394,10 +440,28 @@ def _stat_parts(career: Career, short: bool, played: str = "Played ") -> tuple:
     return first, second
 
 
-def stats_lines(career: Career, limit: int) -> list:
+def _colour_stats(career: Career, limit: int) -> Optional[list]:
+    """Every stat in its own colour.  Eight colours are 72 characters of codes, more
+    than one line has to spare, so the coloured reply is always two lines."""
+    who = _c(NAME_COLOUR, colour_name(career.name))
+    for short in (False, True):
+        first, second = _stat_parts(career, short)
+        parts = [_c(shade, part) for shade, part in zip(STAT_COLOURS, first + second)]
+        head, tail = " ".join([who] + parts[:len(first)]), " ".join(parts[len(first):])
+        if fits(head, limit) and fits(tail, limit):
+            return [head, tail]
+    return None
+
+
+def stats_lines(career: Career, limit: int, colour: bool = False) -> list:
     """One line when it fits (long chat), two when it doesn't.  Never more than two.
+    In colour it is two lines (see _colour_stats).
     Each bar is a word to the server, and a line holds 23 words: the one-line form
     uses commas when the bars would take it over."""
+    if colour:
+        coloured = _colour_stats(career, limit)
+        if coloured:
+            return coloured
     name = chat_safe(career.name)
     for short, bar in ((False, " | "), (False, ", "), (True, ", ")):
         first, second = _stat_parts(career, short)
@@ -412,13 +476,20 @@ def stats_lines(career: Career, limit: int) -> list:
     return [_first_fit(heads, limit), _first_fit(tails, limit)]
 
 
-def rank_up_line(name: str, rank: Rank, limit: int) -> str:
+def rank_up_line(name: str, rank: Rank, limit: int, colour: bool = False,
+                 ranks: Optional[Sequence[Rank]] = None) -> str:
+    candidates = []
+    if colour:
+        shade = tier_colour(rank, ranks or build_ranks())
+        who = _c(NAME_COLOUR, colour_name(name))
+        candidates += [f"{who} {_c(QUIET_COLOUR, 'is now')} {_c(shade, f'Rank {rank.number} {rank.name}!')}",
+                       f"{who} {_c(shade, f'Rank {rank.number} {rank.name}!')}"]
     name = chat_safe(name)
-    return _first_fit((f"{name} is now Rank {rank.number} {rank.name}!",
-                       f"{name}: Rank {rank.number} {rank.name}!",
-                       f"{name}: Rank {rank.number}!"), limit)
+    return _first_fit(candidates + [f"{name} is now Rank {rank.number} {rank.name}!",
+                                    f"{name}: Rank {rank.number} {rank.name}!",
+                                    f"{name}: Rank {rank.number}!"], limit)
 
 
 __all__ = ["Career", "CareerStore", "CareerTracker", "DEFAULT_RANKS", "Rank", "build_ranks", "chat_safe", "compact",
-           "fits", "next_rank", "played_text", "rank_for", "rank_line", "rank_up_line", "stats_lines",
+           "fits", "next_rank", "tier_colour", "played_text", "rank_for", "rank_line", "rank_up_line", "stats_lines",
            "xp_text"]

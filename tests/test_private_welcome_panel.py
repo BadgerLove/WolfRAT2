@@ -87,7 +87,7 @@ def test_second_line_tick_suggests_the_commands_saves_and_reloads(tmp_path):
     assert not panel.text2_input.isEnabled()
     panel.second_cb.setChecked(True)
     assert panel.text2_input.text() == SUGGESTED_SECOND_LINE and panel.text2_input.isEnabled()
-    assert "!kd" in SUGGESTED_SECOND_LINE and sw.line_problem(SUGGESTED_SECOND_LINE) is None
+    assert "!stats" in SUGGESTED_SECOND_LINE and "!rank" in SUGGESTED_SECOND_LINE and sw.line_problem(SUGGESTED_SECOND_LINE) is None
     panel.gap_spin.setValue(4)
     panel.text2_input.setText("<cff8800>Chat:<co> !kd !switch")
     panel.save_btn.click()

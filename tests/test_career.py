@@ -287,3 +287,48 @@ def test_the_rank_reply():
     assert career.rank_line("BadgerLove", 12, 340, 41200, ranks, 118) == (
         "BadgerLove: #12 of 340 | Rank 26 Colonel | 41.2k XP | Next Senior Colonel in 3.8k")
     assert career.rank_up_line("BadgerLove", ranks[27], 59) == "BadgerLove is now Rank 28 Brigadier!"
+
+# ---- colours (long chat servers) ---------------------------------------------------------
+
+def test_the_rank_reply_in_colour():
+    ranks = build_ranks()
+    assert career.rank_line("BadgerLove", 12, 340, 41200, ranks, 118, colour=True) == (
+        "<cffff00>BadgerLove <c40c0ff>#12 <c8080ff>Rank 26 Colonel <c00ff00>41.2k XP "
+        "<c8080ff>Next Senior Colonel in 3.8k")
+    assert career.rank_line("Bo", 1, 340, 1000000, ranks, 118, colour=True) == (
+        "<cffff00>Bo <c40c0ff>#1 of 340 <c808080>| <cffd700>Rank 50 Joint Ops Legend <c808080>| <c00ff00>1M XP")
+    assert career.rank_up_line("BadgerLove", ranks[27], 118, colour=True, ranks=ranks) == (
+        "<cffff00>BadgerLove <c808080>is now <c8080ff>Rank 28 Brigadier!")
+
+
+def test_the_stats_reply_in_colour_is_two_lines():
+    assert career.stats_lines(DALE, 118, colour=True) == [
+        "<cffff00>BadgerLove <c00ff00>K/D 6056/5000 <cff3030>HS 605 10% <cff8000>KK 400",
+        "<cff80c0>Streak 23 <c00ffff>Revives 310 <c40c0ff>Heals 900 <c8080ff>Zones 40 <cc0c0c0>Played 142h",
+    ]
+
+
+def test_the_rank_colour_climbs_from_grey_to_gold_whatever_the_number_of_ranks():
+    for ranks in (build_ranks(), build_ranks([["A", 0], ["B", 10], ["C", 20]]), build_ranks([["Only", 0]])):
+        shades = [career.tier_colour(rank, ranks) for rank in ranks]
+        assert shades[-1] == "ffd700"
+        assert [career.TIER_COLOURS.index(s) for s in shades] == sorted(career.TIER_COLOURS.index(s) for s in shades)
+    assert career.tier_colour(build_ranks()[0], build_ranks()) == "c0c0c0"
+
+
+@pytest.mark.parametrize("who", (DALE, BIG, Career(name="x"), Career(name="A<c123456>B<co>", xp=99)))
+def test_coloured_replies_fit_long_chat_and_a_name_cannot_carry_a_colour_code(who):
+    from wolfrat import chat_markup
+    ranks = build_ranks()
+    lines = career.stats_lines(who, 118, colour=True)
+    assert len(lines) == 2
+    for place, players in ((1, 1), (12345, 123456)):
+        lines.append(career.rank_line(who.name, place, players, who.xp, ranks, 118, colour=True))
+    for rank in ranks:
+        lines.append(career.rank_up_line(who.name, rank, 118, colour=True, ranks=ranks))
+    for line in lines:
+        assert career.fits(line, 118), line
+        assert line.startswith("<c")
+        assert chat_markup.tag_problem(line) is None, line
+        assert "123456>" not in chat_markup.visible(line) or who.name == "x"
+        line.encode("ascii")

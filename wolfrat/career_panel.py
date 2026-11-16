@@ -24,7 +24,7 @@ SETTINGS_FILE = "wolfrat_career.json"
 DATABASE_FILE = "wolfrat_career.db"
 FLUSH_MS = 10000
 LINKED_SECONDS = 5.0
-DEFAULTS = {"track": True, "stats": True, "rank": True, "announce": True, "announce_from": 2}
+DEFAULTS = {"track": True, "stats": True, "rank": True, "announce": True, "announce_from": 6}
 
 
 class RanksDialog(QDialog):
@@ -93,12 +93,14 @@ class RanksDialog(QDialog):
 class CareerPanel(QGroupBox):
     def __init__(self, folder: str, log: Callable[[str], None] = lambda _text: None,
                  announce: Callable[[str], None] = lambda _text: None,
-                 chat_limit: Callable[[], int] = lambda: 59, parent=None) -> None:
+                 chat_limit: Callable[[], int] = lambda: 59,
+                 colour: Callable[[], bool] = lambda: False, parent=None) -> None:
         super().__init__("Stats, XP and ranks", parent)
         self._path = os.path.join(folder, SETTINGS_FILE)
         self._log = log
         self._announce = announce
         self._chat_limit = chat_limit
+        self._colour = colour            # long chat server: the lines go out in colour
         saved = self._load()
         self._settings = {key: saved.get(key, default) for key, default in DEFAULTS.items()}
         self._ranks = build_ranks(saved.get("ranks") or career.DEFAULT_RANKS)
@@ -164,8 +166,8 @@ class CareerPanel(QGroupBox):
             return [line if career.fits(line, limit) else "No stats yet for that player"]
         if command == "!rank":
             place, players = self.store.position(found.xp)
-            return [career.rank_line(found.name, place, players, found.xp, self._ranks, limit)]
-        return career.stats_lines(found, limit)
+            return [career.rank_line(found.name, place, players, found.xp, self._ranks, limit, self._colour())]
+        return career.stats_lines(found, limit, self._colour())
 
     def shutdown(self) -> None:
         if self.store is not None:
@@ -176,7 +178,7 @@ class CareerPanel(QGroupBox):
     def _ranked_up(self, name: str, rank: Rank) -> None:
         self._log(f"{name} reached rank {rank.number} {rank.name}")
         if self._settings["announce"] and self._settings["rank"] and rank.number >= int(self._settings["announce_from"]):
-            self._announce(career.rank_up_line(name, rank, self._chat_limit()))
+            self._announce(career.rank_up_line(name, rank, self._chat_limit(), self._colour(), self._ranks))
 
     # ---- UI -------------------------------------------------------------------------
     def _build(self) -> None:
