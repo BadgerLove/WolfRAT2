@@ -8253,6 +8253,12 @@ class WeaponsTab(QWidget):
         self._weapons_by_row = []
         self._row_groups = []
         self._loading = False
+        # Clicking a saved map in Map Weapons shows ITS weapons in the grid, and
+        # clicks then change that rule (Dale 2026-11-16: the grid only ever showed
+        # the server, so a saved map could not be seen or changed).
+        self._live_weapons = []              # the server's list, kept while a rule is shown
+        self._rule_view = None               # match of the rule the grid shows, None = the server
+        self._loaded_map = None              # () -> map the server has loaded (memory), or None
         self._build_ui()
 
     def _build_ui(self):
@@ -8260,6 +8266,7 @@ class WeaponsTab(QWidget):
         layout.addWidget(self._build_map_weapons())
 
         weapon_group = QGroupBox("Weapons Availability")
+        self.weapon_group = weapon_group
         weapon_layout = QVBoxLayout()
 
         override_row = QHBoxLayout()
@@ -8304,6 +8311,16 @@ class WeaponsTab(QWidget):
         search_row.addWidget(self.weapon_search)
         weapon_layout.addLayout(search_row)
 
+        view_row = QHBoxLayout()
+        self.grid_source_label = QLabel()
+        self.grid_source_label.setWordWrap(True)
+        view_row.addWidget(self.grid_source_label, 1)
+        self.show_server_btn = SatisfyingButton("Show the server's weapons")
+        self.show_server_btn.setToolTip("Stop showing the saved map and show the weapons the server has now")
+        self.show_server_btn.clicked.connect(self._show_server_weapons)
+        view_row.addWidget(self.show_server_btn)
+        weapon_layout.addLayout(view_row)
+
         self.weapon_table = QTableWidget()
         self.weapon_table.setColumnCount(4)
         self.weapon_table.setHorizontalHeaderLabels(["Weapon", "Y", "A", "N"])
@@ -8317,6 +8334,7 @@ class WeaponsTab(QWidget):
 
         weapon_group.setLayout(weapon_layout)
         layout.addWidget(weapon_group)
+        self._refresh_grid_source()
 
     # ------------------------------------------------------------- map weapons
     def _build_map_weapons(self):
@@ -8351,6 +8369,8 @@ class WeaponsTab(QWidget):
         self.map_rules_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.map_rules_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.map_rules_table.setMaximumHeight(130)
+        self.map_rules_table.setToolTip("Click a map to see and change its saved weapons below")
+        self.map_rules_table.itemSelectionChanged.connect(self._on_rule_selected)
         col.addWidget(self.map_rules_table)
 
         buttons = QHBoxLayout()
@@ -8386,11 +8406,12 @@ class WeaponsTab(QWidget):
         self.map_status_signal.connect(lambda text: self.map_status_label.setText(f"Last: {text}"))
         return box
 
-    def attach_map_weapons(self, keeper, display_name=None, map_list=None):
+    def attach_map_weapons(self, keeper, display_name=None, map_list=None, loaded_map=None):
         self.map_weapons = keeper
         if display_name is not None:
             self._display_name = display_name
         self._map_list = map_list
+        self._loaded_map = loaded_map
         self.map_enabled_cb.blockSignals(True)
         self.map_enabled_cb.setChecked(keeper.config.enabled)
         self.map_enabled_cb.blockSignals(False)
@@ -8401,16 +8422,138 @@ class WeaponsTab(QWidget):
         self._refresh_map_rules()
 
     def _refresh_map_rules(self):
+        """Rebuild the rules list, keeping the rule the grid shows selected."""
         keeper = self.map_weapons
         rules = keeper.config.rules if keeper else []
-        self.map_rules_table.setRowCount(0)
+        table = self.map_rules_table
+        viewed = map_weapons.map_key(self._rule_view) if self._rule_view else None
+        keep = None
+        table.blockSignals(True)
+        table.setRowCount(0)
         for i, rule in enumerate(rules):
-            self.map_rules_table.insertRow(i)
+            table.insertRow(i)
             shown = rule.match if not rule.label else f"{rule.label}  ({rule.match})"
-            self.map_rules_table.setItem(i, 0, QTableWidgetItem(shown))
-            self.map_rules_table.setItem(i, 1, QTableWidgetItem(rule.summary()))
-            self.map_rules_table.setItem(i, 2, QTableWidgetItem(rule.saved))
+            table.setItem(i, 0, QTableWidgetItem(shown))
+            table.setItem(i, 1, QTableWidgetItem(rule.summary()))
+            table.setItem(i, 2, QTableWidgetItem(rule.saved))
+            if viewed and map_weapons.map_key(rule.match) == viewed:
+                keep = i
+        if keep is not None:
+            table.selectRow(keep)
+        table.blockSignals(False)
+        if self._rule_view is not None and keep is None:
+            self._rule_view = None                   # its rule was removed: back to the server
+            self._render_weapons(self._live_weapons)
+        self._refresh_grid_source()
         self._refresh_map_current()
+
+    # ---- the grid shows a saved map's rule -------------------------------------
+    def _viewed_rule(self):
+        keeper = self.map_weapons
+        if keeper is None or self._rule_view is None:
+            return None
+        key = map_weapons.map_key(self._rule_view)
+        for rule in keeper.config.rules:
+            if map_weapons.map_key(rule.match) == key:
+                return rule
+        return None
+
+    def _rule_entries(self, rule):
+        """The rule as grid rows: the server's weapons (so the rows and ADMDEF numbers
+        match), each with the rule's mode.  Without a server list, the rule's own names."""
+        import dataclasses
+        from wolfrat.admin_commands import WeaponEntry
+        live = list(self._live_weapons or getattr(self.server, "weapon_entries", None) or ())
+        if live:
+            return [dataclasses.replace(entry, mode=rule.mode_for(entry.name)) for entry in live]
+        return [WeaponEntry(-1 - i, name, WeaponMode(word)) for i, (name, word) in enumerate(rule.weapons.items())]
+
+    def _rule_is_live(self, rule):
+        """True when this rule is the one for the map being played (and Map Weapons is on)."""
+        keeper = self.map_weapons
+        if keeper is None or not keeper.config.enabled or not keeper.current_map:
+            return False
+        return map_weapons.rule_for(keeper.current_map, keeper.config.rules) is rule
+
+    def _on_rule_selected(self):
+        keeper = self.map_weapons
+        rows = self.map_rules_table.selectionModel().selectedRows()
+        row = rows[0].row() if rows else -1
+        if keeper is None or not 0 <= row < len(keeper.config.rules):
+            if self._rule_view is not None:
+                self._rule_view = None
+                self._render_weapons(self._live_weapons)
+            self._refresh_grid_source()
+            return
+        rule = keeper.config.rules[row]
+        self._rule_view = rule.match
+        self._render_weapons(self._rule_entries(rule))
+        self._refresh_grid_source()
+
+    def _show_server_weapons(self):
+        self.map_rules_table.clearSelection()
+        if self._rule_view is not None:              # nothing was selected to clear
+            self._rule_view = None
+            self._render_weapons(self._live_weapons)
+        self._refresh_grid_source()
+
+    def _refresh_grid_source(self):
+        rule = self._viewed_rule()
+        if rule is None:
+            self.weapon_group.setTitle("Weapons Availability - the server now")
+            self.grid_source_label.setText(
+                "Showing the weapons the server has right now. Changes go straight to the server. "
+                "Click a map in Map Weapons above to see or change its saved weapons.")
+            self.show_server_btn.setVisible(False)
+            return
+        name = rule.label or rule.match
+        self.weapon_group.setTitle(f"Weapons Availability - saved for {name}")
+        if self._rule_is_live(rule):
+            where = "saved to this map and sent to the server too (it is the map being played)."
+        else:
+            where = "saved to this map and used the next time it loads."
+        self.grid_source_label.setText(
+            f"Showing the saved weapons for {name} ({rule.summary()}). Changes are {where}")
+        self.show_server_btn.setVisible(True)
+
+    def _edit_rule(self, rule, changes, single=None, all_mode=None):
+        """Change a saved rule from the grid: save it, and send it to the server
+        when it is the rule for the map being played."""
+        keeper = self.map_weapons
+        weapons = {name: word for name, word in rule.weapons.items()
+                   if name.lower() not in {changed.lower() for changed in changes}}
+        weapons.update({name: mode.value for name, mode in changes.items()})
+        rule.weapons = weapons                       # one swap: the keeper's thread may be reading it
+        rule.saved = time.strftime("%Y-%m-%d %H:%M")
+        keeper.save()
+        name = rule.label or rule.match
+        if all_mode is not None:
+            what = f"every weapon {map_weapons.MODE_WORD[all_mode]}"
+        else:
+            what = f"{single.name} {map_weapons.MODE_WORD[changes[single.name]]}"
+        self.server._log(f"[MAP WEAPONS] rule '{rule.match}': {what} (saved)")
+        sent = ""
+        if self._rule_is_live(rule) and all_mode is not None:
+            sent = ", sent to the server too"
+            submit_admin(
+                self,
+                lambda: self.server.set_all_weapons(all_mode),
+                lambda _result: self.server.refresh_weapons(),
+                f"Map Weapons: {name} {what}",
+                lambda _message: self.server.refresh_weapons(),
+            )
+        elif self._rule_is_live(rule) and single.admdef_id >= 0:
+            sent = ", sent to the server too"
+            mode = changes[single.name]
+            submit_admin(
+                self,
+                lambda: self.server.set_weapon(single.admdef_id, mode),
+                lambda _result: self.server.refresh_weapons(),
+                f"Map Weapons: {name} {what}",
+                lambda _message: self.server.refresh_weapons(),
+            )
+        self.map_status_label.setText(f"Last: {name}: {what} - saved{sent}")
+        self._refresh_map_rules()                    # the Weapons column; keeps the selection
 
     def _refresh_map_current(self):
         keeper = self.map_weapons
@@ -8429,12 +8572,21 @@ class WeaponsTab(QWidget):
     def on_missions_updated(self, missions):
         if self.map_weapons is None:
             return
-        current = map_weapons.current_map_from_missions(missions)
+        # The map the server really has loaded (memory, same PC) first: the admin
+        # list only tags <CURRENT MISSION> when that map is in the rotation.
+        current = None
+        if self._loaded_map is not None:
+            try:
+                current = self._loaded_map()
+            except Exception:  # noqa: BLE001 - fall back to the admin list
+                current = None
+        current = current or map_weapons.current_map_from_missions(missions)
         before = self.map_weapons.current_map
         self.map_weapons.on_next(map_weapons.next_map_from_missions(missions))
         self.map_weapons.on_map(current)
         if current and current != before:
             self._refresh_map_current()
+            self._refresh_grid_source()
 
     def _on_map_enabled(self, checked):
         if self.map_weapons is not None:
@@ -8451,6 +8603,7 @@ class WeaponsTab(QWidget):
         keeper = self.map_weapons
         if keeper is None:
             return
+        self._show_server_weapons()                  # it saves the server's weapons: show those
         current = keeper.current_map
         entries = list(self.server.weapon_entries)
         if not current or not entries:
@@ -8545,7 +8698,13 @@ class WeaponsTab(QWidget):
             self.weapon_table.setRowHidden(row, not self._weapon_matches(weapon, text))
 
     def update_weapons(self, weapons):
-        """Render the authoritative ADMDEF list returned by retail."""
+        """The authoritative ADMDEF list returned by retail.  Shown unless the grid
+        is showing a saved map's rule (then it only keeps the rows in step)."""
+        self._live_weapons = list(weapons)
+        rule = self._viewed_rule()
+        self._render_weapons(self._live_weapons if rule is None else self._rule_entries(rule))
+
+    def _render_weapons(self, weapons):
         weapons = list(weapons)
         same_rows = (
             self.weapon_table.rowCount() == len(weapons)
@@ -8573,7 +8732,7 @@ class WeaponsTab(QWidget):
             self.weapon_table.insertRow(i)
 
             w_item = QTableWidgetItem(
-                f"{weapon.name}  [ADMDEF {weapon.admdef_id}]"
+                f"{weapon.name}  [ADMDEF {weapon.admdef_id}]" if weapon.admdef_id >= 0 else weapon.name
             )
             self.weapon_table.setItem(i, 0, w_item)
 
@@ -8614,6 +8773,10 @@ class WeaponsTab(QWidget):
             3: WeaponMode.NEVER,
         }[col]
         weapon = self._weapons_by_row[row]
+        rule = self._viewed_rule()
+        if rule is not None:
+            self._edit_rule(rule, {weapon.name: mode}, single=weapon)
+            return
         self._note_manual_weapon_change()
         submit_admin(
             self,
@@ -8626,6 +8789,11 @@ class WeaponsTab(QWidget):
         )
 
     def _set_all_weapons(self, mode):
+        rule = self._viewed_rule()
+        if rule is not None:
+            self._edit_rule(rule, {w.name: mode for w in self._weapons_by_row}, all_mode=mode)
+            self._render_weapons(self._rule_entries(rule))
+            return
         self._note_manual_weapon_change()
         submit_admin(
             self,
@@ -9866,7 +10034,9 @@ class MainWindow(QMainWindow):
         self.weapons_tab.attach_map_weapons(
             self.map_weapons, display_name=self.missions_tab._find_display_name,
             map_list=lambda: [(m.get('file', ''), m.get('name', ''))
-                              for m in self.missions_store._data.get('available', [])])
+                              for m in self.missions_store._data.get('available', [])],
+            loaded_map=lambda: (self.weather_tab.loaded_map()
+                                if getattr(self, 'weather_tab', None) is not None else None))
         self.signals.missions_signal.connect(self.weapons_tab.on_missions_updated)
         self.signals.connected_signal.connect(self.map_weapons.on_connected)
         # The next map's weapons go on before it loads (players' weapon menus

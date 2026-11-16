@@ -755,6 +755,15 @@ class WeatherTab(QWidget):
         settled = connected and not self._map_changing
         return map_name, int(info.get("players") or 0), settled
 
+    def loaded_map(self) -> Optional[str]:
+        """The map file the server really has loaded (its own memory), or None when
+        WolfRAT can't read the server (not on the server's PC).  Map Weapons uses it:
+        the admin list only tags <CURRENT MISSION> when the running map is in the
+        rotation (2026-11-16: DM-Nuke130 ran outside the rotation, Map Weapons
+        had no current map for three minutes)."""
+        watch = self._read_map_watch()
+        return watch.name if watch is not None else None
+
     def _read_map_watch(self) -> Optional[map_timeline.MapWatch]:
         """The server's own idea of its map, None without a server to read.  A read
         that fails keeps the last answer, or one bad read would look like a map change."""
