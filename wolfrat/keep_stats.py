@@ -296,7 +296,8 @@ def status_text(keeper: StatsKeeper) -> str:
         return "Waiting - needs the server running on this PC."
     saved = keeper.saved
     count = keeper.tracking
-    text = f"On - tracking {count} player{'' if count == 1 else 's'}."
+    text = (f"On - a player who disconnects gets this round's stats back when they rejoin. "
+            f"Watching {count} player{'' if count == 1 else 's'}.")
     if saved:
         names = ", ".join(f"{name} ({s.kills}/{s.deaths})" for name, s in sorted(saved.items()))
         text += f" Waiting to rejoin: {names}."

@@ -146,6 +146,12 @@ class Career:
     def headshot_percent(self) -> int:
         return round(100 * self.headshots / self.kills) if self.kills > 0 else 0
 
+    @property
+    def kd(self) -> float:
+        """Kills / deaths, as the old !kd line worked it out (app.py PlayerStatsStore):
+        no deaths yet = the kill count."""
+        return round(self.kills / self.deaths, 2) if self.deaths > 0 else float(self.kills)
+
 
 _COLUMNS = tuple(f.name for f in fields(Career))
 _NUMBERS = tuple(c for c in _COLUMNS if c not in ("name", "first_seen", "last_seen"))
@@ -430,9 +436,19 @@ def rank_line(name: str, place: int, players: int, xp: int, ranks: Sequence[Rank
     return _first_fit(candidates, limit)
 
 
-def _stat_parts(career: Career, short: bool, played: str = "Played ") -> tuple:
+def kd_text(career: Career) -> str:
+    """1.21, 0.50, 12.00; 1000 and up without decimals (no deaths and a lot of kills)."""
+    kd = career.kd
+    return f"{kd:.2f}" if kd < 1000 else compact(int(kd))
+
+
+def _stat_parts(career: Career, short: bool, played: str = "Played ", totals: bool = True) -> tuple:
+    """totals=False leaves the kills/deaths counts out of K/D and keeps the ratio."""
     n = compact if short else str
-    first = (f"K/D {n(career.kills)}/{n(career.deaths)}",
+    kd = f"K/D {kd_text(career)}"
+    if totals:
+        kd += f" ({n(career.kills)}/{n(career.deaths)})"
+    first = (kd,
              f"HS {n(career.headshots)} {career.headshot_percent}%",
              f"KK {n(career.knife_kills)}")
     second = (f"Streak {n(career.best_streak)}", f"Revives {n(career.revives)}", f"Heals {n(career.heals)}",
@@ -444,8 +460,8 @@ def _colour_stats(career: Career, limit: int) -> Optional[list]:
     """Every stat in its own colour.  Eight colours are 72 characters of codes, more
     than one line has to spare, so the coloured reply is always two lines."""
     who = _c(NAME_COLOUR, colour_name(career.name))
-    for short in (False, True):
-        first, second = _stat_parts(career, short)
+    for short, totals in ((False, True), (True, True), (True, False)):
+        first, second = _stat_parts(career, short, totals=totals)
         parts = [_c(shade, part) for shade, part in zip(STAT_COLOURS, first + second)]
         head, tail = " ".join([who] + parts[:len(first)]), " ".join(parts[len(first):])
         if fits(head, limit) and fits(tail, limit):
@@ -469,8 +485,10 @@ def stats_lines(career: Career, limit: int, colour: bool = False) -> list:
         if fits(whole, limit):
             return [whole]
     heads, tails = [], []
-    for short, bar, played in ((False, " | ", "Played "), (False, " | ", ""), (True, " | ", ""), (True, " ", "")):
-        first, second = _stat_parts(career, short, played)
+    for short, bar, played, totals in ((False, " | ", "Played ", True), (False, " | ", "", True),
+                                       (True, " | ", "", True), (True, " | ", "", False),
+                                       (True, " ", "", False)):
+        first, second = _stat_parts(career, short, played, totals)
         heads.append(f"{name}: " + bar.join(first))
         tails.append(bar.join(second))
     return [_first_fit(heads, limit), _first_fit(tails, limit)]
@@ -491,5 +509,5 @@ def rank_up_line(name: str, rank: Rank, limit: int, colour: bool = False,
 
 
 __all__ = ["Career", "CareerStore", "CareerTracker", "DEFAULT_RANKS", "Rank", "build_ranks", "chat_safe", "compact",
-           "fits", "next_rank", "tier_colour", "played_text", "rank_for", "rank_line", "rank_up_line", "stats_lines",
+           "fits", "kd_text", "next_rank", "tier_colour", "played_text", "rank_for", "rank_line", "rank_up_line", "stats_lines",
            "xp_text"]

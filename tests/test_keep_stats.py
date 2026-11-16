@@ -429,7 +429,7 @@ def test_status_text(server, keeper):
     server.play(1, kills=4, deaths=2)
     server.join(2, "Stays")
     keeper.tick(server)
-    assert "tracking 2 players" in status_text(keeper)
+    assert "Watching 2 players" in status_text(keeper)
     server.leave(1)
     keeper.tick(server)
     assert "Gone (4/2)" in status_text(keeper)
@@ -558,7 +558,8 @@ keep_alive = []
 
 def test_the_box_starts_ticked_and_remembers_being_unticked(panel_class, tmp_path):
     panel = panel_class(str(tmp_path))
-    assert panel.save_box.isChecked() and panel.save_box.text() == "Save player stats"
+    assert panel.save_box.isChecked() and panel.save_box.text() == "Restore disconnected stats"
+    assert panel.title() == "Restore disconnected stats"
     assert panel.wants_write()
     panel.save_box.setChecked(False)
     assert not panel.wants_write()
@@ -576,7 +577,7 @@ def test_the_panel_only_writes_on_a_writable_handle(panel_class, tmp_path, serve
     assert panel.keeper.tracking == 0 and "Waiting" in panel.status_lbl.text()
     panel.server_tick(server, True)
     panel._tick()
-    assert panel.keeper.tracking == 1 and "tracking 1 player." in panel.status_lbl.text()
+    assert panel.keeper.tracking == 1 and "Watching 1 player." in panel.status_lbl.text()
     server.leave(1)
     panel._tick()
     server.join(2, "Gone")

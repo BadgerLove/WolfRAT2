@@ -6036,7 +6036,7 @@ class ModsTab(QWidget):
             ("!skip", "Vote to skip the current map", False),
             ("!yes", "Vote yes on the current vote", False),
             ("!switch", "Switch your own team", False),
-            ("!stats [player]", "Kills/deaths, headshots, knife kills, best streak, medic revives "
+            ("!stats [player]", "K/D ratio and kills/deaths, headshots, knife kills, best streak, medic revives "
              "and heals, zone takeovers and time played (!kd gives the same)", False),
             ("!rank [player]", "Place on the server, rank and XP", False),
             ("!list", "Show the map rotation", False),

@@ -1,4 +1,6 @@
-"""The "Save player stats" box in the Players tab.
+"""The "Restore disconnected stats" box in the Players tab (was "Player Stats" /
+"Save player stats" until 2.10.19: Dale renamed it so it is not confused with the
+Stats, XP and ranks box beside it).
 
 Owns the settings file and the `StatsKeeper`.  It borrows the Weather tab's server
 handle as a server ticker (see ``WeatherTab._server_tickers``); the main window
@@ -24,7 +26,7 @@ class KeepStatsPanel(QGroupBox):
     def __init__(self, folder: str, log: Callable[[str], None] = lambda _text: None,
                  restored: Callable[[str, int, int], None] = lambda _n, _k, _d: None,
                  parent=None) -> None:
-        super().__init__("Player Stats", parent)
+        super().__init__("Restore disconnected stats", parent)
         self._path = os.path.join(folder, SETTINGS_FILE)
         self.keeper = StatsKeeper(log=log, restored=restored)
         self.keeper.enabled = self._load().get("enabled", True) is not False
@@ -55,7 +57,7 @@ class KeepStatsPanel(QGroupBox):
     # ---- UI -------------------------------------------------------------------------
     def _build(self) -> None:
         layout = QVBoxLayout(self)
-        self.save_box = QCheckBox("Save player stats")
+        self.save_box = QCheckBox("Restore disconnected stats")
         self.save_box.setChecked(self.keeper.enabled)
         self.save_box.setToolTip(
             "Everyone's kills, deaths and exp points are saved while they play.\n"

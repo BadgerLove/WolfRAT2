@@ -243,6 +243,16 @@ DALE = Career(name="BadgerLove", xp=412000, kills=6056, deaths=5000, headshots=6
               revives=310, heals=900, zones=40, best_streak=23, seconds=142 * 3600)
 
 
+def test_kd_ratio_works_like_the_old_kd_line():
+    # kills / deaths to 2 places; no deaths = the kill count (app.py PlayerStatsStore)
+    assert DALE.kd == 1.21 and career.kd_text(DALE) == "1.21"
+    assert career.kd_text(Career(name="a", kills=1, deaths=2)) == "0.50"
+    assert career.kd_text(Career(name="a", kills=7)) == "7.00"
+    assert career.kd_text(Career(name="a")) == "0.00"
+    assert career.kd_text(Career(name="a", kills=12345)) == "12.3k"
+    assert career.stats_lines(Career(name="Rookie", kills=7), 59)[0] == "Rookie: K/D 7.00 (7/0) | HS 0 0% | KK 0"
+
+
 def test_xp_is_written_in_thousands():
     assert [career.xp_text(v) for v in (0, 950, 1000, 1234, 41200, 412300, 1000000, 1234567)] == [
         "0", "950", "1k", "1.2k", "41.2k", "412k", "1M", "1.23M"]
@@ -250,7 +260,7 @@ def test_xp_is_written_in_thousands():
 
 def test_the_stats_reply_is_two_lines_on_a_stock_server():
     assert career.stats_lines(DALE, 59) == [
-        "BadgerLove: K/D 6056/5000 | HS 605 10% | KK 400",
+        "BadgerLove: K/D 1.21 (6056/5000) | HS 605 10% | KK 400",
         "Streak 23 | Revives 310 | Heals 900 | Zones 40 | 142h",
     ]
 
@@ -258,12 +268,14 @@ def test_the_stats_reply_is_two_lines_on_a_stock_server():
 def test_the_stats_reply_is_one_line_on_long_chat():
     # with bars it is 25 words, over the server's 23 a line, so commas
     assert career.stats_lines(DALE, 118) == [
-        "BadgerLove: K/D 6056/5000, HS 605 10%, KK 400, Streak 23, Revives 310, Heals 900, Zones 40, Played 142h"]
+        "BadgerLove: K/D 1.21 (6056/5000), HS 605 10%, KK 400, Streak 23, Revives 310, Heals 900, Zones 40, "
+        "Played 142h"]
 
 
 def test_big_numbers_are_shortened_to_stay_on_two_lines():
+    # no room for the kills/deaths counts: the ratio stays
     assert career.stats_lines(BIG, 59) == [
-        "FMJ-BadgerLove123: K/D 123k/98.8k | HS 45.7k 37% | KK 12.3k",
+        "FMJ-BadgerLove123: K/D 1.25 | HS 45.7k 37% | KK 12.3k",
         "Streak 123 Revives 23.5k Heals 98.8k Zones 12.3k 5000h",
     ]
 
@@ -303,7 +315,7 @@ def test_the_rank_reply_in_colour():
 
 def test_the_stats_reply_in_colour_is_two_lines():
     assert career.stats_lines(DALE, 118, colour=True) == [
-        "<cffff00>BadgerLove <c00ff00>K/D 6056/5000 <cff3030>HS 605 10% <cff8000>KK 400",
+        "<cffff00>BadgerLove <c00ff00>K/D 1.21 (6056/5000) <cff3030>HS 605 10% <cff8000>KK 400",
         "<cff80c0>Streak 23 <c00ffff>Revives 310 <c40c0ff>Heals 900 <c8080ff>Zones 40 <cc0c0c0>Played 142h",
     ]
 
