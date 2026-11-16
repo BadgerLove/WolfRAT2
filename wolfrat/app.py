@@ -1393,7 +1393,22 @@ class PlayersTab(QWidget):
         self._build_ui()
 
     def _build_ui(self):
-        layout = QVBoxLayout(self)
+        # Three pages (Dale 2026-11-16): Players = the list and Admin Actions; Team
+        # Balance; Stats = Restore disconnected stats + Stats, XP and ranks (the
+        # main window fills it through stats_layout).  With everything under the
+        # list, a 1024x768 screen squashed the list to one row (JustAPlayer).
+        outer = QVBoxLayout(self)
+        self.pages = QTabWidget()
+        outer.addWidget(self.pages)
+        players_page = QWidget()
+        layout = QVBoxLayout(players_page)
+        self.pages.addTab(players_page, "Players")
+        balance_page = QWidget()
+        balance_page_layout = QVBoxLayout(balance_page)
+        self.pages.addTab(balance_page, "Team Balance")
+        stats_page = QWidget()
+        self.stats_layout = QVBoxLayout(stats_page)
+        self.pages.addTab(stats_page, "Stats")
 
         # Player table - model/view for zero-flicker updates
         self.model = PlayerTableModel()
@@ -1403,7 +1418,7 @@ class PlayersTab(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(False)
-        layout.addWidget(self.table)
+        layout.addWidget(self.table, 1)          # the list takes whatever room is left
 
         # Admin actions
         actions_group = QGroupBox("Admin Actions")
@@ -1478,7 +1493,8 @@ class PlayersTab(QWidget):
         balance_layout.addLayout(balance_btn_layout)
         self.balance_layout = balance_layout   # the main window adds the Automatic row
         balance_group.setLayout(balance_layout)
-        layout.addWidget(balance_group)
+        balance_page_layout.addWidget(balance_group)
+        balance_page_layout.addStretch(1)
 
     def _get_selected_player_target(self):
         rows = self.table.selectionModel().selectedRows()
@@ -9364,7 +9380,7 @@ class MainWindow(QMainWindow):
             log=_keep_stats_log,
             restored=self.spree_tab.note_stats_restored,
         )
-        self.players_tab.layout().addWidget(self.keep_stats_panel)
+        self.players_tab.stats_layout.addWidget(self.keep_stats_panel)
         self.weather_tab.add_server_ticker(self.keep_stats_panel)
 
         # Lifetime stats, XP and ranks (career.py), fed by the same once-a-second read.
@@ -9383,7 +9399,8 @@ class MainWindow(QMainWindow):
             chat_limit=chat_limit,
             colour=extended_chat,
         )
-        self.players_tab.layout().addWidget(self.career_panel)
+        self.players_tab.stats_layout.addWidget(self.career_panel)
+        self.players_tab.stats_layout.addStretch(1)
         self.keep_stats_panel.set_watcher(self.career_panel.observe)
         self.mods_tab.career_panel = self.career_panel
 
