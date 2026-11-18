@@ -33,6 +33,7 @@ PERMISSION_GROUPS = (
         ("startgame", "!startgame - end the start delay (game in 5 s)", ("!startgame",)),
         ("next", "!next - skip to the next map", ("!next",)),
         ("map", "!map - switch to any map", ("!map",)),
+        ("setnext", "!setnext - choose the next map (no skip)", ("!setnext",)),
         ("gametime", "!gametime - set the game time", ("!gametime",)),
         ("time", "!time - set the time of day", ("!time",)),
     )),

@@ -10,7 +10,7 @@ from wolfrat.mod_ranks import (
 )
 
 GUARDED = {
-    '!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map', '!add',
+    '!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map', '!setnext', '!add',
     '!remove', '!startvote', '!startgame', '!mixteams', '!balanceteams', '!time',
     '!gametime', *weather.CHAT_COMMANDS,
 }

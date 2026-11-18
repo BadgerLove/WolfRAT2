@@ -6018,6 +6018,8 @@ class ModsTab(QWidget):
              "(the server must run on this PC)", False),
             ("!next", "Skip to the next map", False),
             ("!map <name>", "Switch to a map", False),
+            ("!setnext <name>", "Make a map the next one, without skipping this one "
+             "(added to the rotation if it isn't in it)", False),
             ("!gametime <1-240>", "Set the game time in minutes", False),
             ("!time <0000-2300>", "Set time of day (!time 930 becomes 1000)", False),
         )),
@@ -6555,7 +6557,7 @@ class ModsTab(QWidget):
             return
 
         # If it's a ! command but not recognized, tell them
-        valid_commands = {'!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map', '!add', '!remove', '!1', '!2', '!3', '!4', '!5', '!startvote', '!startgame', '!mixteams', '!balanceteams', '!time', '!gametime', *weather.CHAT_COMMANDS}
+        valid_commands = {'!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map', '!setnext', '!add', '!remove', '!1', '!2', '!3', '!4', '!5', '!startvote', '!startgame', '!mixteams', '!balanceteams', '!time', '!gametime', *weather.CHAT_COMMANDS}
         if cmd not in valid_commands:
             self._reply_privately(
                 sender, whisper.UNKNOWN, f"Unknown command: {cmd}", "Send unknown command response"
@@ -6890,6 +6892,52 @@ class ModsTab(QWidget):
             else:
                 map_not_found(map_name)
                 self.mod_log.addItem(f"[{now}] {sender} tried !map but '{map_name}' not found")
+
+        elif cmd == '!setnext':
+            # Queue a map as the next one without skipping the current one
+            # (Dale, 2026-11-18).  Same MISSION SETNEXT as the Missions tab's
+            # Queue Next; a map not in the rotation is added first.
+            map_name = ' '.join(args) if args else ''
+            if not map_name:
+                self._send_mod_chat("Usage: !setnext <map>", "Send setnext usage")
+                return
+            name, filename, source = find_map(map_name)
+            if not (name and filename):
+                map_not_found(map_name)
+                self.mod_log.addItem(f"[{now}] {sender} tried !setnext but '{map_name}' not found")
+                return
+            queued = [
+                m for m in self.server.mission_entries
+                if m.filename.casefold() == filename.casefold()
+            ]
+            if len(queued) > 1:
+                self._send_mod_chat(
+                    f"Map is queued more than once: {name}",
+                    "Reject ambiguous next mission",
+                )
+                self.mod_log.addItem(f"[{now}] {sender} tried !setnext {name} - queued more than once")
+                return
+            if not queued and source == "rotation":
+                self._send_mod_chat(
+                    f"Map queue changed: {name}",
+                    "Reject stale next mission",
+                )
+                return
+            add_first = not queued
+            self._submit_mod_action(
+                lambda: self.server.set_next_mission(
+                    filename, add_if_missing=add_first
+                ),
+                context=f"Queue mission {name} as next",
+                announcement=(
+                    f"Next map: {name} (added to rotation)" if add_first
+                    else f"Next map: {name}"
+                ),
+                log_message=(
+                    f"[{now}] {sender} set next map to {name}"
+                    + (" (added to rotation)" if add_first else "")
+                ),
+            )
 
         elif cmd == '!add':
             map_name = ' '.join(args) if args else ''
