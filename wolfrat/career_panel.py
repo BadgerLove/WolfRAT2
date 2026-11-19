@@ -24,7 +24,8 @@ SETTINGS_FILE = "wolfrat_career.json"
 DATABASE_FILE = "wolfrat_career.db"
 FLUSH_MS = 10000
 LINKED_SECONDS = 5.0
-DEFAULTS = {"track": True, "stats": True, "rank": True, "announce": True, "announce_from": 6}
+DEFAULTS = {"track": True, "stats": True, "rank": True, "announce": True, "announce_from": 6,
+            "tone": True}
 
 
 class RanksDialog(QDialog):
@@ -94,13 +95,16 @@ class CareerPanel(QGroupBox):
     def __init__(self, folder: str, log: Callable[[str], None] = lambda _text: None,
                  announce: Callable[[str], None] = lambda _text: None,
                  chat_limit: Callable[[], int] = lambda: 59,
-                 colour: Callable[[], bool] = lambda: False, parent=None) -> None:
+                 colour: Callable[[], bool] = lambda: False,
+                 tone: Callable[[str, str], bool] = lambda _name, _text: False,
+                 parent=None) -> None:
         super().__init__("Stats, XP and ranks", parent)
         self._path = os.path.join(folder, SETTINGS_FILE)
         self._log = log
         self._announce = announce
         self._chat_limit = chat_limit
         self._colour = colour            # long chat server: the lines go out in colour
+        self._tone = tone                # (name, line) -> True when the line went out with the sound
         saved = self._load()
         self._settings = {key: saved.get(key, default) for key, default in DEFAULTS.items()}
         self._ranks = build_ranks(saved.get("ranks") or career.DEFAULT_RANKS)
@@ -150,6 +154,10 @@ class CareerPanel(QGroupBox):
         self._observed_at = time.monotonic()
         self.tracker.observe(slots, rebased)
 
+    def tone_wanted(self) -> bool:
+        """Rank-up lines should go out with the sound for the promoted player."""
+        return self.tracking and bool(self._settings["announce"]) and bool(self._settings["tone"])
+
     def linked(self) -> bool:
         return self._observed_at is not None and time.monotonic() - self._observed_at < LINKED_SECONDS
 
@@ -178,7 +186,12 @@ class CareerPanel(QGroupBox):
     def _ranked_up(self, name: str, rank: Rank) -> None:
         self._log(f"{name} reached rank {rank.number} {rank.name}")
         if self._settings["announce"] and self._settings["rank"] and rank.number >= int(self._settings["announce_from"]):
-            self._announce(career.rank_up_line(name, rank, self._chat_limit(), self._colour(), self._ranks))
+            line = career.rank_up_line(name, rank, self._chat_limit(), self._colour(), self._ranks)
+            # The sound for the promoted player only, the same line for everyone else;
+            # the normal chat line when the sound cannot go out.
+            if self._settings["tone"] and self._tone(name, line):
+                return
+            self._announce(line)
 
     # ---- UI -------------------------------------------------------------------------
     def _build(self) -> None:
@@ -214,6 +227,12 @@ class CareerPanel(QGroupBox):
         row.addWidget(self.ranks_btn)
         row.addStretch(1)
         layout.addLayout(row)
+        self.tone_box = self._tick_box(
+            "Rank-up sound - only the player who ranks up hears it", "tone",
+            "The game's own message sound plays for the promoted player; everyone else\n"
+            "sees the same rank-up line without it. Needs the server on this PC;\n"
+            "otherwise the rank up goes out as a normal chat line.")
+        layout.addWidget(self.tone_box)
         self.status_lbl = QLabel()
         self.status_lbl.setWordWrap(True)
         layout.addWidget(self.status_lbl)
@@ -235,7 +254,7 @@ class CareerPanel(QGroupBox):
 
     def _follow_track(self) -> None:
         on = bool(self._settings["track"])
-        for widget in (self.stats_box, self.rank_box, self.announce_box, self.from_spin):
+        for widget in (self.stats_box, self.rank_box, self.announce_box, self.from_spin, self.tone_box):
             widget.setEnabled(on)
 
     def _from_changed(self, value: int) -> None:

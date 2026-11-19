@@ -29,6 +29,7 @@ from wolfrat import whisper
 from wolfrat import join_country
 from wolfrat import map_weapons
 from wolfrat import lag_comp
+from wolfrat import rank_tone
 from wolfrat.weather_tab import WeatherTab, scroll_column
 from wolfrat.mod_entrance_panel import ModEntrancePanel
 from wolfrat.mod_ranks import ModRoster
@@ -9560,13 +9561,31 @@ class MainWindow(QMainWindow):
                 return
             self.mods_tab._send_mod_chat(text, "Rank up announcement")
 
+        def _career_tone(name, text):
+            # True = handled: sent with the sound, or skipped like the announcement.
+            if manual_mode.skip("Rank announcements"):
+                return True
+            sent = self.rank_tone.queue_line(name, text)
+            if sent:
+                wire_log(f"[CAREER] rank up with sound for {name}: {text}")
+            return sent
+
         self.career_panel = CareerPanel(
             os.path.dirname(str(self.runtime.path("wolfrat_career.json"))),
             log=_career_log,
             announce=_career_announce,
             chat_limit=chat_limit,
             colour=extended_chat,
+            tone=_career_tone,
         )
+        # The rank-up sound for the promoted player only (rank_tone.py).
+        self.rank_tone = rank_tone.RankTone(
+            str(self.runtime.data_dir),
+            enabled=self.career_panel.tone_wanted,
+            quiet=manual_mode.quiet,
+            log=_career_log,
+        )
+        self.weather_tab.add_server_ticker(self.rank_tone)
         self.players_tab.stats_layout.addWidget(self.career_panel)
         self.players_tab.stats_layout.addStretch(1)
         self.keep_stats_panel.set_watcher(self.career_panel.observe)
