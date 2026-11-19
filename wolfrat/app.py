@@ -30,6 +30,7 @@ from wolfrat import join_country
 from wolfrat import map_weapons
 from wolfrat import lag_comp
 from wolfrat import rank_tone
+from wolfrat import mycmd
 from wolfrat.weather_tab import WeatherTab, scroll_column
 from wolfrat.mod_entrance_panel import ModEntrancePanel
 from wolfrat.mod_ranks import ModRoster
@@ -5685,6 +5686,12 @@ class ModsTab(QWidget):
         self.messages_tab = None  # set by MainWindow cross-tab wiring
         self.lag_comp_panel = None  # set by MainWindow cross-tab wiring (!mycomp)
         self._mycomp_last = {}  # lowercase player name -> time of their last !mycomp
+        self._mycmd_last = {}  # lowercase player name -> time of their last !mycmd
+        # !mycmd: (name, line) -> True when the line went to that player only
+        # (MainWindow points it at the rank-sound helper), and the player
+        # commands this server answers.  None = nothing private can be sent.
+        self.private_line = None
+        self.player_commands = None
         self.roster = ModRoster()  # who is a mod, at which rank
         self._seen_chat_ids = set()  # for dedup
         self._chat_initialized = False
@@ -6062,6 +6069,8 @@ class ModsTab(QWidget):
             ("!ping", "Show your own ping", False),
             ("!mycomp", "Your lag compensation: P ping, R rewind (ms), hits since you "
              "joined, hits it added (or took), and that as a %. Once per 30 s each", False),
+            ("!mycmd", "The commands you may use (your rank's, or the player ones), sent to you "
+             "only - nobody else sees it. Needs the server on this PC", False),
         )),
     )
 
@@ -6364,6 +6373,34 @@ class ModsTab(QWidget):
                 line = panel.mycomp_line(sender, chat_limit())
             self._send_mod_chat(line, "Send mycomp response")
             wire_log(f"[MODS] !mycomp: sent '{line}'")
+            return
+
+        # !mycmd - anyone: the chat commands they may use, to them only (Dale,
+        # 2026-11-19).  Through the rank-sound helper (mycmd.py, rank_tone.py),
+        # never public chat, so nobody sees who holds which rank.  Without the
+        # helper (server not on this PC) nothing is said at all.
+        if cmd == '!mycmd':
+            if sender == 'web_admin':
+                return
+            now_s = time.time()
+            if now_s - self._mycmd_last.get(sender, 0) < mycmd.COOLDOWN:
+                wire_log(f"[MODS] !mycmd: {sender} on cooldown")
+                return
+            self._mycmd_last[sender] = now_s
+            rank = self.roster.rank_of(sender)
+            source = self.player_commands
+            players = source() if source is not None else list(mycmd.PLAYER_COMMANDS)
+            to_player = self.private_line
+            sent = 0
+            for line in mycmd.reply_lines(rank, players, chat_limit()):
+                if to_player is None or not to_player(sender, line):
+                    break
+                sent += 1
+            if sent:
+                wire_log(f"[MODS] !mycmd: {sent} private line(s) to {sender}"
+                         f" ({rank.name if rank else 'no rank'})")
+            else:
+                wire_log(f"[MODS] !mycmd: no private chat for {sender} - nothing said")
             return
 
         # !list - available to ALL players, shows current map rotation
@@ -9626,14 +9663,25 @@ class MainWindow(QMainWindow):
             colour=extended_chat,
             tone=_career_tone,
         )
-        # The rank-up sound for the promoted player only (rank_tone.py).
+        # The rank-up sound for the promoted player only (rank_tone.py).  The
+        # same helper carries !mycmd's private answers, so it is loaded whether
+        # or not the rank sound is ticked (the career panel still decides the
+        # sound itself before it queues a rank-up line).
         self.rank_tone = rank_tone.RankTone(
             str(self.runtime.data_dir),
-            enabled=self.career_panel.tone_wanted,
+            enabled=lambda: True,
             quiet=manual_mode.quiet,
             log=_career_log,
         )
         self.weather_tab.add_server_ticker(self.rank_tone)
+        # !mycmd: the answer goes to the one player through the helper, no sound.
+        self.mods_tab.private_line = lambda name, text: self.rank_tone.queue_line(
+            name, text, tone=-1, everyone=False)
+        self.mods_tab.player_commands = lambda: mycmd.player_commands(
+            vote=self.mods_tab._vote_enabled,
+            skip=self.mods_tab._skip_enabled,
+            switch=self.chatbot_tab.swap_trigger if self.chatbot_tab.auto_swap_enabled else None,
+        )
         self.players_tab.stats_layout.addWidget(self.career_panel)
         self.players_tab.stats_layout.addStretch(1)
         self.keep_stats_panel.set_watcher(self.career_panel.observe)
