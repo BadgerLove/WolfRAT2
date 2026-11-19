@@ -6392,7 +6392,9 @@ class ModsTab(QWidget):
             players = source() if source is not None else list(mycmd.PLAYER_COMMANDS)
             to_player = self.private_line
             sent = 0
-            for line in mycmd.reply_lines(rank, players, chat_limit()):
+            # Helper lines skip the admin path's 59 cut and colour strip, so the
+            # limit is the player's chat line (mycmd.LINE_LIMIT), not chat_limit().
+            for line in mycmd.reply_lines(rank, players):
                 if to_player is None or not to_player(sender, line):
                     break
                 sent += 1

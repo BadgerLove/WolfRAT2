@@ -1,58 +1,83 @@
-"""!mycmd: the commands a player may use, sent to that player only (Dale, 2026-11-19)."""
+"""!mycmd: the commands a player may use, sent to that player only, in colour (Dale, 2026-11-19)."""
+import re
 import time
 
 from tests.test_mod_ranks_tab import Rig
 from wolfrat import mycmd
 from wolfrat.mod_ranks import ADMIN, ALL_PERMISSIONS, MODERATOR, Rank
 
+CODE = re.compile(r"<c[0-9a-f]{6}>")
+
+
+def read(lines):
+    """What the player reads, all lines run together."""
+    return " ".join(mycmd.plain(line) for line in lines)
+
 
 # ---- the answer itself -------------------------------------------------------
 
-def test_admin_gets_every_command_and_every_line_fits_both_limits():
+def test_admin_gets_every_command_and_every_line_fits_with_the_codes_counted():
     admin = Rank(ADMIN, frozenset(ALL_PERMISSIONS))
-    for limit in (59, 118):
-        lines = mycmd.reply_lines(admin, [], limit)
-        assert lines[0].startswith("Your commands (Admin): !startvote")
-        assert all(len(line) <= limit for line in lines)
-        words = " ".join(lines).split()
-        for command in ("!setnext", "!ban", "!unban", "!storm", "!clear", "!remove"):
-            assert command in words
-    # Long chat needs fewer lines than stock chat.
-    assert len(mycmd.reply_lines(admin, [], 118)) < len(mycmd.reply_lines(admin, [], 59))
-    assert len(mycmd.reply_lines(admin, [], 59)) <= mycmd.MAX_LINES
+    lines = mycmd.reply_lines(admin, [])
+    assert mycmd.plain(lines[0]).startswith("Your commands (Admin): !startvote")
+    assert all(len(line) <= mycmd.LINE_LIMIT for line in lines)     # codes included
+    words = read(lines).split()
+    for command in ("!setnext", "!ban", "!unban", "!storm", "!clear", "!sky", "!remove"):
+        assert command in words
+    assert len(lines) <= 4
+
+
+def test_every_line_starts_with_a_colour_and_codes_only_where_it_changes():
+    admin = Rank(ADMIN, frozenset(ALL_PERMISSIONS))
+    lines = mycmd.reply_lines(admin, [])
+    assert lines[0].startswith("<cffff00>Your commands (Admin): <c40c0ff>!startvote")
+    for line in lines:
+        assert CODE.match(line)                       # a new chat line starts white
+        codes = CODE.findall(line)
+        assert all(a != b for a, b in zip(codes, codes[1:]))   # no wasted repeat
+    joined = " ".join(lines)
+    assert "<cff3030>!warn" in joined and "<c00ffff>!storm" in joined and "<cff80c0>!add" in joined
+
+
+def test_a_tight_limit_still_counts_the_codes_and_never_splits_a_word():
+    admin = Rank(ADMIN, frozenset(ALL_PERMISSIONS))
+    lines = mycmd.reply_lines(admin, [], 59)
+    assert all(len(line) <= 59 for line in lines)
+    assert read(lines).split() == read(mycmd.reply_lines(admin, [])).split()
 
 
 def test_moderator_gets_only_their_rank_and_not_admin_commands():
     mod = Rank(MODERATOR, frozenset({"next", "kick", "warn"}))
-    lines = mycmd.reply_lines(mod, ["!stats"], 59)
-    assert lines == ["Your commands (Moderator): !next !warn !kick"]
+    lines = mycmd.reply_lines(mod, ["!stats"])
+    assert lines == ["<cffff00>Your commands (Moderator): <c40c0ff>!next <cff3030>!warn !kick"]
 
 
 def test_made_up_rank_gets_its_own_commands():
     guest = Rank("Guest", frozenset({"startvote", "lightning"}))
-    assert mycmd.reply_lines(guest, [], 118) == ["Your commands (Guest): !startvote !lightning"]
+    assert read(mycmd.reply_lines(guest, [])) == "Your commands (Guest): !startvote !lightning"
 
 
 def test_rank_with_nothing_ticked_says_so():
     empty = Rank("Trial", frozenset())
-    assert mycmd.reply_lines(empty, ["!stats"], 59) == ["Your rank (Trial) has no commands ticked."]
+    assert mycmd.reply_lines(empty, ["!stats"]) == ["<cffff00>Your rank (Trial) has no commands ticked."]
 
 
 def test_no_rank_gets_the_player_commands_this_server_has_on():
     on = mycmd.player_commands(vote=True, skip=True, switch="!switch")
-    assert mycmd.reply_lines(None, on, 118) == [
-        "Your commands: !stats !rank !ping !list !vote !yes !skip !switch !mycomp !mycmd"]
+    lines = mycmd.reply_lines(None, on)
+    assert read(lines) == "Your commands: !stats !rank !ping !list !vote !yes !skip !switch !mycomp !mycmd"
+    assert len(lines) == 1 and "<c00ff00>!vote" in lines[0] and "<c40c0ff>!mycomp" in lines[0]
     off = mycmd.player_commands(vote=False, skip=False, switch=None)
     assert off == ["!stats", "!rank", "!ping", "!list", "!mycomp", "!mycmd"]
     assert "!team" in mycmd.player_commands(switch="!team")
 
 
-def test_words_are_never_split_and_lines_never_pass_the_helper():
-    words = ["!" + "x" * 30] * 10
-    for limit in (59, 118, 500):
-        lines = mycmd.wrap("Your commands:", words, limit)
-        assert all(len(line) <= min(limit, mycmd.HELPER_TEXT) for line in lines)
-        assert " ".join(lines).split()[2:] == words[:len(" ".join(lines).split()) - 2]
+def test_long_words_wrap_whole_and_lines_never_pass_the_limit():
+    words = [("40c0ff", "!" + "x" * 40)] * 12
+    lines = mycmd.wrap(("ffff00", "Your commands:"), words)
+    assert all(len(line) <= mycmd.LINE_LIMIT for line in lines)
+    assert len(lines) <= mycmd.MAX_LINES
+    assert all(w == "!" + "x" * 40 for w in read(lines).split()[2:])
 
 
 # ---- the chat command --------------------------------------------------------
@@ -72,34 +97,47 @@ def rig_with(tmp_path, ranks=None):
     return PrivateRig(tmp_path, cfg)
 
 
+def said_privately(rig):
+    return read(text for _, text in rig.private)
+
+
 def test_the_answer_goes_to_the_one_player_only_and_nothing_public(tmp_path):
     rig = rig_with(tmp_path)
     rig.tab._check_mod_command("Ham: !mycmd")
     assert rig.said == [] and rig.actions == []
     assert rig.private and all(name == "ham" for name, _ in rig.private)
-    assert rig.private[0][1].startswith("Your commands (Moderator): ")
-    assert "!ban" not in " ".join(text for _, text in rig.private)
+    assert said_privately(rig).startswith("Your commands (Moderator): ")
+    assert "!ban" not in said_privately(rig)
 
 
 def test_admin_guest_and_player_each_get_their_own_list(tmp_path):
     rig = rig_with(tmp_path)
     rig.tab._check_mod_command("Dale: !mycmd")
-    assert "!ban" in " ".join(text for _, text in rig.private)
+    assert "!ban" in said_privately(rig)
     rig.private.clear()
     rig.tab._check_mod_command("Visitor: !mycmd")
-    assert rig.private == [("visitor", "Your commands (Guest): !startvote")]
+    assert [name for name, _ in rig.private] == ["visitor"]
+    assert said_privately(rig) == "Your commands (Guest): !startvote"
     rig.private.clear()
     rig.tab._check_mod_command("Griefer: !MYCMD")
     assert rig.private[0][0] == "griefer"
-    assert rig.private[0][1].startswith("Your commands: !stats")
+    assert said_privately(rig).startswith("Your commands: !stats")
     assert rig.said == []
+
+
+def test_the_long_line_is_used_on_a_stock_chat_server_too(tmp_path):
+    # Helper lines skip the admin path's 59 cut, so the stock chat setting does not shorten them.
+    rig = rig_with(tmp_path)
+    rig.tab._check_mod_command("Dale: !mycmd")
+    assert len(rig.private) <= 4
+    assert max(len(text) for _, text in rig.private) > 59
 
 
 def test_a_rank_edit_shows_straight_away(tmp_path):
     rig = rig_with(tmp_path)
     rig.tab.roster.rank_of("Visitor").permissions = frozenset({"startvote", "kick"})
     rig.tab._check_mod_command("Visitor: !mycmd")
-    assert rig.private == [("visitor", "Your commands (Guest): !startvote !kick")]
+    assert said_privately(rig) == "Your commands (Guest): !startvote !kick"
 
 
 def test_no_helper_means_nothing_is_said(tmp_path):
