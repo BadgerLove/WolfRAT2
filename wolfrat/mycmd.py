@@ -25,7 +25,7 @@ from typing import Iterable, Optional
 from wolfrat import mod_ranks
 
 COOLDOWN = 10        # seconds between one player's answers
-MAX_LINES = 8        # the helper's queue holds 16; never fill it with one answer
+MAX_LINES = 3        # Dale: the chat shows 3; a 4th only shows in the J history, codes and all
 LINE_LIMIT = 118     # what one helper line carries to the player, colour codes included
 
 # Proven colour codes (colour_codes.py).

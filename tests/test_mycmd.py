@@ -24,7 +24,7 @@ def test_admin_gets_every_command_and_every_line_fits_with_the_codes_counted():
     words = read(lines).split()
     for command in ("!setnext", "!ban", "!unban", "!storm", "!clear", "!sky", "!remove"):
         assert command in words
-    assert len(lines) <= 4
+    assert len(lines) <= mycmd.MAX_LINES == 3                    # Dale: never more than 3
 
 
 def test_every_line_starts_with_a_colour_and_codes_only_where_it_changes():
@@ -39,11 +39,12 @@ def test_every_line_starts_with_a_colour_and_codes_only_where_it_changes():
     assert "<cff3030>!warn" in joined and "<c00ffff>!storm" in joined and "<cff80c0>!add" in joined
 
 
-def test_a_tight_limit_still_counts_the_codes_and_never_splits_a_word():
+def test_a_tight_limit_still_counts_the_codes_and_stops_at_three_lines():
     admin = Rank(ADMIN, frozenset(ALL_PERMISSIONS))
     lines = mycmd.reply_lines(admin, [], 59)
-    assert all(len(line) <= 59 for line in lines)
-    assert read(lines).split() == read(mycmd.reply_lines(admin, [])).split()
+    assert len(lines) == 3 and all(len(line) <= 59 for line in lines)
+    full = read(mycmd.reply_lines(admin, [])).split()
+    assert read(lines).split() == full[:len(read(lines).split())]   # words whole, in order
 
 
 def test_moderator_gets_only_their_rank_and_not_admin_commands():
@@ -129,7 +130,7 @@ def test_the_long_line_is_used_on_a_stock_chat_server_too(tmp_path):
     # Helper lines skip the admin path's 59 cut, so the stock chat setting does not shorten them.
     rig = rig_with(tmp_path)
     rig.tab._check_mod_command("Dale: !mycmd")
-    assert len(rig.private) <= 4
+    assert len(rig.private) <= 3
     assert max(len(text) for _, text in rig.private) > 59
 
 
