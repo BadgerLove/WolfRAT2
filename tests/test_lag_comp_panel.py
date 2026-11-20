@@ -564,3 +564,108 @@ def test_a_half_done_switch_that_cannot_be_repaired_says_so_and_is_not_hammered(
     p.server_tick(_Mem(), writable=True)
     assert len(tries) == 2
     assert sum("did not finish" in line for line in logs) == 1 and not p.on_cb.isChecked()
+
+
+# ------------------------- quick first retries (2026-11-20)
+# Twice a server restart left lag compensation off for about 150 s: the server
+# was not ready for a few seconds ("Could not find kernel32 in the server",
+# "cannot find its settings block") and every retry was 30 s apart.
+
+class _Mem2:
+    pid = 6001
+
+
+def _failing_panel(qtbot, tmp_path, monkeypatch, poll_now=None):
+    import json
+    (tmp_path / "lc.json").write_text(json.dumps(
+        {"on": True, "reapply": True, "auto_enabled_once": True}), encoding="utf-8")
+    now = {"state": lc.State(lc.STOCK), "works": False}
+    clock, calls, logs = [1000.0], [], []
+    monkeypatch.setattr(lc, "loaded_name", lambda data_dir: "wolfrat_lagcomp_test.dll")
+    monkeypatch.setattr(lc, "server_state", lambda pid, name=None: now["state"])
+    monkeypatch.setattr(lc, "reset_stats", lambda pid, name=None: True)
+    monkeypatch.setattr(panel_mod.time, "monotonic", lambda: clock[0])
+
+    def turn_on(pid, memory, data_dir, settings):
+        calls.append(clock[0])
+        if not now["works"]:
+            raise lc.LagCompError("Could not find kernel32 in the server.")
+        now["state"] = _loaded(alive=True)
+        return now["state"]
+    monkeypatch.setattr(lc, "turn_on", turn_on)
+    p = panel_mod.LagCompPanel(tmp_path / "lc.json", tmp_path / "lc_history.json",
+                               tmp_path, log=logs.append, poll_now=poll_now)
+    qtbot.addWidget(p)
+    return p, now, clock, calls, logs
+
+
+def test_first_retries_are_5_s_apart_for_a_minute_then_30_s(qtbot, tmp_path, monkeypatch):
+    p, now, clock, calls, logs = _failing_panel(qtbot, tmp_path, monkeypatch)
+    p.server_tick(_Mem(), writable=True)                       # new server: first try fails
+    assert calls == [1000.0]
+    assert "tries again every 5 s" in p.state_lbl.text() and "NOT running" in p.state_lbl.text()
+    clock[0] = 1004.9
+    p.server_tick(_Mem(), writable=True)                       # not yet
+    assert len(calls) == 1
+    for second in range(1005, 1061, 5):                        # every 5 s through the first minute
+        clock[0] = float(second)
+        p.server_tick(_Mem(), writable=True)
+    assert calls == [float(t) for t in range(1000, 1061, 5)]   # 13 tries in the first 60 s
+    assert "tries again every 30 s" in p.state_lbl.text()      # from now on, as before
+    clock[0] = 1065.0
+    p.server_tick(_Mem(), writable=True)
+    clock[0] = 1089.9
+    p.server_tick(_Mem(), writable=True)
+    assert len(calls) == 13
+    clock[0] = 1090.0
+    p.server_tick(_Mem(), writable=True)
+    assert len(calls) == 14
+    # Never unticked, and the reason is logged once with both speeds.
+    assert p.on_cb.isChecked() and _saved(tmp_path)["on"] is True
+    told = [line for line in logs if "kernel32" in line]
+    assert told == ["Lag compensation: Could not find kernel32 in the server. Still ticked - "
+                    "WolfRAT tries again every 5 s for a minute, then every 30 s."]
+
+
+def test_the_quick_tries_start_again_after_it_worked_or_on_a_new_server(
+        qtbot, tmp_path, monkeypatch):
+    p, now, clock, calls, logs = _failing_panel(qtbot, tmp_path, monkeypatch)
+    p.server_tick(_Mem(), writable=True)
+    clock[0] = 1200.0                                          # failing for over a minute
+    p.server_tick(_Mem(), writable=True)
+    assert "every 30 s" in p.state_lbl.text()
+    now["works"] = True
+    clock[0] = 1230.0
+    p.server_tick(_Mem(), writable=True)                       # works
+    assert p.state_lbl.text().startswith("\U0001F7E2 ON") and not p.wants_write()
+    # The server restarts (a new process) and is not ready: quick tries again.
+    now["works"], now["state"] = False, lc.State(lc.STOCK)
+    clock[0] = 1300.0
+    p.server_tick(_Mem2(), writable=True)
+    assert "tries again every 5 s" in p.state_lbl.text()
+    # A run of failures that has gone slow, then yet another new server: quick again.
+    clock[0] = 1400.0
+    p.server_tick(_Mem2(), writable=True)
+    assert "every 30 s" in p.state_lbl.text()
+    clock[0] = 1401.0
+    p.server_tick(_Mem(), writable=True)
+    assert "tries again every 5 s" in p.state_lbl.text()
+
+
+def test_a_quick_retry_asks_for_a_poll_when_it_is_due(qtbot, tmp_path, monkeypatch):
+    """The Weather tab polls every 5 s: without this a 5 s retry would just miss
+    the next poll and really be 10 s."""
+    polls = []
+    p, now, clock, calls, logs = _failing_panel(qtbot, tmp_path, monkeypatch,
+                                                poll_now=lambda: polls.append(clock[0]))
+    p.server_tick(_Mem(), writable=True)
+    assert p._retry_timer.isActive() and p._retry_timer.interval() == 5050
+    p._retry_poke()                                            # too early: nothing
+    assert polls == []
+    clock[0] = 1005.0
+    p._retry_poke()
+    assert polls == [1005.0]
+    p._retry_timer.stop()
+    clock[0] = 1100.0                                          # slow retries: the normal poll does it
+    p.server_tick(_Mem(), writable=True)
+    assert "every 30 s" in p.state_lbl.text() and not p._retry_timer.isActive()

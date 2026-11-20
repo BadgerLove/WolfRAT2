@@ -37,7 +37,13 @@ BANNER = (
 NO_SERVER = ("Lag compensation needs WolfRAT on the same PC as the game server, connected "
              "to it (Server connection page).")
 RESET_TEXT = "Start counting again"
-RETRY_SECONDS = 30      # a failed switch-on is tried again this often
+RETRY_SECONDS = 30      # a failed switch-on is tried again this often...
+# ...but every 5 s for the first minute of failing.  Twice a server restart left
+# lag compensation off for about 150 s ("Could not find kernel32 in the server",
+# "cannot find its settings block"): the server was simply not ready for a few
+# seconds, and each try was 30 s apart.
+FAST_RETRY_SECONDS = 5
+FAST_RETRY_FOR = 60
 RESET_TIP_ON = "Set every number on this page back to zero and count from now."
 RESET_TIP_OFF = "Nothing to count yet - switch lag compensation on first."
 
@@ -155,6 +161,7 @@ class LagCompPanel(QWidget):
                                      tune_mode).clamp()
         self._dirty = False             # a click waits to be written into the server
         self._retry_at = 0.0            # a failed switch-on tries again from then (0 = none)
+        self._fail_since = 0.0          # when this run of failures began (0 = none)
         self._last_error = ""           # logged once, not every retry
         self._failed_text = ""          # shown while a ticked box is not running
         # Two WolfRATs on one server (review P1): never take the calls BY ITSELF
@@ -184,6 +191,11 @@ class LagCompPanel(QWidget):
         self._settings_timer.setSingleShot(True)
         self._settings_timer.setInterval(900)
         self._settings_timer.timeout.connect(self._settings_settled)
+        # The Weather tab polls every 5 s, so a 5 s retry would just miss the
+        # next poll: ask for one when the retry is due.
+        self._retry_timer = QTimer(self)
+        self._retry_timer.setSingleShot(True)
+        self._retry_timer.timeout.connect(self._retry_poke)
 
     # ------------------------------------------------------------------ UI
     def _build(self):
@@ -415,6 +427,7 @@ class LagCompPanel(QWidget):
         self._takeover = bool(on)       # a deliberate click, not WolfRAT acting by itself
         self._dirty = True
         self._retry_at = 0.0
+        self._fail_since = 0.0
         self._last_error = ""
         self._failed_text = ""
         self._save()
@@ -499,6 +512,10 @@ class LagCompPanel(QWidget):
     def _retry_due(self) -> bool:
         return bool(self._wish_on and self._retry_at and time.monotonic() >= self._retry_at)
 
+    def _retry_poke(self):
+        if self._poll_now and self._retry_due():
+            self._poll_now()
+
     def wants_write(self) -> bool:
         return self._dirty or self._retry_due() or (
             self._wish_on and self._reapply and self._state is not None and not self._state.on
@@ -522,6 +539,8 @@ class LagCompPanel(QWidget):
             return
         new_server = pid != self._pid
         self._pid = pid
+        if new_server:
+            self._fail_since = 0.0      # a new server gets the quick first tries again
         self.server_lbl.setText(f"\U0001F5A5 Game server on this PC (process {pid}).")
         self._set_available(True)
         try:
@@ -610,21 +629,30 @@ class LagCompPanel(QWidget):
             # Never untick on a failure: the admin asked for it on, so it stays
             # ticked (and saved) and WolfRAT keeps trying.  Unticking here once
             # left a server without lag compensation for four days.
+            now = time.monotonic()
+            if not self._fail_since:
+                self._fail_since = now
+            delay = (FAST_RETRY_SECONDS if now - self._fail_since < FAST_RETRY_FOR
+                     else RETRY_SECONDS)
             if str(exc) != self._last_error:
                 self._last_error = str(exc)
                 self._log("Lag compensation: " + str(exc)
                           + (" Still ticked - WolfRAT tries again every "
+                             f"{FAST_RETRY_SECONDS} s for a minute, then every "
                              f"{RETRY_SECONDS} s." if self._wish_on else ""))
             if self._wish_on:
-                self._retry_at = time.monotonic() + RETRY_SECONDS
+                self._retry_at = now + delay
                 self._failed_text = ("⚠ NOT running: " + str(exc) + " The box stays "
-                                     f"ticked; WolfRAT tries again every {RETRY_SECONDS} s.")
+                                     f"ticked; WolfRAT tries again every {delay} s.")
+                if self._poll_now and delay < RETRY_SECONDS:
+                    self._retry_timer.start(delay * 1000 + 50)
             else:
                 self._failed_text = "⚠ " + str(exc)
                 # Not a retry of the click; only paces the repair of a half-done switch.
                 self._retry_at = time.monotonic() + RETRY_SECONDS
             return state
         self._retry_at = 0.0
+        self._fail_since = 0.0
         self._last_error = ""
         self._failed_text = ""
         self._takeover = False
