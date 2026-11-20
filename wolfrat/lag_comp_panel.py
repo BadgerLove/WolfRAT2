@@ -522,7 +522,13 @@ class LagCompPanel(QWidget):
             self.state_lbl.setText("⚠ " + str(exc))
             return
         if new_server and self._wish_on and not state.on and not self._dirty:
-            if self._reapply:
+            if state.kind == lc.OLD:
+                # On already, from another WolfRAT version's helper: the server
+                # did not restart, WolfRAT did (an update).  Carry it on here.
+                self._dirty = True
+                self._log("Lag compensation: it is on from another WolfRAT version - "
+                          "moving it to this one.")
+            elif self._reapply:
                 self._dirty = True
                 self._log("Lag compensation: new server - putting it back on.")
             else:
@@ -603,8 +609,13 @@ class LagCompPanel(QWidget):
             if not st.alive:
                 text += " Waiting for players - an empty server does not run it."
         elif st.kind == lc.OLD:
-            text = ("\U0001F7E1 On, from an older WolfRAT. Tick the box to switch to this "
-                    "version (the numbers start again).")
+            # Another WolfRAT version's helper has the game's calls (older or newer).
+            if self._wish_on:
+                text = ("\U0001F7E1 On, from another WolfRAT version. Untick the box to "
+                        "switch it off.")
+            else:
+                text = ("\U0001F7E1 On, from another WolfRAT version. Tick the box to run "
+                        "it from this one (the numbers start again).")
         else:
             text = "⚪ Off - normal JO hits."
         self.state_lbl.setText(text)

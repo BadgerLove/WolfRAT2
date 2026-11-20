@@ -340,3 +340,84 @@ def test_page_with_the_what_if_box_fits_1024x768(qtbot, tmp_path, monkeypatch):
     assert p.whatif_table.height() >= (p.whatif_table.horizontalHeader().height()
                                        + 6 * 24)               # all six rows show
     tabs.hide()
+
+
+# ------------------------- another WolfRAT version's helper is on (review B3)
+def _other_version_on():
+    return lc.State(lc.OLD, base=0x20000000, shared=0x20008000, ready=True,
+                    settings=lc.Settings(False, 55, 400, 80),
+                    stats=lc.Stats(seconds=600, tests=900, hits=200, plain_hits=150), alive=True)
+
+
+def _switchable(qtbot, tmp_path, monkeypatch, saved, state, elsewhere=False):
+    """A panel over a fake server whose state the test can change; records the
+    turn_on / turn_off calls."""
+    import json
+    (tmp_path / "lc.json").write_text(json.dumps(dict(saved, auto_enabled_once=True)),
+                                      encoding="utf-8")
+    now = {"state": state, "elsewhere": elsewhere}
+    calls, logs = [], []
+    monkeypatch.setattr(lc, "loaded_name", lambda data_dir: "wolfrat_lagcomp_test.dll")
+    monkeypatch.setattr(lc, "server_state", lambda pid, name=None: now["state"])
+    monkeypatch.setattr(lc, "reset_stats", lambda pid, name=None: True)
+    monkeypatch.setattr(lc, "managed_elsewhere", lambda st, **kw: now["elsewhere"],
+                        raising=False)
+
+    def turn_on(pid, memory, data_dir, settings):
+        calls.append("on")
+        now["state"] = _loaded(alive=True)
+        return now["state"]
+
+    def turn_off(pid, memory):
+        calls.append("off")
+        now["state"] = lc.State(lc.STOCK)
+        return now["state"]
+    monkeypatch.setattr(lc, "turn_on", turn_on)
+    monkeypatch.setattr(lc, "turn_off", turn_off)
+    p = panel_mod.LagCompPanel(tmp_path / "lc.json", tmp_path / "lc_history.json",
+                               tmp_path, log=logs.append)
+    qtbot.addWidget(p)
+    return p, now, calls, logs
+
+
+def test_other_versions_helper_shows_as_on_and_the_page_shows_its_numbers(
+        qtbot, tmp_path, monkeypatch):
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch, {"on": False},
+                                      _other_version_on())
+    p.server_tick(_Mem(), writable=True)
+    assert calls == []                                         # unticked: left as it is
+    assert p.state_lbl.text() == ("\U0001F7E1 On, from another WolfRAT version. Tick the box "
+                                  "to run it from this one (the numbers start again).")
+    p._refresh_stats(force=True)
+    assert "<b>200</b> hits" in p.totals_lbl.text()            # that helper's live numbers
+    assert p.reset_btn.isEnabled()
+
+
+def test_unticking_switches_another_versions_helper_off(qtbot, tmp_path, monkeypatch):
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch,
+                                      {"on": True, "reapply": True}, _loaded(alive=True))
+    p.server_tick(_Mem(), writable=True)                       # ours is on
+    now["state"] = _other_version_on()                         # another build took the calls
+    p.server_tick(_Mem(), writable=True)
+    assert calls == []                                         # same server: no tug of war
+    assert p.state_lbl.text() == ("\U0001F7E1 On, from another WolfRAT version. Untick the "
+                                  "box to switch it off.")
+    p.on_cb.setChecked(False)
+    p.server_tick(_Mem(), writable=True)
+    assert calls == ["off"]
+    assert "Off - normal JO hits" in p.state_lbl.text()
+    assert any("OFF" in line for line in logs)
+
+
+def test_after_a_wolfrat_update_the_ticked_box_carries_on_with_this_version(
+        qtbot, tmp_path, monkeypatch):
+    """WolfRAT restarted (an update), the server did not: the old version's
+    helper is still on.  Before, with 'put it back' unticked, the page unticked
+    itself and said the server had restarted and it was off - while it was on."""
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch,
+                                      {"on": True, "reapply": False}, _other_version_on())
+    p.server_tick(_Mem(), writable=True)
+    assert calls == ["on"] and p.on_cb.isChecked() and _saved(tmp_path)["on"] is True
+    assert any("moving it to this one" in line for line in logs)
+    assert not any("restarted and it is off" in line for line in logs)
+    assert p.state_lbl.text().startswith("\U0001F7E2 ON")

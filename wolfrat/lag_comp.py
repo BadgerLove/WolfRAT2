@@ -820,27 +820,36 @@ def _sites(block: _Shared) -> list:
             (block.tick_call, block.tick_func, block.tick_wrap)]
 
 
-def _classify(proc: ServerProcess, mine: Optional[_Helper], helpers: list) -> str:
-    """What the three calls point at now."""
-    ref = mine or (helpers[0] if helpers else None)
-    if ref is None or ref.block.status != 1:
+def _calls(proc: ServerProcess, mine: Optional[_Helper], helpers: list) -> tuple:
+    """(kind, owner): what the three calls point at now, and the loaded helper
+    whose wrappers they are (None for the game's own calls or someone else's).
+
+    Any helper that fits this exe knows where the calls are, so this works when
+    this build's own helper is not loaded (2026-11-19 review, B3)."""
+    usable = [h for h in helpers if h.block.status == 1]
+    ref = mine if (mine is not None and mine.block.status == 1) else (usable[0] if usable else None)
+    if ref is None:
         try:
             if proc.read(_LEG_TAIL[0], len(_LEG_TAIL[1])) == _LEG_TAIL[1]:
                 targets = [_call_target(proc, site) for site, _ in _RETAIL_SITES]
                 if None not in targets and targets != [func for _, func in _RETAIL_SITES]:
-                    return FOREIGN
+                    return FOREIGN, None
         except LagCompError:
             pass
-        return UNKNOWN
+        return UNKNOWN, None
     targets = [_call_target(proc, site) for site, _, _ in _sites(ref.block)]
     if targets == [f for _, f, _ in _sites(ref.block)]:
-        return STOCK
-    if mine and targets == [w for _, _, w in _sites(mine.block)]:
-        return ON
-    for h in helpers:
+        return STOCK, None
+    # This build's helper first, then the others.
+    for h in sorted(usable, key=lambda h: h is not mine):
         if targets == [w for _, _, w in _sites(h.block)]:
-            return OLD
-    return FOREIGN
+            return (ON if h is mine else OLD), h
+    return FOREIGN, None
+
+
+def _classify(proc: ServerProcess, mine: Optional[_Helper], helpers: list) -> str:
+    """What the three calls point at now."""
+    return _calls(proc, mine, helpers)[0]
 
 
 def _call_bytes(site: int, target: int) -> bytes:
@@ -852,7 +861,13 @@ def read_state(proc: ServerProcess, wanted_name: Optional[str] = None) -> State:
     mine = next((h for h in helpers if h.name == wanted_name), None) if wanted_name else None
     if mine is None and helpers and wanted_name is None:
         mine = next((h for h in helpers if _classify(proc, h, helpers) == ON), helpers[-1])
-    kind = _classify(proc, mine, helpers)
+    kind, owner = _calls(proc, mine, helpers)
+    # Another build's helper has the calls: lag compensation is ON, from that
+    # helper.  Show its block (its settings and numbers are the live ones), so
+    # the page says so and unticking the box can switch it off.  Before, with
+    # this build's helper not loaded, this read as "off" (review B3).
+    if kind == OLD and owner is not None:
+        mine = owner
     if mine is None:
         return State(kind if kind in (FOREIGN, STOCK) else UNKNOWN)
     block, stats = parse_stats(_read_block(proc, mine.shared))
@@ -942,17 +957,19 @@ def turn_off(pid: int, memory) -> State:
         helpers = _helpers(proc)
         if not helpers:
             return State(STOCK)
-        ref = helpers[-1]
-        kind = _classify(proc, ref, helpers)
-        if kind == STOCK:
-            for h in helpers:
-                _write_settings(proc, h.shared, Settings(), False)
-            return read_state(proc)
+        # The helper whose wrappers are in the calls says where the game's own
+        # functions are - whichever WolfRAT build loaded it.
+        kind, owner = _calls(proc, None, helpers)
         if kind == FOREIGN:
             raise LagCompError("Something else has changed the game's hit code in this server "
                                "- WolfRAT left it alone.")
+        if owner is None:
+            # The game's own calls already (or no helper that fits this exe).
+            for h in helpers:
+                _write_settings(proc, h.shared, Settings(), False)
+            return read_state(proc)
         memory.write_code([(site, _call_bytes(site, func))
-                           for site, func, _ in _sites(ref.block)])
+                           for site, func, _ in _sites(owner.block)])
         for h in helpers:
             _write_settings(proc, h.shared, Settings(), False)
         after = read_state(proc)
