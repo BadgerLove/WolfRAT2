@@ -261,3 +261,102 @@ def test_the_smoke_run_never_asks(monkeypatch, tmp_path):
     code, ran = _main_with(monkeypatch, tmp_path, claim=False, arguments=("--smoke-test",))
     assert code == 0
     assert ran == ["start", "smoke", "exec", "shutdown"]
+
+
+# ---------------------------------------------------------------- an older copy in the folder
+# (Dale, 2026-11-20: the first test build said nothing about a 2.10.23 left open beside it.
+# Versions before this file hold no mutex, so they are found by the process list.)
+def _rows(*rows):
+    return lambda: list(rows)
+
+
+def _paths(mapping):
+    return lambda pid: mapping.get(pid)
+
+
+def test_an_older_wolfrat_from_the_same_folder_is_seen(tmp_path):
+    rows = _rows((10, 1, "explorer.exe"), (20, 10, "WolfRAT2.exe"), (21, 20, "WolfRAT2.exe"),
+                 (30, 10, "WolfRAT2-lagcomp4-test.exe"), (31, 30, "WolfRAT2-lagcomp4-test.exe"))
+    paths = _paths({20: str(tmp_path / "WolfRAT2.exe"), 21: str(tmp_path / "WolfRAT2.exe"),
+                    30: str(tmp_path / "WolfRAT2-lagcomp4-test.exe"),
+                    31: str(tmp_path / "WolfRAT2-lagcomp4-test.exe")})
+    assert si.copy_running_from(tmp_path, rows, paths, own_pid=31, parent_pid=30) is True
+
+
+def test_this_copy_and_its_own_unpacker_are_not_another_copy(tmp_path):
+    rows = _rows((10, 1, "explorer.exe"), (30, 10, "WolfRAT2.exe"), (31, 30, "WolfRAT2.exe"))
+    paths = _paths({30: str(tmp_path / "WolfRAT2.exe"), 31: str(tmp_path / "WolfRAT2.exe")})
+    assert si.copy_running_from(tmp_path, rows, paths, own_pid=31, parent_pid=30) is False
+
+
+def test_a_wolfrat_from_another_folder_is_left_alone(tmp_path):
+    other = tmp_path / "second server"
+    rows = _rows((20, 10, "WolfRAT2.exe"), (31, 30, "WolfRAT2.exe"), (30, 10, "WolfRAT2.exe"))
+    paths = _paths({20: str(other / "WolfRAT2.exe"), 30: str(tmp_path / "WolfRAT2.exe"),
+                    31: str(tmp_path / "WolfRAT2.exe")})
+    assert si.copy_running_from(tmp_path, rows, paths, own_pid=31, parent_pid=30) is False
+
+
+def test_a_wolfrat_whose_folder_windows_will_not_tell_is_not_counted(tmp_path):
+    rows = _rows((20, 10, "WolfRAT2.exe"), (31, 30, "python.exe"))
+    assert si.copy_running_from(tmp_path, rows, _paths({}), own_pid=31, parent_pid=30) is False
+
+    def boom(pid):
+        raise OSError("no")
+    assert si.copy_running_from(tmp_path, rows, boom, own_pid=31, parent_pid=30) is False
+
+
+def test_the_folder_is_matched_however_it_is_written(tmp_path):
+    rows = _rows((20, 10, "wolfrat2.EXE"), (31, 30, "python.exe"))
+    paths = _paths({20: str(tmp_path).upper() + "\\.\\WolfRAT2.exe"})
+    assert si.copy_running_from(str(tmp_path) + "\\", rows, paths, own_pid=31, parent_pid=30) is True
+
+
+def test_other_programs_in_the_folder_do_not_count(tmp_path):
+    rows = _rows((20, 10, "notepad.exe"), (22, 10, "WolfRAT2.txt"), (31, 30, "python.exe"))
+    paths = _paths({20: str(tmp_path / "notepad.exe"), 22: str(tmp_path / "WolfRAT2.txt")})
+    assert si.copy_running_from(tmp_path, rows, paths, own_pid=31, parent_pid=30) is False
+
+
+def test_a_failing_process_list_means_no_copy(tmp_path):
+    def boom():
+        raise OSError("no snapshot")
+    assert si.copy_running_from(tmp_path, boom) is False
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Windows process API")
+def test_windows_gives_the_path_of_a_running_exe():
+    path = si.exe_path_of(os.getpid())
+    assert path and os.path.normcase(path) == os.path.normcase(sys.executable)
+    assert si.exe_path_of(0) is None
+
+
+def test_start_asks_when_an_older_copy_is_open_and_close_this_one_lets_go(tmp_path, no_kept_lock):
+    asked = []
+    assert si.claim(tmp_path, ask=lambda: asked.append(1) or False, wait_seconds=0,
+                    folder_copy=lambda: True) is False
+    assert asked == [1]
+    assert si.held_elsewhere(tmp_path) is False      # this copy let go of the folder
+
+
+def test_start_with_an_older_copy_open_and_open_anyway_carries_on(tmp_path, no_kept_lock):
+    assert si.claim(tmp_path, ask=lambda: True, wait_seconds=0, folder_copy=lambda: True) is True
+    assert si.held_elsewhere(tmp_path) is True       # and it holds the folder now
+
+
+def test_an_older_copy_that_is_just_closing_is_not_asked_about(tmp_path, no_kept_lock):
+    asked = []
+    answers = iter([True, True, False])
+    now = [0.0]
+
+    def sleep(seconds):
+        now[0] += seconds
+    assert si.claim(tmp_path, ask=lambda: asked.append(1) or False, wait_seconds=2.0,
+                    sleep=sleep, clock=lambda: now[0], folder_copy=lambda: next(answers)) is True
+    assert asked == []
+
+
+def test_no_copy_in_the_folder_means_no_question_by_default(tmp_path, no_kept_lock):
+    asked = []
+    assert si.claim(tmp_path, ask=lambda: asked.append(1) or False, wait_seconds=0) is True
+    assert asked == []

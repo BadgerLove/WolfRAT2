@@ -12,9 +12,12 @@ however it ends: a crash or a kill never leaves a stale lock behind.
 
 The mutex only says "somebody has this folder".  It cannot tell a WolfRAT
 that holds it whether a second one does too, and WolfRATs older than this
-file hold none.  ``other_instance_running`` therefore goes by the process
-list: it is what lag compensation asks before it takes the game's hit calls
-over from another WolfRAT's helper.
+file hold none.  So the start-up check also looks at the process list for
+any WolfRAT exe running from the same folder (``copy_running_from``): that
+is what catches an older version left open (Dale, 2026-11-20: the first
+test build said nothing about a 2.10.23 still running beside it).
+``other_instance_running`` (any folder) is what lag compensation asks before
+it takes the game's hit calls over from another WolfRAT's helper.
 
 No PyQt and no network here, so the logic is unit-testable.
 """
@@ -65,6 +68,8 @@ def _kernel32():
     k.Process32FirstW.argtypes = (ctypes.c_void_p, ctypes.POINTER(_ProcessEntry))
     k.Process32NextW.argtypes = (ctypes.c_void_p, ctypes.POINTER(_ProcessEntry))
     k.CloseHandle.argtypes = (ctypes.c_void_p,)
+    k.QueryFullProcessImageNameW.argtypes = (ctypes.c_void_p, ctypes.c_uint32, ctypes.c_wchar_p,
+                                             ctypes.POINTER(ctypes.c_uint32))
     return k
 
 
@@ -123,7 +128,8 @@ _held: Optional[InstanceLock] = None      # kept for as long as this WolfRAT run
 
 def claim(data_dir, ask: Callable[[], bool], wait_seconds: float = RECHECK_SECONDS,
           sleep: Callable[[float], None] = time.sleep,
-          clock: Callable[[], float] = time.monotonic) -> bool:
+          clock: Callable[[], float] = time.monotonic,
+          folder_copy: Optional[Callable[[], bool]] = None) -> bool:
     """Called once when the desktop starts.  True = carry on starting; False =
     the admin chose to close this copy.
 
@@ -134,13 +140,20 @@ def claim(data_dir, ask: Callable[[], bool], wait_seconds: float = RECHECK_SECON
     and the old one's mutex ends with it, before the new one is even started.
     The short look-again below is for a copy that is closing at this moment."""
     global _held
+    # A copy of this version or newer shows in the mutex; an older one only
+    # in the process list (``folder_copy``: any WolfRAT exe in this folder).
+    if folder_copy is None:
+        def folder_copy() -> bool:
+            return copy_running_from(data_dir)
     lock = acquire(data_dir)
     deadline = clock() + max(0.0, wait_seconds)
-    while not lock.first and clock() < deadline:
+    busy = (not lock.first) or folder_copy()
+    while busy and clock() < deadline:
         lock.release()
         sleep(RECHECK_STEP)
         lock = acquire(data_dir)
-    if lock.first or ask():
+        busy = (not lock.first) or folder_copy()
+    if not busy or ask():
         _held = lock
         return True
     lock.release()
@@ -203,6 +216,63 @@ def other_instance_running(processes: Optional[Callable[[], list]] = None,
     if _is_wolfrat(names.get(parent, "")) and names.get(parent) == names.get(me):
         mine.add(parent)
     return any(_is_wolfrat(name) and pid not in mine for pid, name in names.items())
+
+
+def exe_path_of(pid: int) -> Optional[str]:
+    """The full path of a running process's exe, or None when Windows will not say."""
+    if not pid or sys.platform != "win32":
+        return None
+    try:
+        k = _kernel32()
+        handle = k.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return None
+        try:
+            size = ctypes.c_uint32(32768)
+            buffer = ctypes.create_unicode_buffer(size.value)
+            if not k.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+                return None
+            return buffer.value or None
+        finally:
+            k.CloseHandle(handle)
+    except Exception:
+        return None
+
+
+def copy_running_from(data_dir, processes: Optional[Callable[[], list]] = None,
+                      path_of: Optional[Callable[[int], Optional[str]]] = None,
+                      own_pid: Optional[int] = None,
+                      parent_pid: Optional[int] = None) -> bool:
+    """True when another WolfRAT exe that lives in ``data_dir`` is running: any
+    version, any file name starting with WolfRAT.
+
+    A released WolfRAT keeps its settings beside its exe, so "an exe from this
+    folder" is "a copy using these settings files".  This WolfRAT's own
+    unpacker does not count.  A WolfRAT whose folder Windows will not tell us
+    is not counted (no false alarm for an admin who runs one WolfRAT per
+    server from different folders)."""
+    try:
+        rows = (processes or process_list)()
+    except Exception:
+        return False
+    lookup = path_of or exe_path_of
+    me = os.getpid() if own_pid is None else own_pid
+    parent = os.getppid() if parent_pid is None else parent_pid
+    names = {pid: (name or "").lower() for pid, _parent, name in rows}
+    mine = {me}
+    if _is_wolfrat(names.get(parent, "")) and names.get(parent) == names.get(me):
+        mine.add(parent)
+    folder = folder_key(data_dir)
+    for pid, name in names.items():
+        if pid in mine or not _is_wolfrat(name):
+            continue
+        try:
+            path = lookup(pid)
+        except Exception:
+            path = None
+        if path and folder_key(os.path.dirname(path)) == folder:
+            return True
+    return False
 
 
 def pid_running(pid: int) -> bool:
