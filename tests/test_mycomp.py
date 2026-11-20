@@ -4,9 +4,11 @@ from wolfrat import lag_comp as lc
 
 
 def _state(*players, on=True, observe=False, min_ping=80):
+    """Players as (name, ping, rewind, hits, plain hits[, rewound bullet checks])."""
     stats = lc.Stats()
-    for i, (name, ping, rewind, hits, plain) in enumerate(players):
-        stats.players.append(lc.PlayerStats(i, name, ping, rewind, 100, hits, plain, 0, 0))
+    for i, (name, ping, rewind, hits, plain, *rest) in enumerate(players):
+        tests = rest[0] if rest else 100
+        stats.players.append(lc.PlayerStats(i, name, ping, rewind, tests, hits, plain, 0, 0))
     return lc.State(kind=lc.ON if on else "off", observe=observe,
                     settings=lc.Settings(observe=observe, min_ping_ms=min_ping),
                     stats=stats)
@@ -28,8 +30,25 @@ def test_no_plain_hits_leaves_the_percent_out():
 
 
 def test_low_ping_needs_no_comp():
-    st = _state(("Nikolay", 45, 0, 10, 10))
+    # Never rewound this session: no bullet checks, no rewind now.
+    st = _state(("Nikolay", 45, 0, 0, 0, 0))
     assert lc.mycomp_line(st, "nikolay") == "Nikolay P45 No comp needed (under 80)"
+
+
+def test_a_player_rewound_earlier_gets_their_numbers_when_their_ping_dips():
+    """Review N5: a player hovering at the minimum ping was rewound for most of
+    the session; in a second at 78 ms the line said "No comp needed"."""
+    st = _state(("Hover", 78, 0, 48, 39, 5200))
+    assert lc.mycomp_line(st, "hover") == "Hover P78 R0 Hits 48 +9 comp (+23%)"
+
+
+def test_no_comp_needed_is_not_said_when_everyone_is_rewound():
+    # Minimum ping 0 = nobody is "under" it: no "under 0" line, the numbers instead.
+    st = _state(("Elk", 0, 0, 0, 0, 0), min_ping=0)
+    assert lc.mycomp_line(st, "elk") == "Elk P0 R0 Hits 0 +0 comp"
+    # Being rewound right now is never "no comp needed", bullets or not.
+    st = _state(("New", 120, 190, 0, 0, 0))
+    assert lc.mycomp_line(st, "new") == "New P120 R190 Hits 0 +0 comp"
 
 
 def test_off_and_not_loaded():
@@ -66,7 +85,8 @@ def test_stock_chat_limit_falls_back_to_the_short_form():
 
 
 def test_every_line_fits_both_limits():
-    st = _state(("X" * 31, 999, 400, 99999, 99999), ("Y" * 31, 79, 0, 0, 0))
+    st = _state(("X" * 31, 999, 400, 99999, 99999), ("Y" * 31, 79, 0, 0, 0),
+                ("W" * 31, 79, 0, 0, 0, 0), ("V" * 31, 79, 0, 99999, 88888, 999999))
     for limit in (59, 118):
-        for who in ("X" * 31, "Y" * 31, "Z" * 31):
+        for who in ("X" * 31, "Y" * 31, "Z" * 31, "W" * 31, "V" * 31):
             assert len(lc.mycomp_line(st, who, limit)) <= limit

@@ -1146,6 +1146,11 @@ def mycomp_line(state: Optional[State], name: str, limit: int = 118) -> str:
 
         BadgerLove P142 R212 Hits 48 +9 comp (+23%)
         BadgerLove P45 No comp needed (under 80)
+
+    "No comp needed" only for a player with no rewound bullets this session, a
+    rewind of 0 now and a minimum ping above 0.  A player near the minimum ping
+    who was rewound for most of the session gets their numbers, even in a
+    second when their ping is under it (review N5).
     """
     if state is None or not state.on or not state.stats or not state.settings:
         return MYCOMP_OFF
@@ -1156,8 +1161,8 @@ def mycomp_line(state: Optional[State], name: str, limit: int = 118) -> str:
     if state.observe or state.settings.observe:
         return _fit_name(shown, f" P{row.ping} Lag comp is watch-only (no hits changed)",
                          limit) or _fit_name(shown, f" P{row.ping} watch-only", limit) or MYCOMP_OFF
-    if row.rewind_ms <= 0:
-        minimum = state.settings.min_ping_ms
+    minimum = state.settings.min_ping_ms
+    if row.tests <= 0 and row.rewind_ms <= 0 and minimum > 0:
         return (_fit_name(shown, f" P{row.ping} No comp needed (under {minimum})", limit)
                 or _fit_name(shown, f" P{row.ping} no comp", limit) or MYCOMP_OFF)
     net = row.hits - row.plain_hits
@@ -1227,7 +1232,11 @@ class HistoryBook:
             for old in self.rows:
                 if old.get("key") == key:
                     for t in old.get("targets", []):
-                        targets.setdefault(t.get("name"), t)
+                        name = t.get("name")
+                        if name in targets:
+                            self._carry(targets[name], t)
+                        else:
+                            targets[name] = dict(t, away=True)
             row["targets"] = sorted(targets.values(),
                                     key=lambda t: -(t["close_low"] + t["close_lag"]))[:64]
         for i, old in enumerate(self.rows):
@@ -1238,6 +1247,27 @@ class HistoryBook:
             self.rows.append(row)
             self.rows = self.rows[-self.KEEP:]
         return True
+
+    _COUNTERS = tuple(name for name, _ in _Target._fields_)
+
+    @classmethod
+    def _carry(cls, new: dict, old: dict) -> None:
+        """A player who left and came back within one session keeps the SUM of
+        their numbers (review N5): the helper starts their row from zero, and
+        the newest, smaller numbers used to replace the old ones.
+
+        ``new`` is the helper's row now, ``old`` what the session row holds.
+        ``earlier`` in a stored row = the part from their earlier visits.
+        They came back if they were away at the last look, or a number went
+        down."""
+        earlier = old.get("earlier") or {}
+        visit = {k: old.get(k, 0) - earlier.get(k, 0) for k in cls._COUNTERS}
+        if old.get("away") or any(new.get(k, 0) < visit[k] for k in cls._COUNTERS):
+            earlier = {k: old.get(k, 0) for k in cls._COUNTERS}
+        if any(earlier.values()):
+            for k in cls._COUNTERS:
+                new[k] = new.get(k, 0) + earlier.get(k, 0)
+            new["earlier"] = earlier
 
     def save(self) -> None:
         tmp = str(self.path) + ".tmp"

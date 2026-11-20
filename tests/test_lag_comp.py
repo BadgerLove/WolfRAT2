@@ -517,3 +517,57 @@ def test_reading_the_log_back_survives_broken_lines_and_a_missing_file(tmp_path)
     # Only the end of a long file is read: a line the read starts inside is skipped.
     logger.TAIL_BYTES = 40
     assert logger._logged_steps(999) == set()
+
+
+# ------------------------------------- a player who leaves and rejoins (review N5)
+def _targets(**close_shots):
+    """Stats with one target row per name; every number follows the close shots."""
+    s = lc.Stats(tests=10, hits=2, since=0x10, has_targets=True,
+                 bands=[lc.BandStats(label) for label in lc.BAND_LABELS])
+    s.targets = [lc.TargetStats(i, name, 100, c, c // 5, c * 2, c // 2, c * 2, c // 4, c // 10, 0)
+                 for i, (name, c) in enumerate(close_shots.items())]
+    return s
+
+
+def _row(book, name):
+    return next(t for t in book.rows[0]["targets"] if t["name"] == name)
+
+
+def test_history_adds_up_a_player_who_left_and_came_back(tmp_path):
+    """The helper starts a rejoining player's row from zero.  The session row
+    used to take the new, smaller numbers over the old ones."""
+    settings = lc.Settings(False, 70, 400, 80)
+    book = lc.HistoryBook(str(tmp_path / "h.json"))
+    book.record(1, _targets(A=10, B=20), settings, now=1_000_000)
+    book.record(1, _targets(A=12), settings, now=1_000_030)               # B left
+    assert _row(book, "B")["close_low"] == 20
+    book.record(1, _targets(A=15, B=3), settings, now=1_000_060)          # B is back, from zero
+    assert _row(book, "B")["close_low"] == 23 and _row(book, "B")["close_lag"] == 46
+    assert _row(book, "B")["hits_low"] == 20 // 5 + 3 // 5
+    book.record(1, _targets(A=15, B=8), settings, now=1_000_090)          # and plays on
+    assert _row(book, "B")["close_low"] == 28
+    # Left and came back between two looks: seen by their numbers going down.
+    book.record(1, _targets(A=16, B=2), settings, now=1_000_120)
+    assert _row(book, "B")["close_low"] == 30
+    book.record(1, _targets(A=16, B=2), settings, now=1_000_150)          # nothing new: no double count
+    assert _row(book, "B")["close_low"] == 30
+    assert _row(book, "A")["close_low"] == 16 and "earlier" not in _row(book, "A")
+    assert len(book.rows) == 1 and len(book.rows[0]["targets"]) == 2
+
+    book.save()                                                           # WolfRAT restarts
+    again = lc.HistoryBook(str(tmp_path / "h.json"))
+    again.record(1, _targets(A=16, B=5), settings, now=1_000_180)
+    assert _row(again, "B")["close_low"] == 33
+
+
+def test_history_rows_from_before_this_still_update(tmp_path):
+    """A session row saved by an older WolfRAT has no 'away' or 'earlier' keys."""
+    settings = lc.Settings(False, 70, 400, 80)
+    old = {"key": "1-00000010", "started": "2026-11-19 20:00", "minutes": 5, "setting": "x",
+           "hits": 2, "plain_hits": 1, "gained": 1, "lost": 0, "cal_total": 0, "cal_median": None,
+           "bands": [], "targets": [dict(lc.TargetStats(0, "A", 100, 10, 2, 20, 5, 20, 2, 1, 0).__dict__),
+                                    dict(lc.TargetStats(1, "Gone", 90, 7, 1, 0, 0, 0, 0, 0, 0).__dict__)]}
+    (tmp_path / "h.json").write_text(json.dumps([old]), encoding="utf-8")
+    book = lc.HistoryBook(str(tmp_path / "h.json"))
+    book.record(1, _targets(A=14), settings, now=1_000_000)
+    assert _row(book, "A")["close_low"] == 14 and _row(book, "Gone")["close_low"] == 7
