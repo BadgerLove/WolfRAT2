@@ -38,7 +38,20 @@ def test_block_layout_matches_the_helper():
     assert lc._V2_SIZE == lc._OFF["band_totals"] + 32 * lc.BANDS == 26344
     assert lc._OFF["tune_mode"] == 26344
     assert lc._OFF["tune_log"] == 26344 + 28
-    assert lc.SHARED_SIZE == lc._V3_SIZE == 26344 + 28 + 32 * lc.TUNE_LOG == 28420
+    assert lc._V3_SIZE == 26344 + 28 + 32 * lc.TUNE_LOG == 28420
+
+
+def test_version_4_block_layout_matches_the_spec():
+    # tmp/lagreview_2026-11-19/v4/SPEC.md: 528 bytes appended, nothing before them moves.
+    assert lc.VERSION == 4
+    assert lc.ctypes.sizeof(lc._WhatIf) == 68
+    assert lc._OFF["bot_totals"] == lc._V3_SIZE == 28420
+    assert [lc._OFF[k] - 28420 for k in (
+        "dead_hits", "dead_plain_hits", "near_steps", "tracked_persons", "tracked_bots",
+        "low_tests", "owner_pid", "owner_heartbeat", "what_if_offset_ms",
+        "what_if_band_min_ping", "what_if")] == [32, 36, 40, 44, 48, 52, 56, 60, 64, 96, 120]
+    assert lc.SHARED_SIZE == lc._V4_SIZE == 28420 + 528 == 28948
+    assert lc.ctypes.sizeof(lc._Shared) == 28948
 
 
 def test_bundled_helper_exports_its_block():
@@ -271,3 +284,175 @@ def test_v3_auto_tune_and_event_logger(tmp_path):
     assert logger.record_poll(999, s, settings, include_snapshot=False, now=1_700_000_005) == []
     assert (tmp_path / "wolfrat_lag_comp_events.log").exists()
     assert (tmp_path / "wolfrat_lag_comp_events.jsonl").exists()
+
+
+# ------------------------------------------------- helper version 4 (2026-11-20)
+# Bots are rewound and counted in their own row, dead bodies are counted apart,
+# and every bullet is also judged at seven other rewinds (the what-if table).
+
+def _v4(**kw):
+    b = _block(**kw)
+    b.version, b.size = 4, lc.SHARED_SIZE
+    for i, off in enumerate(lc.WHATIF_OFFSETS):        # the helper writes these at load
+        b.what_if_offset_ms[i] = off
+    for i, ping in enumerate(lc.WHATIF_BAND_MIN_PING):
+        b.what_if_band_min_ping[i] = ping
+    return b
+
+
+def _what_if(b, band, steps, hits, human=None):
+    w = b.what_if[band]
+    w.steps = steps
+    for i, n in enumerate(hits):
+        w.hits[i] = n
+        w.hits_human[i] = (human or hits)[i]
+
+
+def test_version_4_bots_dead_bodies_and_what_if():
+    b = _v4(tests=900, hits=200, plain_hits=150, stats_since=1000,
+            dead_hits=7, dead_plain_hits=5, near_steps=640, low_tests=310,
+            tracked_persons=48, tracked_bots=40, owner_pid=4242, owner_heartbeat=99)
+    bots = b.bot_totals
+    bots.close_low, bots.hits_low, bots.close_lag, bots.hits_lag = 80, 20, 300, 120
+    bots.close_lag_plain, bots.plain_lag, bots.gained, bots.lost = 300, 90, 40, 10
+    _what_if(b, 2, 500, [100, 90, 110, 130, 150, 140, 120, 80], [10, 9, 11, 13, 15, 14, 12, 8])
+    _what_if(b, 5, 60, [5, 1, 2, 3, 9, 4, 4, 4])
+    _, s = lc.parse_stats(bytes(b), now_ticks=2000)
+    assert s.has_v4 and s.has_tuner and s.has_targets
+    assert s.bot_totals.label == "Bots (AI)" and s.bot_totals.players == 40
+    assert (s.bot_totals.close_lag, s.bot_totals.hits_lag, s.bot_totals.plain_lag,
+            s.bot_totals.gained, s.bot_totals.lost) == (300, 120, 90, 40, 10)
+    assert (s.dead_hits, s.dead_plain_hits, s.near_steps, s.low_tests) == (7, 5, 640, 310)
+    assert (s.tracked_persons, s.tracked_bots) == (48, 40)
+    assert s.what_if_offsets == [0x7FFFFFFF, -80, -40, 0, 40, 80, 120, 160]
+    assert [r.label for r in s.what_if] == ["under 50", "50-79", "80-99", "100-149",
+                                           "150-199", "200+"]
+    assert [r.min_ping for r in s.what_if] == [0, 50, 80, 100, 150, 200]
+    row = s.what_if[2]
+    assert (row.steps, row.hits[4], row.hits_human[4]) == (500, 150, 15)
+    assert [lc.what_if_column_label(o) for o in s.what_if_offsets] == [
+        "Plain JO", "ping -80", "ping -40", "ping +0", "ping +40", "ping +80",
+        "ping +120", "ping +160"]
+
+
+def test_older_helpers_blocks_still_parse_without_version_4():
+    full = _v4(tests=5, dead_hits=3, stats_since=1000)
+    full.players[0].entity, full.players[0].ping = 1, 100
+    # A version 3 helper: its block ends at 28,420 bytes.
+    v3 = _block(tests=5, stats_since=1000)
+    v3.version, v3.size = 3, lc._V3_SIZE
+    v3.players[0].entity, v3.players[0].ping = 1, 100
+    for raw in (bytes(v3)[:lc._V3_SIZE], bytes(v3)):
+        _, s = lc.parse_stats(raw, now_ticks=2000)
+        assert s.has_tuner and s.has_targets and not s.has_v4
+        assert s.bot_totals is None and s.what_if == [] and s.dead_hits == 0
+    # Version 2 and version 1 sizes.
+    v2 = _block(stats_since=1000)
+    v2.version, v2.size = 2, lc._V2_SIZE
+    _, s = lc.parse_stats(bytes(v2)[:lc._V2_SIZE], now_ticks=2000)
+    assert s.has_targets and not s.has_tuner and not s.has_v4
+    _, s = lc.parse_stats(bytes(_block(stats_since=1000))[:lc._OFF["targets"]], now_ticks=2000)
+    assert not s.has_targets and not s.has_tuner and not s.has_v4
+    # A block that says 4 but is not that big is not trusted to have the new part.
+    full.size = lc._V3_SIZE
+    _, s = lc.parse_stats(bytes(full), now_ticks=2000)
+    assert not s.has_v4 and s.dead_hits == 0
+
+
+def test_a_pending_reset_clears_the_version_4_counters_and_keeps_the_rest():
+    b = _v4(reset_seq=2, seen_reset_seq=1, stats_since=1000, dead_hits=7, dead_plain_hits=5,
+            near_steps=640, low_tests=310, tracked_persons=48, tracked_bots=40,
+            owner_pid=4242, owner_heartbeat=123456)
+    b.bot_totals.close_lag = 300
+    _what_if(b, 2, 500, [100, 90, 110, 130, 150, 140, 120, 80])
+    block, s = lc.parse_stats(bytes(b), now_ticks=5000)
+    assert s.bot_totals.close_lag == 0
+    assert (s.dead_hits, s.dead_plain_hits, s.near_steps, s.low_tests) == (0, 0, 0, 0)
+    assert all(r.steps == 0 and not any(r.hits) for r in s.what_if)
+    # Not counters: who runs it, the column offsets, the bands, who is tracked now.
+    assert (block.owner_pid, block.owner_heartbeat) == (4242, 123456)
+    assert (s.tracked_persons, s.tracked_bots) == (48, 40)
+    assert s.what_if_offsets == list(lc.WHATIF_OFFSETS)
+    assert [r.label for r in s.what_if][0] == "under 50"
+
+
+def test_most_hits_overall_counts_the_bands_at_or_above_the_minimum_ping():
+    b = _v4(stats_since=1000)
+    _what_if(b, 0, 5000, [900, 0, 0, 0, 0, 0, 0, 0])                 # under 50: plain JO wins
+    _what_if(b, 2, 200, [40, 30, 35, 50, 70, 60, 45, 20])            # 80-99
+    _what_if(b, 4, 99, [20, 10, 15, 25, 30, 41, 22, 10])             # 150-199
+    _, s = lc.parse_stats(bytes(b), now_ticks=2000)
+    assert s.what_if_best(80) == (299, [])                           # under 300 bullets
+    b.what_if[4].steps = 100
+    _, s = lc.parse_stats(bytes(b), now_ticks=2000)
+    assert s.what_if_best(80) == (300, [5])                          # 60+41 beats 70+30: ping +80
+    assert s.what_if_best(0) == (5300, [0])                          # everyone: plain JO
+    assert s.what_if_best(150) == (100, [])
+    assert s.what_if_best(999)[0] == 0                               # above every band: the top one
+    b.what_if[4].hits[4] = 31                                        # 70+31 = 60+41: a tie
+    _, s = lc.parse_stats(bytes(b), now_ticks=2000)
+    assert s.what_if_best(80) == (300, [4, 5])
+
+
+def test_band_names_come_from_the_blocks_own_pings():
+    assert lc.what_if_band_labels([0, 40, 90]) == ["under 40", "40-89", "90+"]
+    # Never filled in (all zero): the helper's own bands.
+    assert lc.what_if_band_labels([0] * 6) == ["under 50", "50-79", "80-99", "100-149",
+                                               "150-199", "200+"]
+
+
+def _v4_stats():
+    b = _v4(tests=900, hits=200, plain_hits=150, stats_since=1000, dead_hits=7,
+            dead_plain_hits=5, near_steps=640, low_tests=310, tracked_persons=48, tracked_bots=40)
+    b.bot_totals.close_lag, b.bot_totals.hits_lag = 300, 120
+    b.bot_totals.close_lag_plain, b.bot_totals.plain_lag = 300, 90
+    _what_if(b, 2, 500, [100, 90, 110, 130, 150, 140, 120, 80], [10, 9, 11, 13, 15, 14, 12, 8])
+    return lc.parse_stats(bytes(b), now_ticks=61000)[1]
+
+
+def test_history_row_and_snapshot_keep_the_version_4_numbers(tmp_path):
+    s = _v4_stats()
+    settings = lc.Settings(False, 70, 400, 80)
+    # An old history file (rows without the new keys) still loads and is kept.
+    old_row = {"key": "1-00000001", "started": "2026-11-01 20:00", "minutes": 30,
+               "setting": "ping +70 ms, none under 80, max 400", "hits": 5, "plain_hits": 4,
+               "gained": 2, "lost": 1, "cal_total": 9, "cal_median": 44}
+    (tmp_path / "h.json").write_text(json.dumps([old_row]), encoding="utf-8")
+    book = lc.HistoryBook(str(tmp_path / "h.json"))
+    assert book.rows == [old_row]
+    assert book.record(77, s, settings, now=1_700_000_000)
+    book.save()
+    rows = json.loads((tmp_path / "h.json").read_text(encoding="utf-8"))
+    assert rows[0] == old_row
+    row = rows[1]
+    assert row["bots"]["label"] == "Bots (AI)" and row["bots"]["hits_lag"] == 120
+    assert (row["dead_hits"], row["dead_plain_hits"], row["near_steps"]) == (7, 5, 640)
+    assert row["what_if"]["offsets"] == [None, -80, -40, 0, 40, 80, 120, 160]
+    assert row["what_if"]["rows"] == [{
+        "band": "80-99", "min_ping": 80, "steps": 500,
+        "hits": [100, 90, 110, 130, 150, 140, 120, 80],
+        "human": [10, 9, 11, 13, 15, 14, 12, 8]}]                    # bands with bullets only
+
+    logger = lc.EventLogger(str(tmp_path))
+    added = logger.record_poll(77, s, settings, include_snapshot=True, now=1_700_000_000)
+    assert "| bots: lag 40%/plain 30%" in added[-1]
+    snap = json.loads((tmp_path / "wolfrat_lag_comp_events.jsonl").read_text(
+        encoding="utf-8").splitlines()[-1])
+    assert snap["kind"] == "snapshot" and snap["dead_hits"] == 7 and snap["near_steps"] == 640
+    assert snap["bots"]["close_lag"] == 300 and snap["tracked_bots"] == 40
+    assert snap["what_if"]["rows"][0]["hits"][4] == 150
+
+
+def test_a_version_3_snapshot_has_none_of_the_new_keys(tmp_path):
+    b = _block(stats_since=1000, tests=400, hits=110, plain_hits=90)
+    b.version, b.size = 3, lc._V3_SIZE
+    s = lc.parse_stats(bytes(b), now_ticks=61000)[1]
+    logger = lc.EventLogger(str(tmp_path))
+    line = logger.record_poll(5, s, lc.Settings(), include_snapshot=True, now=1_700_000_000)[-1]
+    assert "bots:" not in line
+    snap = json.loads((tmp_path / "wolfrat_lag_comp_events.jsonl").read_text(
+        encoding="utf-8").splitlines()[-1])
+    assert "what_if" not in snap and "bots" not in snap and "dead_hits" not in snap
+    book = lc.HistoryBook(str(tmp_path / "h.json"))
+    book.record(5, s, lc.Settings(), now=1_700_000_000)
+    assert "what_if" not in book.rows[0] and "bots" not in book.rows[0]

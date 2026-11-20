@@ -37,7 +37,7 @@ DLL_NAME = "wolfrat_lagcomp.dll"
 LOADED_PREFIX = "wolfrat_lagcomp_"
 EXPORT_NAME = b"WolfRatLagComp"
 MAGIC = 0x31434C57
-VERSION = 3              # 3 = auto-tune of Extra + decision log (2 = per-target rows)
+VERSION = 4              # 4 = bots, dead bodies apart, what-if table, owner (3 = auto-tune)
 
 SLOTS = 250
 LEGACY_SLOTS = 64
@@ -51,6 +51,13 @@ TUNE_OFF = 0
 TUNE_WATCH = 1
 TUNE_APPLY = 2
 TUNE_MODE_NAMES = {TUNE_OFF: "off", TUNE_WATCH: "watch", TUNE_APPLY: "apply"}
+BOTS_LABEL = "Bots (AI)"
+WHATIF_BANDS = 6         # SHOOTER ping bands: under 50, 50-79, 80-99, 100-149, 150-199, 200+
+WHATIF_COLS = 8          # column 0 = plain JO; 1..7 = a rewind of ping + offset
+WHATIF_PLAIN = 0x7FFFFFFF                      # the offset that means "plain JO"
+WHATIF_OFFSETS = (WHATIF_PLAIN, -80, -40, 0, 40, 80, 120, 160)   # as the helper writes them
+WHATIF_BAND_MIN_PING = (0, 50, 80, 100, 150, 200)
+WHATIF_MIN_BULLETS = 300                       # fewer than this: "not enough yet"
 
 # Retail 1.7.5.7 / TAC / FMJ call sites, so WolfRAT can spot onHook's own
 # lag compensation before loading its helper DLL.
@@ -96,6 +103,16 @@ class _Target(ctypes.LittleEndianStructure):
                 ("gained", ctypes.c_uint32), ("lost", ctypes.c_uint32)]
 
 
+class _WhatIf(ctypes.LittleEndianStructure):
+    """One shooter ping band of the what-if table (version 4): the same bullet
+    steps judged at each rewind.  hits = on a live person; hits_human = on a
+    live human player."""
+    _pack_ = 4
+    _fields_ = [("steps", ctypes.c_uint32),
+                ("hits", ctypes.c_uint32 * WHATIF_COLS),
+                ("hits_human", ctypes.c_uint32 * WHATIF_COLS)]
+
+
 class _Shared(ctypes.LittleEndianStructure):
     _pack_ = 4
     _fields_ = [("magic", ctypes.c_uint32), ("version", ctypes.c_uint32),
@@ -132,7 +149,20 @@ class _Shared(ctypes.LittleEndianStructure):
                 ("tune_samples", ctypes.c_uint32),
                 ("tune_window_mins", ctypes.c_uint32),
                 ("tune_decisions", ctypes.c_uint32),
-                ("tune_log", (ctypes.c_uint32 * 8) * TUNE_LOG)]
+                ("tune_log", (ctypes.c_uint32 * 8) * TUNE_LOG),
+                # version 4, appended (SPEC.md, 2026-11-20):
+                ("bot_totals", _Target),            # AI targets, same columns as band_totals
+                ("dead_hits", ctypes.c_uint32),     # decided answer hit a dead body (not in hits)
+                ("dead_plain_hits", ctypes.c_uint32),
+                ("near_steps", ctypes.c_uint32),    # bullet steps with a live person near
+                ("tracked_persons", ctypes.c_uint32),
+                ("tracked_bots", ctypes.c_uint32),
+                ("low_tests", ctypes.c_uint32),     # steps from shooters under the minimum ping
+                ("owner_pid", ctypes.c_uint32),     # WolfRAT writes these two: who runs it,
+                ("owner_heartbeat", ctypes.c_uint32),   # and GetTickCount() each poll
+                ("what_if_offset_ms", ctypes.c_int32 * WHATIF_COLS),
+                ("what_if_band_min_ping", ctypes.c_int32 * WHATIF_BANDS),
+                ("what_if", _WhatIf * WHATIF_BANDS)]
 
 
 class _TuneStep(ctypes.LittleEndianStructure):
@@ -147,7 +177,13 @@ SHARED_SIZE = ctypes.sizeof(_Shared)
 _OFF = {name: getattr(_Shared, name).offset for name, _ in _Shared._fields_}
 _MIN_SHARED_SIZE = _OFF["players"] + LEGACY_SLOTS * ctypes.sizeof(_Player)
 _V2_SIZE = _OFF["tune_mode"]               # 26,344: a block this big has the target rows
-_V3_SIZE = SHARED_SIZE                     # 28,420: a block this big has the auto-tuner
+_V3_SIZE = _OFF["bot_totals"]              # 28,420: a block this big has the auto-tuner
+_V4_SIZE = SHARED_SIZE                     # 28,948: bots, what-if table, owner
+# The helper checks the same two numbers when it is built (SPEC.md).
+assert ctypes.sizeof(_WhatIf) == 68
+assert _V3_SIZE == 28420, "the version 3 part of the block must not move"
+assert ctypes.sizeof(_Shared) == 28948, "version 4 block is 28,948 bytes"
+assert _OFF["owner_heartbeat"] == _OFF["owner_pid"] + 4
 
 
 @dataclass
@@ -231,6 +267,41 @@ def band_of(ping: int) -> int:
 
 
 @dataclass
+class WhatIfRow:
+    """One SHOOTER ping band of the what-if table: how many of the same bullet
+    steps would have hit at each rewind (see Stats.what_if_offsets)."""
+    label: str              # "under 50", "50-79", ... "200+"
+    min_ping: int           # the band's lowest ping
+    steps: int              # bullet steps judged (a live person was near)
+    hits: list              # per column: hit a live person (player or bot)
+    hits_human: list        # per column: hit a live human player
+
+    def as_dict(self) -> dict:
+        return {"band": self.label, "min_ping": self.min_ping, "steps": self.steps,
+                "hits": list(self.hits), "human": list(self.hits_human)}
+
+
+def what_if_band_labels(min_pings) -> list:
+    """Band names from their lowest pings: (0, 50, 80) -> under 50, 50-79, 80+."""
+    lows = [int(p) for p in min_pings]
+    if any(b <= a for a, b in zip(lows, lows[1:])):
+        lows = list(WHATIF_BAND_MIN_PING[:len(lows)])    # not filled in: the helper's own
+    out = []
+    for i, low in enumerate(lows):
+        if i + 1 == len(lows):
+            out.append(f"{low}+")
+        elif i == 0 and low <= 0:
+            out.append(f"under {lows[1]}")
+        else:
+            out.append(f"{low}-{lows[i + 1] - 1}")
+    return out
+
+
+def what_if_column_label(offset_ms: int) -> str:
+    return "Plain JO" if offset_ms == WHATIF_PLAIN else "ping %+d" % offset_ms
+
+
+@dataclass
 class TuneStep:
     minute: int
     tick_count: int
@@ -272,6 +343,16 @@ class Stats:
     tune_window_mins: int = 0
     tune_decisions: int = 0
     tune_log: list = field(default_factory=list)
+    has_v4: bool = False                   # helper version 4 or later
+    bot_totals: Optional[BandStats] = None     # AI soldiers as targets (label "Bots (AI)")
+    dead_hits: int = 0                     # hits on dead bodies: counted apart, not in hits
+    dead_plain_hits: int = 0
+    near_steps: int = 0
+    low_tests: int = 0
+    tracked_persons: int = 0               # people the helper follows now (players + bots)
+    tracked_bots: int = 0
+    what_if: list = field(default_factory=list)            # WhatIfRow, one per shooter band
+    what_if_offsets: list = field(default_factory=list)    # ms per column; WHATIF_PLAIN = plain JO
 
     @property
     def gain_percent(self) -> Optional[float]:
@@ -284,6 +365,23 @@ class Stats:
         if self.cal_median is None or self.cal_total < minimum_shots:
             return None
         return int(round(self.cal_median / 10.0)) * 10
+
+    def what_if_best(self, min_ping_ms: int = 0) -> tuple:
+        """(bullets, best columns) over the shooter bands at or above the
+        minimum ping: the rewinds that would have scored the most hits.  Under
+        WHATIF_MIN_BULLETS bullets the columns are empty (not enough yet)."""
+        rows = [r for r in self.what_if if r.min_ping >= min_ping_ms] or self.what_if[-1:]
+        bullets = sum(r.steps for r in rows)
+        totals = [sum(r.hits[c] for r in rows) for c in range(len(self.what_if_offsets))]
+        if bullets < WHATIF_MIN_BULLETS or not totals or not max(totals):
+            return bullets, []
+        return bullets, [c for c, n in enumerate(totals) if n == max(totals)]
+
+    def what_if_compact(self) -> dict:
+        """The what-if table for the history and the event log: bands with
+        bullets only; offset None = plain JO."""
+        return {"offsets": [None if o == WHATIF_PLAIN else o for o in self.what_if_offsets],
+                "rows": [r.as_dict() for r in self.what_if if r.steps]}
 
 
 @dataclass
@@ -325,6 +423,7 @@ def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, S
     ver, sz = struct.unpack_from("<II", raw, 4)
     has_targets = len(raw) >= _V2_SIZE and ver >= 2 and sz >= _V2_SIZE
     has_tuner = len(raw) >= _V3_SIZE and ver >= 3 and sz >= _V3_SIZE
+    has_v4 = len(raw) >= _V4_SIZE and ver >= 4 and sz >= _V4_SIZE
     if len(raw) < SHARED_SIZE:
         raw = raw + b"\0" * (SHARED_SIZE - len(raw))
     shared = _Shared.from_buffer_copy(raw[:SHARED_SIZE])
@@ -341,10 +440,16 @@ def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, S
             p.tests = p.hits = p.plain_hits = p.gained = p.lost = 0
         saved_mode = shared.tune_mode
         ctypes.memset(ctypes.addressof(shared) + _OFF["targets"], 0,
-                      SHARED_SIZE - _OFF["targets"])
+                      _V3_SIZE - _OFF["targets"])
         shared.tune_mode = saved_mode
         shared.tune_value_ms = shared.extra_ms
         shared.stats_since = now_ticks
+        # Version 4: the counters go; the owner, the column offsets, the band
+        # pings and who is tracked now stay (as the helper's own reset does).
+        ctypes.memset(ctypes.addressof(shared) + _OFF["bot_totals"], 0, ctypes.sizeof(_Target))
+        shared.dead_hits = shared.dead_plain_hits = shared.near_steps = shared.low_tests = 0
+        ctypes.memset(ctypes.addressof(shared) + _OFF["what_if"], 0,
+                      ctypes.sizeof(_WhatIf) * WHATIF_BANDS)
     cal = list(shared.cal)
     low, mid, high = histogram_quantiles(cal)
     stats = Stats(shared.tests, shared.hits, shared.plain_hits, shared.gained,
@@ -394,6 +499,27 @@ def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, S
                     int(st.samples), int(st.window_mins)))
         steps.sort(key=lambda x: x.minute)
         stats.tune_log = steps
+    stats.has_v4 = has_v4
+    if has_v4:
+        bots = BandStats(BOTS_LABEL, players=int(shared.tracked_bots))
+        for k, _ in _Target._fields_:
+            setattr(bots, k, getattr(shared.bot_totals, k))
+        stats.bot_totals = bots
+        stats.dead_hits = int(shared.dead_hits)
+        stats.dead_plain_hits = int(shared.dead_plain_hits)
+        stats.near_steps = int(shared.near_steps)
+        stats.low_tests = int(shared.low_tests)
+        stats.tracked_persons = int(shared.tracked_persons)
+        stats.tracked_bots = int(shared.tracked_bots)
+        stats.what_if_offsets = [int(o) for o in shared.what_if_offset_ms]
+        if len(set(stats.what_if_offsets)) < WHATIF_COLS:
+            stats.what_if_offsets = list(WHATIF_OFFSETS)      # not filled in: the helper's own
+        lows = [int(p) for p in shared.what_if_band_min_ping]
+        if any(b <= a for a, b in zip(lows, lows[1:])):
+            lows = list(WHATIF_BAND_MIN_PING)
+        for label, low, w in zip(what_if_band_labels(lows), lows, shared.what_if):
+            stats.what_if.append(WhatIfRow(label, low, int(w.steps), [int(n) for n in w.hits],
+                                           [int(n) for n in w.hits_human]))
     return shared, stats
 
 
@@ -919,6 +1045,17 @@ def mycomp_line(state: Optional[State], name: str, limit: int = 118) -> str:
     return _fit_name(shown, long, limit) or _fit_name(shown, short, limit) or MYCOMP_OFF
 
 
+def v4_record(stats: Stats) -> dict:
+    """What a version 4 helper adds, for a history row or a snapshot line: the
+    bots row, dead bodies, near steps and the what-if table.  Older rows and
+    lines simply do not have these keys."""
+    return {"bots": stats.bot_totals.as_dict() if stats.bot_totals else None,
+            "dead_hits": stats.dead_hits, "dead_plain_hits": stats.dead_plain_hits,
+            "near_steps": stats.near_steps, "low_tests": stats.low_tests,
+            "tracked_persons": stats.tracked_persons, "tracked_bots": stats.tracked_bots,
+            "what_if": stats.what_if_compact()}
+
+
 class HistoryBook:
     """One row per counting session (a server run, or since the last restart
     of the counters), kept in a small JSON file.  A row is updated in place
@@ -959,6 +1096,8 @@ class HistoryBook:
             row["tune_samples"] = stats.tune_samples
             row["tune_decisions"] = stats.tune_decisions
             row["tune_log"] = [st.as_dict() for st in stats.tune_log]
+        if stats.has_v4:
+            row.update(v4_record(stats))
         if stats.has_targets:
             row["bands"] = [b.as_dict() for b in stats.bands]
             # Players who left keep their last numbers (the helper drops their row).
@@ -1071,6 +1210,12 @@ class EventLogger:
                     p_str = "-" if plain_pct is None else f"{plain_pct:.0f}%"
                     band_parts.append(f"{b.label}: lag {l_str}/plain {p_str} (best {b_best})")
             bands_summary = (" | Bands " + ", ".join(band_parts)) if band_parts else ""
+            bots = stats.bot_totals if stats.has_v4 else None
+            if bots and (bots.close_lag or bots.close_low):
+                lag_pct = bots.percent(bots.hits_lag, bots.close_lag)
+                plain_pct = bots.percent(bots.plain_lag, bots.close_lag_plain)
+                bands_summary += (" | bots: lag " + ("-" if lag_pct is None else f"{lag_pct:.0f}%")
+                                  + "/plain " + ("-" if plain_pct is None else f"{plain_pct:.0f}%"))
             msg = (f"Snapshot ({stats.seconds // 60}m): {stats.hits} hits vs {stats.plain_hits} plain ({gain_str}), "
                    f"saved {stats.gained} / cost {stats.lost}, best {best_str} ({stats.cal_total} shots), "
                    f"active Extra {live_extra:+d} ms [{mode_name}]{bands_summary}")
@@ -1091,6 +1236,7 @@ class EventLogger:
                 bands=[b.as_dict() for b in stats.bands] if stats.has_targets else [],
                 players=[p.__dict__ for p in stats.players],
                 targets=[t.__dict__ for t in stats.targets] if stats.has_targets else [],
+                **(v4_record(stats) if stats.has_v4 else {}),
             ))
         return added
 

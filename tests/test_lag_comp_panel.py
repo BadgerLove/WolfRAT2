@@ -224,3 +224,119 @@ def test_server_tick_records_history_and_events_even_when_tab_is_hidden(
     assert (tmp_path / "lc_history.json").exists()
     assert (tmp_path / "wolfrat_lag_comp_events.log").exists()
     assert "Auto-tune min #1" in (tmp_path / "wolfrat_lag_comp_events.log").read_text(encoding="utf-8")
+
+
+# ------------------------------------------------- helper version 4 (2026-11-20)
+def _v4_state(what_if=None, dead_hits=0, min_ping=80):
+    state = _loaded(alive=True)
+    state.settings = lc.Settings(False, 70, 400, min_ping)
+    s = state.stats
+    s.tests, s.hits, s.plain_hits, s.gained, s.lost = 5000, 1200, 1000, 300, 100
+    s.has_targets = True
+    s.bands = [lc.BandStats(label) for label in lc.BAND_LABELS]
+    s.has_v4 = True
+    s.bot_totals = lc.BandStats(lc.BOTS_LABEL, players=40, close_lag=300, hits_lag=120,
+                                close_lag_plain=300, plain_lag=90, gained=40, lost=10)
+    s.dead_hits = dead_hits
+    s.what_if_offsets = list(lc.WHATIF_OFFSETS)
+    labels = lc.what_if_band_labels(lc.WHATIF_BAND_MIN_PING)
+    s.what_if = [lc.WhatIfRow(label, low, 0, [0] * 8, [0] * 8)
+                 for label, low in zip(labels, lc.WHATIF_BAND_MIN_PING)]
+    for band, (steps, hits) in (what_if or {}).items():
+        s.what_if[band].steps, s.what_if[band].hits = steps, list(hits)
+    return state
+
+
+def _header(table):
+    return [table.horizontalHeaderItem(c).text() for c in range(table.columnCount())]
+
+
+def test_version_4_totals_say_live_players_and_bots_and_show_dead_bodies(
+        qtbot, tmp_path, monkeypatch):
+    p = _panel(qtbot, tmp_path, monkeypatch, _v4_state(dead_hits=1234))
+    p._refresh_stats(force=True)
+    text = p.totals_lbl.text()
+    assert "<b>1,200</b> hits on live players and bots counted with it" in text
+    assert "Dead bodies hit: 1,234 (not counted)" in text
+    q = _panel(qtbot, tmp_path, monkeypatch, _v4_state(dead_hits=0))
+    q._refresh_stats(force=True)
+    assert "Dead bodies" not in q.totals_lbl.text()
+
+
+def test_version_4_being_shot_at_has_a_bots_row(qtbot, tmp_path, monkeypatch):
+    p = _panel(qtbot, tmp_path, monkeypatch, _v4_state())
+    p._refresh_stats(force=True)
+    assert p.bands_table.rowCount() == 4
+    row = [p.bands_table.item(3, c).text() for c in range(p.bands_table.columnCount())]
+    assert row == ["Bots (AI)", "40", "0", "-", "300", "40%", "30%", "40", "10", "-"]
+    assert p.bands_table.minimumHeight() == 134                # room for the fourth row
+
+
+def test_what_if_table_bold_best_and_most_hits_overall(qtbot, tmp_path, monkeypatch):
+    state = _v4_state({0: (5000, [900, 0, 0, 0, 0, 0, 0, 0]),
+                       2: (200, [40, 30, 35, 50, 70, 60, 45, 20]),
+                       4: (100, [20, 10, 15, 25, 30, 41, 22, 10])})
+    p = _panel(qtbot, tmp_path, monkeypatch, state)
+    p._refresh_stats(force=True)
+    assert not p.whatif_group.isHidden() and p.whatif_group.title() == "What if - hits at other rewinds"
+    t = p.whatif_table
+    assert _header(t) == ["Shooter ping", "Plain JO", "ping -80", "ping -40", "ping +0",
+                          "ping +40", "ping +80", "ping +120", "ping +160", "Bullets"]
+    assert t.rowCount() == 3                                   # only bands with bullets
+    assert [t.item(r, 0).text() for r in range(3)] == ["under 50", "80-99", "150-199"]
+    assert [t.item(1, c).text() for c in range(1, 10)] == [
+        "40", "30", "35", "50", "70", "60", "45", "20", "200"]
+    bold = [[c for c in range(t.columnCount()) if t.item(r, c).font().bold()] for r in range(3)]
+    assert bold == [[1], [5], [6]]                             # each row's best rewind
+    # 80 and over only (the minimum ping): ping +80 has 60 + 41, ping +40 has 70 + 30.
+    assert p.whatif_best_lbl.text() == "Most hits overall: <b>ping +80</b>"
+
+
+def test_what_if_says_not_enough_yet_under_300_bullets(qtbot, tmp_path, monkeypatch):
+    state = _v4_state({2: (299, [40, 30, 35, 50, 70, 60, 45, 20])})
+    p = _panel(qtbot, tmp_path, monkeypatch, state)
+    p._refresh_stats(force=True)
+    assert p.whatif_best_lbl.text() == "Most hits overall: not enough yet (299 of 300 bullets)"
+    assert p.whatif_table.rowCount() == 1
+
+
+def test_an_older_helper_shows_no_what_if_no_bots_row_and_the_old_totals(
+        qtbot, tmp_path, monkeypatch):
+    state = _v4_state({2: (500, [40, 30, 35, 50, 70, 60, 45, 20])}, dead_hits=9)
+    state.stats.has_v4 = False                                 # a version 3 helper
+    p = _panel(qtbot, tmp_path, monkeypatch, state)
+    p._refresh_stats(force=True)
+    assert p.whatif_group.isHidden()
+    assert p.bands_table.rowCount() == 3 and p.bands_table.minimumHeight() == 110
+    assert "<b>1,200</b> hits counted with it" in p.totals_lbl.text()
+    assert "Dead bodies" not in p.totals_lbl.text()
+
+
+def test_page_with_the_what_if_box_fits_1024x768(qtbot, tmp_path, monkeypatch):
+    """Same rule as the other Server tab pages (test_server_patcher): a sub-page
+    gets about 1004 x 540 at 1024x768 and scrolls rather than squashing a box."""
+    from PyQt6.QtWidgets import QApplication, QGroupBox, QScrollArea, QTabWidget
+    state = _v4_state({i: (400 + i, [40, 30, 35, 50, 70, 60, 45, 20]) for i in range(6)},
+                      dead_hits=12)
+    p = _panel(qtbot, tmp_path, monkeypatch, state)
+    tabs = QTabWidget()
+    qtbot.addWidget(tabs)
+    tabs.addTab(p, "Lag compensation")
+    tabs.resize(1004, 540)
+    tabs.show()
+    p._refresh_stats(force=True)
+    for _ in range(20):
+        QApplication.processEvents()
+    assert p.whatif_group.isVisible() and p.whatif_table.rowCount() == 6
+    columns = [a for a in p.findChildren(QScrollArea) if a.widgetResizable()]
+    assert len(columns) == 2                                   # still two scrolling columns
+    for group in p.findChildren(QGroupBox):
+        assert group.height() >= group.minimumSizeHint().height(), group.title()
+    # The new box asks for no more width than the widest box already in its
+    # column, so it cannot make the column any wider than it was.
+    others = [g.minimumSizeHint().width() for g in p.findChildren(QGroupBox)
+              if g is not p.whatif_group and g.parent() is p.whatif_group.parent()]
+    assert len(others) == 3 and p.whatif_group.minimumSizeHint().width() <= max(others)
+    assert p.whatif_table.height() >= (p.whatif_table.horizontalHeader().height()
+                                       + 6 * 24)               # all six rows show
+    tabs.hide()

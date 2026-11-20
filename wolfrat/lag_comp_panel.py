@@ -96,6 +96,16 @@ TARGETS_HELP = (
     "If high-ping players really are harder to hit, their row shows a lower hit %.")
 
 
+# What if (helper version 4): the same bullets judged at other rewinds.
+WHATIF_TITLE = "What if - hits at other rewinds"
+WHATIF_HELP = ("How many hits the same bullets would have scored at each rewind, by the "
+               "shooter's ping - counted only, no hit is changed.")
+
+
+def _whatif_columns(offsets) -> list:
+    return ["Shooter ping"] + [lc.what_if_column_label(o) for o in offsets] + ["Bullets"]
+
+
 def _pct(hits: int, close: int) -> str:
     return "-" if not close else "%.0f%%" % (hits * 100.0 / close)
 _HISTORY_COLUMNS = ["Started", "Min", "Setting", "Hits", "Without", "Gain", "Best"]
@@ -256,6 +266,27 @@ class LagCompPanel(QWidget):
         stats_box.addLayout(buttons)
         stats_group.setLayout(stats_box)
         left.addWidget(stats_group)
+
+        # Shown only when the helper in the server is version 4 or later.
+        self.whatif_group = QGroupBox(WHATIF_TITLE)
+        whatif_box = QVBoxLayout()
+        whatif_note = QLabel(WHATIF_HELP)
+        whatif_note.setWordWrap(True)
+        whatif_note.setStyleSheet("font-size: 9pt; color: #c8b040;")
+        whatif_note.setMinimumWidth(240)
+        whatif_note.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        whatif_box.addWidget(whatif_note)
+        self._whatif_labels = _whatif_columns(lc.WHATIF_OFFSETS)
+        self.whatif_table = self._table(self._whatif_labels)
+        whatif_box.addWidget(self.whatif_table)
+        self.whatif_best_lbl = QLabel()
+        self.whatif_best_lbl.setWordWrap(True)
+        self.whatif_best_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self.whatif_best_lbl.setStyleSheet("font-size: 10pt; color: #e0d070; padding: 2px 4px;")
+        whatif_box.addWidget(self.whatif_best_lbl)
+        self.whatif_group.setLayout(whatif_box)
+        self.whatif_group.setVisible(False)
+        left.addWidget(self.whatif_group)
 
         log_group = QGroupBox("\U0001F4CB Live activity & auto-tune log")
         log_box = QVBoxLayout()
@@ -607,11 +638,13 @@ class LagCompPanel(QWidget):
             self.players_table.setRowCount(0)
             self.bands_table.setRowCount(0)
             self.targets_table.setRowCount(0)
+            self.whatif_group.setVisible(False)
             return
         s = st.stats
         self._show_totals(st, s)
         self._show_players(s)
         self._show_targets(s)
+        self._show_what_if(st, s)
         self._record_background(st)
 
     def _record_background(self, st: lc.State) -> None:
@@ -644,10 +677,14 @@ class LagCompPanel(QWidget):
         else:
             gain = s.gain_percent
             word = "would have" if st.observe else "counted"
+            # Version 4: hits are live people only; dead bodies are counted apart.
+            who = " on live players and bots" if s.has_v4 else ""
+            dead = (f" · Dead bodies hit: {s.dead_hits:,} (not counted)"
+                    if s.has_v4 and s.dead_hits > 0 else "")
             self.totals_lbl.setText(self._with_reset_note(
-                f"<b>{s.hits:,}</b> hits {word} with it, <b>{s.plain_hits:,}</b> without "
+                f"<b>{s.hits:,}</b> hits{who} {word} with it, <b>{s.plain_hits:,}</b> without "
                 f"(<b>{'-' if gain is None else '%+.0f%%' % gain}</b>)"
-                f"<br>Saved <b>{s.gained:,}</b> · cost <b>{s.lost:,}</b>"
+                f"<br>Saved <b>{s.gained:,}</b> · cost <b>{s.lost:,}</b>{dead}"
                 f"<br><span style='font-size:9pt'>{minutes} min · {s.tests:,} bullet "
                 f"checks · server tick {s.tick_us / 1000:.1f} ms</span>"))
         suggestion = s.suggested_extra()
@@ -719,17 +756,58 @@ class LagCompPanel(QWidget):
                                       "- tick the box again to load the new one.</b>")
             return
         self.targets_note.setText(TARGETS_HELP)
+        # Version 4 adds one row for the AI soldiers ("On" = bots on the map now).
+        bands = list(s.bands) + ([s.bot_totals] if s.has_v4 and s.bot_totals else [])
+        self.bands_table.setMinimumHeight(110 + 24 * max(0, len(bands) - lc.BANDS))
         self._fill(self.bands_table, [
             [b.label, str(b.players), f"{b.close_low:,}", _pct(b.hits_low, b.close_low),
              f"{b.close_lag:,}", _pct(b.hits_lag, b.close_lag),
              _pct(b.plain_lag, b.close_lag_plain), f"{b.gained:,}", f"{b.lost:,}",
-             _signed(b.cal_median)] for b in s.bands])
+             _signed(b.cal_median)] for b in bands])
         rows = sorted(s.targets, key=lambda t: -t.ping)
         self._fill(self.targets_table, [
             [t.name, str(t.ping), f"{t.close_low:,}", _pct(t.hits_low, t.close_low),
              f"{t.close_lag:,}", _pct(t.hits_lag, t.close_lag),
              _pct(t.plain_lag, t.close_lag_plain), f"{t.gained:,}", f"{t.lost:,}"]
             for t in rows])
+
+    def _show_what_if(self, st: lc.State, s: lc.Stats):
+        """One row per shooter ping band that has bullets; the best rewind of
+        each row in bold; under it the rewind with the most hits overall."""
+        self.whatif_group.setVisible(s.has_v4)
+        if not s.has_v4:
+            return
+        labels = _whatif_columns(s.what_if_offsets)
+        if labels != self._whatif_labels:
+            self._whatif_labels = labels
+            self.whatif_table.setHorizontalHeaderLabels(labels)
+        rows = [r for r in s.what_if if r.steps]
+        table = self.whatif_table
+        table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            best = max(row.hits) if row.hits else 0
+            cells = [row.label] + [f"{n:,}" for n in row.hits] + [f"{row.steps:,}"]
+            for c, text in enumerate(cells):
+                item = QTableWidgetItem(text)
+                if c:
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                if best and 1 <= c <= len(row.hits) and row.hits[c - 1] == best:
+                    font = item.font()
+                    font.setBold(True)
+                    item.setFont(font)
+                table.setItem(r, c, item)
+        # Just tall enough for its rows (and a scroll bar on a narrow window).
+        table.setFixedHeight(table.horizontalHeader().sizeHint().height() + 24 * max(1, len(rows))
+                             + table.horizontalScrollBar().sizeHint().height()
+                             + 2 * table.frameWidth() + 2)
+        bullets, best_cols = s.what_if_best(st.settings.min_ping_ms if st.settings else 0)
+        if best_cols:
+            names = " and ".join(labels[1 + c] for c in best_cols)
+            self.whatif_best_lbl.setText(f"Most hits overall: <b>{names}</b>")
+        else:
+            self.whatif_best_lbl.setText(
+                f"Most hits overall: not enough yet ({bullets:,} of "
+                f"{lc.WHATIF_MIN_BULLETS} bullets)")
 
     def _show_history(self):
         rows = list(reversed(self._history.rows))
