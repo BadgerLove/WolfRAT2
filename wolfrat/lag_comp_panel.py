@@ -548,7 +548,7 @@ class LagCompPanel(QWidget):
         except lc.LagCompError as exc:
             self.state_lbl.setText("⚠ " + str(exc))
             return
-        self._elsewhere = state.kind == lc.OLD and lc.managed_elsewhere(state)
+        self._elsewhere = self._run_elsewhere(state)
         if new_server and self._wish_on and not state.on and not self._dirty:
             if state.kind == lc.OLD:
                 # On already, from another WolfRAT version's helper: the server
@@ -594,7 +594,7 @@ class LagCompPanel(QWidget):
                                        "(run WolfRAT as administrator if this does not clear)...")
                 return
             state = self._write(pid, memory, state)
-            self._elsewhere = state.kind == lc.OLD and lc.managed_elsewhere(state)
+            self._elsewhere = self._run_elsewhere(state)
         self._state = state
         self._show_state(state)
         if self._failed_text and not state.on:
@@ -604,6 +604,10 @@ class LagCompPanel(QWidget):
             # Tell other WolfRATs this one is running it (version 4 helpers).
             lc.stamp_owner(memory, state)
         self._record_background(state)
+
+    def _run_elsewhere(self, state: lc.State) -> bool:
+        """Another WolfRAT that is open now runs the helper that is on."""
+        return state.kind == lc.OLD and lc.managed_elsewhere(state, own_dir=self._data_dir)
 
     def _write(self, pid: int, memory, state: lc.State) -> lc.State:
         self._dirty = False

@@ -669,3 +669,14 @@ def test_a_quick_retry_asks_for_a_poll_when_it_is_due(qtbot, tmp_path, monkeypat
     clock[0] = 1100.0                                          # slow retries: the normal poll does it
     p.server_tick(_Mem(), writable=True)
     assert "every 30 s" in p.state_lbl.text() and not p._retry_timer.isActive()
+
+
+def test_the_page_gives_the_check_its_own_data_folder(qtbot, tmp_path, monkeypatch):
+    """So an older helper this WolfRAT loaded before it was updated is not taken
+    for another WolfRAT's just because a second WolfRAT is open on the PC."""
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch, {"on": False},
+                                      _other_version_on())
+    asked = []
+    monkeypatch.setattr(lc, "managed_elsewhere", lambda st, **kw: asked.append(kw) or False)
+    p.server_tick(_Mem(), writable=True)
+    assert asked and all(kw == {"own_dir": str(tmp_path)} for kw in asked)

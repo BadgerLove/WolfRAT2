@@ -637,3 +637,51 @@ def test_mycomp_answers_when_it_is_on_from_another_wolfrat_version(server):
     state = lc.read_state(server, MINE)
     assert state.kind == lc.OLD
     assert lc.mycomp_line(state, "badgerlove") == "BadgerLove P142 R212 Hits 48 +9 comp (+23%)"
+
+
+# ------------------- an older helper from this WolfRAT's own folder (W3)
+def test_an_older_helper_from_this_wolfrats_own_folder_is_not_someone_elses(tmp_path):
+    """The normal update on a PC that runs two servers: this WolfRAT's older
+    build loaded the helper (from this folder) and has gone.  The other WolfRAT
+    open on the PC looks after another server and has nothing to do with it."""
+    mine = tmp_path / "Live WolfRAT"
+    mine.mkdir()
+    old = _theirs(has_v4=False, helper_dir=str(mine).upper() + "\\")
+    assert lc.managed_elsewhere(old, other_wolfrat=lambda: True, own_dir=str(mine)) is False
+    # Loaded from another WolfRAT's folder (a test build next to the live one).
+    other = _theirs(has_v4=False, helper_dir=str(tmp_path / "Test WolfRAT"))
+    assert lc.managed_elsewhere(other, other_wolfrat=lambda: True, own_dir=str(mine)) is True
+    assert lc.managed_elsewhere(other, other_wolfrat=lambda: False, own_dir=str(mine)) is False
+    # Windows would not say where it was loaded from: any other WolfRAT counts.
+    unknown = _theirs(has_v4=False, helper_dir="")
+    assert lc.managed_elsewhere(unknown, other_wolfrat=lambda: True, own_dir=str(mine)) is True
+    assert lc.managed_elsewhere(old, other_wolfrat=lambda: True) is True     # folder not given
+    # A version 4 helper goes by its owner, wherever it was loaded from.
+    v4 = _theirs(owner_pid=4242, owner_age_ms=100, helper_dir=str(mine))
+    assert lc.managed_elsewhere(v4, own_pid=1, pid_running=lambda pid: True,
+                                own_dir=str(mine)) is True
+
+
+def test_read_state_says_where_another_builds_helper_was_loaded_from(server):
+    server.add_helper(OTHER, OTHER_BASE, version=3)
+    server.point_calls_at(wraps(OTHER_BASE))
+    assert lc.read_state(server, MINE).helper_dir == ""            # this server cannot say
+    server.module_dir = lambda base: r"D:\WolfRAT Live" if base == OTHER_BASE else "wrong"
+    assert lc.read_state(server, MINE).helper_dir == r"D:\WolfRAT Live"
+    server.add_helper(MINE, MINE_BASE)
+    server.point_calls_at(wraps(MINE_BASE))
+    assert lc.read_state(server, MINE).helper_dir == ""            # only for another build's
+
+
+def test_module_dir_asks_windows_for_the_helpers_file():
+    class Kernel:
+        def K32GetModuleFileNameExW(self, handle, base, buffer, size):
+            if base.value != OTHER_BASE:
+                return 0
+            buffer.value = "D:\\WolfRAT Live\\" + OTHER
+            return len(buffer.value)
+
+    proc = lc.ServerProcess.__new__(lc.ServerProcess)
+    proc._h, proc._k = 1, Kernel()
+    assert proc.module_dir(OTHER_BASE) == r"D:\WolfRAT Live"
+    assert proc.module_dir(MINE_BASE) == ""

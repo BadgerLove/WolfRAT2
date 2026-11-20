@@ -402,6 +402,7 @@ class State:
     has_v4: bool = False              # this helper's block is version 4 or later
     owner_pid: int = 0                # the WolfRAT that says it runs it (v4; 0 = nobody yet)
     owner_age_ms: Optional[int] = None    # how long ago it last said so (None = never)
+    helper_dir: str = ""              # OLD only: the folder that helper was loaded from
 
     @property
     def on(self) -> bool:
@@ -660,6 +661,7 @@ class ServerProcess:
                                               ctypes.POINTER(ctypes.c_uint32), ctypes.c_uint32)
         k.K32GetModuleBaseNameW.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_wchar_p,
                                             ctypes.c_uint32)
+        k.K32GetModuleFileNameExW.argtypes = k.K32GetModuleBaseNameW.argtypes
         self._k = k
         access = _PROCESS_VM_READ | _PROCESS_QUERY_INFORMATION
         if not read_only:
@@ -710,6 +712,14 @@ class ServerProcess:
             if self._k.K32GetModuleBaseNameW(self._h, ctypes.c_void_p(base), name, 260):
                 out[name.value.lower()] = int(base)
         return out
+
+    def module_dir(self, base: int) -> str:
+        """The folder a loaded module's file is in ('' when Windows will not say).
+        A helper sits in the data folder of the WolfRAT that loaded it."""
+        name = ctypes.create_unicode_buffer(1024)
+        if not self._k.K32GetModuleFileNameExW(self._h, ctypes.c_void_p(base), name, 1024):
+            return ""
+        return os.path.dirname(name.value)
 
     def _remote_export(self, base: int, name: bytes) -> Optional[int]:
         """Address of an export of a module loaded in the server.  Reads only
@@ -932,9 +942,15 @@ def read_state(proc: ServerProcess, wanted_name: Optional[str] = None) -> State:
         owner_pid = int(block.owner_pid)
         if block.owner_heartbeat:
             owner_age = (_tick_count() - block.owner_heartbeat) & 0xFFFFFFFF
+    helper_dir = ""
+    if kind == OLD:
+        try:
+            helper_dir = proc.module_dir(mine.base)
+        except Exception:
+            helper_dir = ""
     return State(kind, mine.base, mine.shared, block.status == 1,
                  block.error.split(b"\0")[0].decode("latin-1"), bool(block.observe),
-                 settings, stats, alive, stats.has_v4, owner_pid, owner_age)
+                 settings, stats, alive, stats.has_v4, owner_pid, owner_age, helper_dir)
 
 
 # ------------------------------------------------- one WolfRAT runs it (P1)
@@ -965,16 +981,26 @@ def stamp_owner(memory, state: Optional[State], pid: Optional[int] = None,
 
 def managed_elsewhere(state: Optional[State], own_pid: Optional[int] = None,
                       pid_running: Optional[Callable[[int], bool]] = None,
-                      other_wolfrat: Optional[Callable[[], bool]] = None) -> bool:
+                      other_wolfrat: Optional[Callable[[], bool]] = None,
+                      own_dir: Optional[str] = None) -> bool:
     """True when another WolfRAT that is running right now looks after the
     helper that has the calls (``state.kind`` OLD).
 
     Version 4 block: its WolfRAT's process id is not ours, it said so less than
-    30 s ago, and that process is still running.  Older block (no owner in
-    it): any other WolfRAT running on this PC counts."""
+    30 s ago, and that process is still running.
+
+    Older block (no owner in it): any other WolfRAT running on this PC counts -
+    unless that helper was loaded from this WolfRAT's own data folder
+    (``own_dir``).  Then this WolfRAT put it there before it was updated, and
+    another WolfRAT open on the PC (for another server) has nothing to do with
+    it: the normal case after an update on a PC that runs two servers."""
     if state is None or state.kind != OLD:
         return False
     if not state.has_v4:
+        if own_dir and state.helper_dir and (
+                single_instance.folder_key(state.helper_dir)
+                == single_instance.folder_key(own_dir)):
+            return False
         return bool((other_wolfrat or single_instance.other_instance_running)())
     me = os.getpid() if own_pid is None else own_pid
     if not state.owner_pid or state.owner_pid == me:
