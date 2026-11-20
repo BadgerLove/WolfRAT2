@@ -31,6 +31,7 @@ from wolfrat import map_weapons
 from wolfrat import lag_comp
 from wolfrat import rank_tone
 from wolfrat import mycmd
+from wolfrat import single_instance
 from wolfrat.weather_tab import WeatherTab, scroll_column
 from wolfrat.mod_entrance_panel import ModEntrancePanel
 from wolfrat.mod_ranks import ModRoster
@@ -10344,6 +10345,33 @@ def schedule_desktop_smoke(
     return result_path
 
 
+# One WolfRAT per folder (2026-11-20): the day before, two copies of the same
+# WolfRAT ran against one server for hours and every message went out twice.
+SECOND_COPY_TEXT = ("WolfRAT is already running from this folder. Two copies both talk to the "
+                    "server, so every message and vote would be sent twice.")
+
+
+def _second_copy_box():
+    """The question a second copy from the same folder asks: (box, close, open)."""
+    box = QMessageBox()
+    box.setStyleSheet(DARK_STYLE)
+    box.setIcon(QMessageBox.Icon.Warning)
+    box.setWindowTitle("WolfRAT is already running")
+    box.setText(SECOND_COPY_TEXT)
+    close_btn = box.addButton("Close this one", QMessageBox.ButtonRole.RejectRole)
+    open_btn = box.addButton("Open anyway", QMessageBox.ButtonRole.AcceptRole)
+    box.setDefaultButton(close_btn)
+    box.setEscapeButton(close_btn)
+    return box, close_btn, open_btn
+
+
+def _ask_open_second_copy() -> bool:
+    """True when the admin chose "Open anyway"."""
+    box, _close_btn, open_btn = _second_copy_box()
+    box.exec()
+    return box.clickedButton() is open_btn
+
+
 def main(argv=None, runtime: DesktopRuntime | None = None):
     raw_arguments = list(sys.argv if argv is None else argv)
     try:
@@ -10392,6 +10420,12 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
     try:
         app = QApplication(list(launch.qt_argv))
+        # One WolfRAT per folder.  Never in the smoke run (the tests and the
+        # build check use it), and before anything connects to the server.
+        if not launch.smoke_test and not single_instance.claim(
+                runtime.data_dir, _ask_open_second_copy):
+            wire_log("Already running from this folder - this copy was closed")
+            return 0
         window = start_desktop(app, runtime)
     except BaseException as error:
         if launch.smoke_test:

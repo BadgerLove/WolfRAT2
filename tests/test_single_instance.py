@@ -188,3 +188,76 @@ def test_the_real_process_list_has_this_process():
     assert os.getpid() in {pid for pid, _parent, _name in si.process_list()}
     assert si.pid_running(os.getpid())
     assert not si.pid_running(0)
+
+
+# ------------------------------------------------------------ the desktop start
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+
+def test_the_question_reads_as_agreed_and_close_this_one_is_the_default(qapp):
+    import wolfrat.app as app_module
+    box, close_btn, open_btn = app_module._second_copy_box()
+    assert box.text() == ("WolfRAT is already running from this folder. Two copies both talk "
+                          "to the server, so every message and vote would be sent twice.")
+    assert close_btn.text() == "Close this one" and open_btn.text() == "Open anyway"
+    assert box.defaultButton() is close_btn and box.escapeButton() is close_btn
+    assert len(box.buttons()) == 2
+    box.deleteLater()
+
+
+def _main_with(monkeypatch, tmp_path, claim, arguments=()):
+    """app.main() with the desktop itself replaced: returns (exit code, what ran)."""
+    import sys as _sys
+
+    import wolfrat.app as app_module
+    ran = []
+    monkeypatch.setattr(_sys, "excepthook", _sys.excepthook)       # main() sets its own
+
+    class _App:
+        def exec(self):
+            ran.append("exec")
+            return 0
+
+        def exit(self, code=0):
+            ran.append("exit")
+
+    class _Window:
+        def shutdown(self):
+            ran.append("shutdown")
+
+    def start(application, runtime):
+        ran.append("start")
+        return _Window()
+
+    def claimed(data_dir, ask):
+        ran.append(("claim", str(data_dir)))
+        return claim
+
+    monkeypatch.setattr(app_module, "QApplication", lambda _arguments: _App())
+    monkeypatch.setattr(app_module, "start_desktop", start)
+    monkeypatch.setattr(app_module, "schedule_desktop_smoke", lambda *a, **k: ran.append("smoke"))
+    monkeypatch.setattr(app_module.single_instance, "claim", claimed)
+    runtime = app_module.DesktopRuntime.isolated(tmp_path)           # no usage ping, no auto-connect
+    code = app_module.main(["WolfRAT2.exe", "--data-dir", str(tmp_path), *arguments],
+                           runtime=runtime)
+    return code, ran
+
+
+def test_the_desktop_start_asks_for_the_data_folder_and_carries_on(monkeypatch, tmp_path):
+    code, ran = _main_with(monkeypatch, tmp_path, claim=True)
+    assert code == 0
+    assert ran == [("claim", str(tmp_path.resolve())), "start", "exec", "shutdown"]
+
+
+def test_close_this_one_ends_before_anything_starts(monkeypatch, tmp_path):
+    code, ran = _main_with(monkeypatch, tmp_path, claim=False)
+    assert code == 0
+    assert ran == [("claim", str(tmp_path.resolve()))]              # no window, no connection
+
+
+def test_the_smoke_run_never_asks(monkeypatch, tmp_path):
+    """The tests and the build check start WolfRAT with --smoke-test while the
+    admin's own WolfRAT may be open: that must never put up a question."""
+    code, ran = _main_with(monkeypatch, tmp_path, claim=False, arguments=("--smoke-test",))
+    assert code == 0
+    assert ran == ["start", "smoke", "exec", "shutdown"]
