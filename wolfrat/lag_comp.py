@@ -1250,6 +1250,7 @@ class EventLogger:
     """Timestamped event and auto-tune log for WolfRAT2 (human .log + structured .jsonl)."""
 
     MAX_LINES = 200
+    TAIL_BYTES = 8 * 1024 * 1024     # how much of the .jsonl is read back for _logged_steps
 
     def __init__(self, base_dir: str):
         import json
@@ -1259,6 +1260,7 @@ class EventLogger:
         self.lines: list[str] = []
         self._last_session_key: Optional[str] = None
         self._last_tune_minute: int = 0
+        self._logged: set = set()        # (minute, tick_count) already in the .jsonl
         try:
             if os.path.exists(self.log_path):
                 with open(self.log_path, encoding="utf-8", errors="replace") as fh:
@@ -1292,6 +1294,34 @@ class EventLogger:
         self._append(line, payload)
         return line
 
+    def _logged_steps(self, pid: int) -> set:
+        """(minute, tick_count) of the auto-tune steps already written to the
+        .jsonl for this server process, read from the end of the file.
+
+        The helper keeps its last 64 decisions.  A WolfRAT that has just started
+        knows nothing of what the one before it logged, and wrote all of them
+        again as new lines stamped "now" (review B4).  The tick count is the
+        server's own clock at the decision, so the same decision is recognised
+        and a later session's minute 1 is not."""
+        seen: set = set()
+        try:
+            with open(self.jsonl_path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                fh.seek(max(0, fh.tell() - self.TAIL_BYTES))
+                data = fh.read()
+        except OSError:
+            return seen
+        for raw in data.split(b"\n"):
+            if b'"tune_step"' not in raw:
+                continue
+            try:
+                row = self._json.loads(raw.decode("utf-8"))
+                if row.get("kind") == "tune_step" and row.get("pid") == pid:
+                    seen.add((int(row["step"]["minute"]), int(row["step"]["tick_count"])))
+            except Exception:
+                continue                 # a line cut in half by the seek, or not ours
+        return seen
+
     def record_poll(self, pid: int, stats: Stats, settings: Settings,
                     include_snapshot: bool = False, now: Optional[float] = None) -> list[str]:
         """Log any new per-minute auto-tune decisions, plus an optional periodic snapshot."""
@@ -1300,12 +1330,15 @@ class EventLogger:
         if session_key != self._last_session_key:
             self._last_session_key = session_key
             self._last_tune_minute = 0
+            self._logged = self._logged_steps(pid)
         mode_name = TUNE_MODE_NAMES.get(stats.tune_mode if stats.has_tuner else settings.tune_mode, "off")
         if stats.has_tuner and stats.tune_log:
             for st in stats.tune_log:
                 if st.minute <= self._last_tune_minute:
                     continue
                 self._last_tune_minute = st.minute
+                if (st.minute, st.tick_count) in self._logged:
+                    continue             # logged before WolfRAT restarted
                 if st.median_ms is None:
                     msg = (f"Auto-tune min #{st.minute} [{mode_name}]: holding Extra {st.after_ms:+d} ms "
                            f"(waiting for 450 close shots in 30 min: {st.samples} in {st.window_mins} min)")

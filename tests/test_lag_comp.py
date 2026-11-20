@@ -456,3 +456,64 @@ def test_a_version_3_snapshot_has_none_of_the_new_keys(tmp_path):
     book = lc.HistoryBook(str(tmp_path / "h.json"))
     book.record(5, s, lc.Settings(), now=1_700_000_000)
     assert "what_if" not in book.rows[0] and "bots" not in book.rows[0]
+
+
+# ------------------------------------- the event log across restarts (review B4)
+TUNED = lc.Settings(False, 70, 400, 80, lc.TUNE_APPLY)
+
+
+def _tuner_stats(minutes, since=0x10, first_tick=100000):
+    s = lc.Stats(tests=10, since=since, has_tuner=True, tune_mode=lc.TUNE_APPLY, tune_value_ms=70)
+    s.tune_log = [lc.TuneStep(m, first_tick + m * 60000, 70, 70, None, 100 + m, m)
+                  for m in minutes]
+    return s
+
+
+def _tune_lines(tmp_path):
+    rows = [json.loads(line) for line in (tmp_path / "wolfrat_lag_comp_events.jsonl").read_text(
+        encoding="utf-8").splitlines()]
+    return [(r["pid"], r["step"]["minute"]) for r in rows if r["kind"] == "tune_step"]
+
+
+def test_a_wolfrat_restart_does_not_log_the_kept_decisions_again(tmp_path):
+    """The helper keeps its last 64 decisions.  A WolfRAT that had just started
+    logged every one of them again, stamped with the time it started."""
+    first = lc.EventLogger(str(tmp_path))
+    assert len(first.record_poll(999, _tuner_stats([1, 2, 3]), TUNED)) == 3
+    # WolfRAT restarts.  The helper still holds minutes 1-3 and has decided a 4th.
+    second = lc.EventLogger(str(tmp_path))
+    added = second.record_poll(999, _tuner_stats([1, 2, 3, 4]), TUNED)
+    assert len(added) == 1 and "Auto-tune min #4" in added[0]
+    assert second.record_poll(999, _tuner_stats([1, 2, 3, 4]), TUNED) == []
+    third = lc.EventLogger(str(tmp_path))                      # once more, nothing new
+    assert third.record_poll(999, _tuner_stats([1, 2, 3, 4]), TUNED) == []
+    log = (tmp_path / "wolfrat_lag_comp_events.log").read_text(encoding="utf-8")
+    assert log.count("Auto-tune min #") == 4
+    assert _tune_lines(tmp_path) == [(999, 1), (999, 2), (999, 3), (999, 4)]
+
+
+def test_a_restart_still_logs_a_new_session_and_another_server(tmp_path):
+    lc.EventLogger(str(tmp_path)).record_poll(999, _tuner_stats([1, 2]), TUNED)
+    # The counters were started again: minute 1 once more, but a later decision.
+    again = lc.EventLogger(str(tmp_path))
+    assert len(again.record_poll(999, _tuner_stats([1], since=0x99, first_tick=900000),
+                                 TUNED)) == 1
+    # Another server process whose helper happens to hold the same minutes.
+    other = lc.EventLogger(str(tmp_path))
+    assert len(other.record_poll(555, _tuner_stats([1, 2]), TUNED)) == 2
+    assert _tune_lines(tmp_path) == [(999, 1), (999, 2), (999, 1), (555, 1), (555, 2)]
+
+
+def test_reading_the_log_back_survives_broken_lines_and_a_missing_file(tmp_path):
+    assert lc.EventLogger(str(tmp_path))._logged_steps(999) == set()          # no file yet
+    lc.EventLogger(str(tmp_path)).record_poll(999, _tuner_stats([1, 2, 3]), TUNED)
+    with open(tmp_path / "wolfrat_lag_comp_events.jsonl", "ab") as fh:
+        fh.write(b'{"kind": "tune_step", "pid": 999, "step": {"minu\n')       # cut short
+        fh.write(b'\xff\xfe "tune_step" not json\n')
+        fh.write(b'{"kind": "tune_step", "pid": 999}\n')                      # no step in it
+    logger = lc.EventLogger(str(tmp_path))
+    assert logger._logged_steps(999) == {(1, 160000), (2, 220000), (3, 280000)}
+    assert logger.record_poll(999, _tuner_stats([1, 2, 3]), TUNED) == []
+    # Only the end of a long file is read: a line the read starts inside is skipped.
+    logger.TAIL_BYTES = 40
+    assert logger._logged_steps(999) == set()
