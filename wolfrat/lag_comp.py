@@ -79,6 +79,8 @@ ON = "on"              # our helper's calls
 OLD = "old"            # an older copy of the helper (another WolfRAT build)
 FOREIGN = "foreign"    # someone else's code: left alone
 UNKNOWN = "unknown"    # helper not loaded / not readable
+PARTIAL = "partial"    # some calls a helper's, the rest the game's: a switch that did
+                       # not finish (turn_on completes it, turn_off undoes it)
 
 
 class LagCompError(Exception):
@@ -846,9 +848,16 @@ def _calls(proc: ServerProcess, mine: Optional[_Helper], helpers: list) -> tuple
     if targets == [f for _, f, _ in _sites(ref.block)]:
         return STOCK, None
     # This build's helper first, then the others.
-    for h in sorted(usable, key=lambda h: h is not mine):
+    ordered = sorted(usable, key=lambda h: h is not mine)
+    for h in ordered:
         if targets == [w for _, _, w in _sites(h.block)]:
             return (ON if h is mine else OLD), h
+    # Half switched (review P2): every call is either the game's own or ONE
+    # helper's wrapper.  A person test wrapped without the bone test loses
+    # hits, so this must be repairable, not refused as someone else's code.
+    for h in ordered:
+        if all(t in (f, w) for t, (_, f, w) in zip(targets, _sites(h.block))):
+            return PARTIAL, h
     return FOREIGN, None
 
 
@@ -861,6 +870,34 @@ def _call_bytes(site: int, target: int) -> bytes:
     return b"\xe8" + struct.pack("<i", target - (site + 5))
 
 
+def _switch_calls(proc: ServerProcess, memory, changes: list) -> None:
+    """Point call sites at new targets (``[(site, target), ...]``): all of them
+    or none (review P2).
+
+    The bytes there now are read first.  ``memory.write_code`` pauses the
+    server for all the writes together and, given those bytes, puts back the
+    sites it had already changed if a later one fails - before the server runs
+    again.  Raises LagCompError saying which of the two it ended as."""
+    before = [(site, proc.read(site, 5)) for site, _ in changes]
+    wanted = [(site, _call_bytes(site, target)) for site, target in changes]
+    todo = [(new, old) for new, old in zip(wanted, before) if new[1] != old[1]]
+    if not todo:
+        return
+    try:
+        memory.write_code([new for new, _ in todo], restore=[old for _, old in todo])
+    except LagCompError:
+        raise
+    except Exception as exc:
+        try:
+            as_it_was = all(proc.read(site, 5) == old for site, old in before)
+        except LagCompError:
+            as_it_was = False
+        raise LagCompError(
+            "%s %s" % (str(exc) or "Could not change the game's hit code.",
+                       "The game's hit code is as it was." if as_it_was else
+                       "The change is half done; WolfRAT finishes it on the next try.")) from exc
+
+
 def read_state(proc: ServerProcess, wanted_name: Optional[str] = None) -> State:
     helpers = _helpers(proc)
     mine = next((h for h in helpers if h.name == wanted_name), None) if wanted_name else None
@@ -871,7 +908,7 @@ def read_state(proc: ServerProcess, wanted_name: Optional[str] = None) -> State:
     # helper.  Show its block (its settings and numbers are the live ones), so
     # the page says so and unticking the box can switch it off.  Before, with
     # this build's helper not loaded, this read as "off" (review B3).
-    if kind == OLD and owner is not None:
+    if kind in (OLD, PARTIAL) and owner is not None:
         mine = owner
     if mine is None:
         return State(kind if kind in (FOREIGN, STOCK) else UNKNOWN)
@@ -999,9 +1036,9 @@ def turn_on(pid: int, memory, data_dir: str, settings: Settings) -> State:
                                "- WolfRAT left it alone.")
         _write_settings(proc, mine.shared, settings, True)
         if kind != ON:
-            # An older helper's calls go straight over to the new one.
-            memory.write_code([(site, _call_bytes(site, wrap))
-                               for site, _, wrap in _sites(mine.block)])
+            # Another helper's calls go straight over to this one, and a half
+            # done switch is completed: all three calls or none.
+            _switch_calls(proc, memory, [(site, wrap) for site, _, wrap in _sites(mine.block)])
         after = read_state(proc, name)
         if not after.on:
             raise LagCompError("Lag compensation did not stick in the server.")
@@ -1025,8 +1062,8 @@ def turn_off(pid: int, memory) -> State:
             for h in helpers:
                 _write_settings(proc, h.shared, Settings(), False)
             return read_state(proc)
-        memory.write_code([(site, _call_bytes(site, func))
-                           for site, func, _ in _sites(owner.block)])
+        # On, or half switched: the game's own three calls back, all or none.
+        _switch_calls(proc, memory, [(site, func) for site, func, _ in _sites(owner.block)])
         for h in helpers:
             _write_settings(proc, h.shared, Settings(), False)
         after = read_state(proc)

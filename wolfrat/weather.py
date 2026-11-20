@@ -868,10 +868,16 @@ class ProcessMemory:
                                           len(data), ctypes.byref(done)) or done.value != len(data):
             raise WeatherError("Could not write to the server's memory (has it closed?).")
 
-    def write_code(self, writes: list) -> None:
+    def write_code(self, writes: list, restore: Optional[list] = None) -> None:
         """Write game code (``[(address, bytes), ...]`` in order) with the server
         paused for the moment it takes, so it never runs a half-written
-        instruction.  Uses its own short-lived handle."""
+        instruction.  Uses its own short-lived handle.
+
+        ``restore`` (optional; one ``(address, bytes)`` per write, the bytes that
+        were there): if a write fails, the ones already made are put back
+        before the server runs again, so the writes happen together or not at
+        all (lag compensation's three calls).  Without it nothing changes: the
+        failure is raised with the earlier writes left in."""
         k = self._k
         k.VirtualProtectEx.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
                                        ctypes.c_uint32, ctypes.POINTER(ctypes.c_uint32))
@@ -887,20 +893,35 @@ class ProcessMemory:
         try:
             if nt.NtSuspendProcess(handle) != 0:
                 raise WeatherError("Could not pause the server to change its code.")
+
+            def put(address, data):
+                old = ctypes.c_uint32()
+                if not k.VirtualProtectEx(handle, ctypes.c_void_p(address), len(data),
+                                          _PAGE_EXECUTE_READWRITE, ctypes.byref(old)):
+                    raise WeatherError("Could not unlock the server's code for writing.")
+                done = ctypes.c_size_t()
+                ok = (k.WriteProcessMemory(handle, ctypes.c_void_p(address), data, len(data),
+                                           ctypes.byref(done)) and done.value == len(data))
+                k.VirtualProtectEx(handle, ctypes.c_void_p(address), len(data), old.value,
+                                   ctypes.byref(ctypes.c_uint32()))
+                k.FlushInstructionCache(handle, ctypes.c_void_p(address), len(data))
+                if not ok:
+                    raise WeatherError("Could not write the server's code.")
+
             try:
-                for address, data in writes:
-                    old = ctypes.c_uint32()
-                    if not k.VirtualProtectEx(handle, ctypes.c_void_p(address), len(data),
-                                              _PAGE_EXECUTE_READWRITE, ctypes.byref(old)):
-                        raise WeatherError("Could not unlock the server's code for writing.")
-                    done = ctypes.c_size_t()
-                    ok = (k.WriteProcessMemory(handle, ctypes.c_void_p(address), data, len(data),
-                                               ctypes.byref(done)) and done.value == len(data))
-                    k.VirtualProtectEx(handle, ctypes.c_void_p(address), len(data), old.value,
-                                       ctypes.byref(ctypes.c_uint32()))
-                    k.FlushInstructionCache(handle, ctypes.c_void_p(address), len(data))
-                    if not ok:
-                        raise WeatherError("Could not write the server's code.")
+                made = 0
+                try:
+                    for address, data in writes:
+                        put(address, data)
+                        made += 1
+                except WeatherError:
+                    # Still paused: undo what went in (and the one that failed).
+                    for address, data in (restore or [])[:made + 1]:
+                        try:
+                            put(address, data)
+                        except WeatherError:
+                            pass
+                    raise
             finally:
                 nt.NtResumeProcess(handle)
         finally:

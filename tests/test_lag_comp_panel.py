@@ -510,3 +510,57 @@ def test_the_wolfrat_running_it_says_so_on_every_poll_with_write_access(
     monkeypatch.setattr(lc, "turn_off", lambda pid, memory: state)
     p.server_tick(mem, writable=True)
     assert len(mem.writes) == 2
+
+
+# ------------------------- a switch that did not finish (review P2)
+def _half_switched():
+    return lc.State(lc.PARTIAL, base=0x10000000, shared=0x10001000, ready=True,
+                    settings=lc.Settings(), stats=lc.Stats(seconds=5), alive=True)
+
+
+def test_a_half_done_switch_is_finished_when_the_box_is_ticked(qtbot, tmp_path, monkeypatch):
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch,
+                                      {"on": True, "reapply": True}, _loaded(alive=True))
+    p.server_tick(_Mem(), writable=True)
+    now["state"] = _half_switched()
+    assert p.wants_write() is False
+    p.server_tick(_Mem(), writable=False)                      # no write access yet
+    assert calls == [] and p.wants_write() is True             # asks for it
+    p.server_tick(_Mem(), writable=True)
+    assert calls == ["on"] and p.state_lbl.text().startswith("\U0001F7E2 ON")
+    assert sum("did not finish" in line for line in logs) == 1
+
+
+def test_a_half_done_switch_is_undone_when_the_box_is_unticked(qtbot, tmp_path, monkeypatch):
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch, {"on": False},
+                                      _half_switched())
+    p.server_tick(_Mem(), writable=True)
+    assert calls == ["off"] and "Off - normal JO hits" in p.state_lbl.text()
+    assert not p.on_cb.isChecked()
+
+
+def test_a_half_done_switch_that_cannot_be_repaired_says_so_and_is_not_hammered(
+        qtbot, tmp_path, monkeypatch):
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch, {"on": False},
+                                      _half_switched())
+    clock = [1000.0]
+    monkeypatch.setattr(panel_mod.time, "monotonic", lambda: clock[0])
+    tries = []
+
+    def turn_off(pid, memory):
+        tries.append(1)
+        raise lc.LagCompError("Could not write the server's code. The change is half done; "
+                              "WolfRAT finishes it on the next try.")
+    monkeypatch.setattr(lc, "turn_off", turn_off)
+    p.server_tick(_Mem(), writable=True)
+    assert len(tries) == 1 and "half done" in p.state_lbl.text()
+    p.server_tick(_Mem(), writable=True)                       # 5 s later: not again yet
+    assert len(tries) == 1
+    p._failed_text = ""
+    p._show_state(now["state"])
+    assert p.state_lbl.text() == ("⚠ Half switched: a change to the game's hit code did "
+                                  "not finish. WolfRAT is putting it right.")
+    clock[0] += panel_mod.RETRY_SECONDS
+    p.server_tick(_Mem(), writable=True)
+    assert len(tries) == 2
+    assert sum("did not finish" in line for line in logs) == 1 and not p.on_cb.isChecked()

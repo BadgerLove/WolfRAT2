@@ -300,3 +300,226 @@ def test_read_state_gives_the_owner_of_the_helper_that_is_on(server, monkeypatch
     assert (state.kind, state.has_v4, state.owner_pid, state.owner_age_ms) == (
         lc.OLD, True, 4242, 4000)
     assert lc.managed_elsewhere(state, own_pid=1000, pid_running=lambda pid: pid == 4242)
+
+
+# --------------------------------------------------------------- P2 (W4)
+@pytest.mark.parametrize("failing", [0, 1, 2])
+def test_a_failed_write_while_switching_on_leaves_all_three_calls_as_they_were(server, failing):
+    server.add_helper(MINE, MINE_BASE)
+    server.fail_code_write = failing
+    with pytest.raises(lc.LagCompError, match="The game's hit code is as it was"):
+        lc.turn_on(PID, server, "unused", lc.Settings())
+    assert server.targets() == STOCK_TARGETS                    # none of the three changed
+    assert lc.read_state(server, MINE).kind == lc.STOCK
+    server.fail_code_write = None
+    assert lc.turn_on(PID, server, "unused", lc.Settings()).on  # the retry works
+    assert server.targets() == wraps(MINE_BASE)
+
+
+@pytest.mark.parametrize("failing", [1, 2])
+def test_a_failed_write_while_switching_off_leaves_it_on(server, failing):
+    server.add_helper(MINE, MINE_BASE, enabled=1)
+    server.point_calls_at(wraps(MINE_BASE))
+    server.fail_code_write = failing
+    with pytest.raises(lc.LagCompError, match="as it was"):
+        lc.turn_off(PID, server)
+    assert server.targets() == wraps(MINE_BASE)
+    assert lc.read_state(server, MINE).on
+    assert server.block(MINE).enabled == 1                      # still running, not half off
+
+
+def test_a_takeover_that_fails_leaves_the_other_helper_fully_on(server):
+    server.add_helper(MINE, MINE_BASE)
+    server.add_helper(OTHER, OTHER_BASE, enabled=1)
+    server.point_calls_at(wraps(OTHER_BASE))
+    server.fail_code_write = 2
+    with pytest.raises(lc.LagCompError, match="as it was"):
+        lc.turn_on(PID, server, "unused", lc.Settings())
+    assert server.targets() == wraps(OTHER_BASE)
+
+
+def test_the_bytes_there_are_read_first_and_given_to_write_code(server):
+    server.add_helper(MINE, MINE_BASE)
+    seen = {}
+
+    def write_code(writes, restore=None):
+        seen["writes"], seen["restore"] = list(writes), list(restore)
+        for address, data in writes:
+            server.write(address, data)
+    server.write_code = write_code
+    lc.turn_on(PID, server, "unused", lc.Settings())
+    assert [a for a, _ in seen["writes"]] == [site for site, _ in SITES]
+    assert seen["restore"] == [(site, lc._call_bytes(site, func)) for site, func in SITES]
+
+
+def _half(server, base, wrapped):
+    """Some of the three calls at the helper's wrappers, the rest the game's own."""
+    server.point_calls_at([w if i in wrapped else f
+                           for i, (w, f) in enumerate(zip(wraps(base), STOCK_TARGETS))])
+
+
+def test_when_the_undo_fails_too_it_says_half_done_and_reads_as_half_switched(server):
+    server.add_helper(MINE, MINE_BASE)
+    server.fail_code_write, server.restore_works = 1, False
+    with pytest.raises(lc.LagCompError, match="half done; WolfRAT finishes it on the next try"):
+        lc.turn_on(PID, server, "unused", lc.Settings())
+    state = lc.read_state(server, MINE)
+    assert state.kind == lc.PARTIAL and not state.on and state.shared
+
+
+@pytest.mark.parametrize("wrapped", [{0}, {1}, {2}, {0, 1}, {1, 2}, {0, 2}])
+def test_turn_on_finishes_a_half_done_switch(server, wrapped):
+    """Before: a mix read as someone else's code and both on and off refused,
+    leaving the person test wrapped without the bone test until a restart."""
+    server.add_helper(MINE, MINE_BASE)
+    _half(server, MINE_BASE, wrapped)
+    assert lc.read_state(server, MINE).kind == lc.PARTIAL
+    assert lc.turn_on(PID, server, "unused", lc.Settings()).on
+    assert server.targets() == wraps(MINE_BASE)
+    # Only the calls that were not there yet are written.
+    assert len(server.code_writes[-1]) == 3 - len(wrapped)
+
+
+@pytest.mark.parametrize("wrapped", [{0}, {1, 2}])
+def test_turn_off_undoes_a_half_done_switch(server, wrapped):
+    server.add_helper(MINE, MINE_BASE, enabled=1)
+    _half(server, MINE_BASE, wrapped)
+    assert lc.turn_off(PID, server).kind == lc.STOCK
+    assert server.targets() == STOCK_TARGETS and server.block(MINE).enabled == 0
+
+
+def test_a_half_done_switch_of_another_builds_helper_is_repairable_too(server):
+    server.add_helper(OTHER, OTHER_BASE, version=3, enabled=1)
+    _half(server, OTHER_BASE, {1})
+    state = lc.read_state(server, MINE)
+    assert state.kind == lc.PARTIAL and state.base == OTHER_BASE
+    assert lc.turn_off(PID, server).kind == lc.STOCK and server.targets() == STOCK_TARGETS
+    _half(server, OTHER_BASE, {0, 2})
+    assert lc.turn_on(PID, server, "unused", lc.Settings()).on
+    assert server.targets() == wraps(MINE_BASE)
+
+
+def test_a_mix_with_someone_elses_code_is_still_left_alone(server):
+    server.add_helper(MINE, MINE_BASE)
+    mixed = [wraps(MINE_BASE)[0], 0x67200100, STOCK_TARGETS[2]]
+    server.point_calls_at(mixed)
+    assert lc.read_state(server, MINE).kind == lc.FOREIGN
+    with pytest.raises(lc.LagCompError, match="left it alone"):
+        lc.turn_on(PID, server, "unused", lc.Settings())
+    with pytest.raises(lc.LagCompError, match="left it alone"):
+        lc.turn_off(PID, server)
+    assert server.targets() == mixed
+    # Two different helpers' wrappers mixed is not ours to guess at either.
+    server.add_helper(OTHER, OTHER_BASE)
+    server.point_calls_at([wraps(MINE_BASE)[0], wraps(OTHER_BASE)[1], STOCK_TARGETS[2]])
+    assert lc.read_state(server, MINE).kind == lc.FOREIGN
+
+
+# ---- the real write_code (weather.ProcessMemory) against a fake Windows
+class _FakeWin:
+    """kernel32 + ntdll as write_code uses them, over a dict of bytes."""
+
+    def __init__(self, memory, fail_at=None, fail_restore=False):
+        self.memory, self.fail_at, self.fail_restore = memory, fail_at, fail_restore
+        self.calls, self.writes, self.paused = [], 0, False
+        self.log = []                    # (address, bytes, paused at the time)
+
+    # kernel32
+    class _Fn:
+        def __init__(self, fn):
+            self.fn, self.argtypes, self.restype = fn, None, None
+
+        def __call__(self, *args):
+            return self.fn(*args)
+
+    def __getattr__(self, name):
+        if name.startswith("_"):
+            raise AttributeError(name)
+        fn = self._Fn(getattr(self, "_" + name))
+        setattr(self, name, fn)
+        return fn
+
+    def _OpenProcess(self, access, inherit, pid):
+        return 99
+
+    def _CloseHandle(self, handle):
+        self.calls.append("close")
+        return 1
+
+    def _VirtualProtectEx(self, handle, address, size, protect, old):
+        return 1
+
+    def _FlushInstructionCache(self, handle, address, size):
+        return 1
+
+    def _WriteProcessMemory(self, handle, address, data, size, done):
+        index = self.writes
+        self.writes += 1
+        failing = index == self.fail_at or (self.fail_restore and self.fail_at is not None
+                                             and index > self.fail_at)
+        if failing:
+            return 0
+        self.memory[address.value] = bytes(data[:size])
+        self.log.append((address.value, bytes(data[:size]), self.paused))
+        done._obj.value = size
+        return 1
+
+    # ntdll
+    def _NtSuspendProcess(self, handle):
+        self.paused = True
+        self.calls.append("pause")
+        return 0
+
+    def _NtResumeProcess(self, handle):
+        self.paused = False
+        self.calls.append("resume")
+        return 0
+
+
+def _process_memory(monkeypatch, win):
+    from wolfrat import weather
+    monkeypatch.setattr(weather.ctypes, "WinDLL", lambda name, **kw: win)
+    mem = weather.ProcessMemory.__new__(weather.ProcessMemory)
+    mem.pid, mem._k, mem._handle = PID, win, None
+    return weather, mem
+
+
+WRITES = [(0x1000, b"AAAAA"), (0x2000, b"BBBBB"), (0x3000, b"CCCCC")]
+BEFORE = [(0x1000, b"aaaaa"), (0x2000, b"bbbbb"), (0x3000, b"ccccc")]
+
+
+def test_write_code_without_restore_is_exactly_as_before(monkeypatch):
+    """Live patches, rank tone and wildlife call it this way: a failure is
+    raised with the earlier writes left in, as it always was."""
+    win = _FakeWin(dict(BEFORE))
+    weather, mem = _process_memory(monkeypatch, win)
+    mem.write_code(WRITES)
+    assert win.memory == dict(WRITES) and win.calls == ["pause", "resume", "close"]
+    assert all(paused for _a, _d, paused in win.log)            # all three in one pause
+
+    win = _FakeWin(dict(BEFORE), fail_at=1)
+    weather, mem = _process_memory(monkeypatch, win)
+    with pytest.raises(weather.WeatherError, match="Could not write the server's code"):
+        mem.write_code(WRITES)
+    assert win.memory == {0x1000: b"AAAAA", 0x2000: b"bbbbb", 0x3000: b"ccccc"}
+    assert win.calls == ["pause", "resume", "close"] and win.writes == 2
+
+
+@pytest.mark.parametrize("failing", [0, 1, 2])
+def test_write_code_with_restore_puts_the_earlier_writes_back_before_resuming(
+        monkeypatch, failing):
+    win = _FakeWin(dict(BEFORE), fail_at=failing)
+    weather, mem = _process_memory(monkeypatch, win)
+    with pytest.raises(weather.WeatherError, match="Could not write the server's code"):
+        mem.write_code(WRITES, restore=BEFORE)
+    assert win.memory == dict(BEFORE)                           # as it was
+    assert win.calls == ["pause", "resume", "close"]            # one pause, always resumed
+    assert all(paused for _a, _d, paused in win.log)            # the undo was inside it
+
+
+def test_write_code_resumes_the_server_even_when_the_undo_fails(monkeypatch):
+    win = _FakeWin(dict(BEFORE), fail_at=1, fail_restore=True)
+    weather, mem = _process_memory(monkeypatch, win)
+    with pytest.raises(weather.WeatherError):
+        mem.write_code(WRITES, restore=BEFORE)
+    assert win.calls == ["pause", "resume", "close"]

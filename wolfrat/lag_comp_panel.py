@@ -162,6 +162,7 @@ class LagCompPanel(QWidget):
         self._takeover = False          # the admin ticked the box: take it over even then
         self._elsewhere = False         # another running WolfRAT runs the helper that is on
         self._held_logged = False       # "leaves it alone" is logged once, not every poll
+        self._partial_logged = False    # so is "a switch did not finish"
         self._pid: Optional[int] = None
         self._state: Optional[lc.State] = None
         self._last_record = 0.0
@@ -500,7 +501,8 @@ class LagCompPanel(QWidget):
 
     def wants_write(self) -> bool:
         return self._dirty or self._retry_due() or (
-            self._wish_on and self._reapply and self._state is not None and not self._state.on)
+            self._wish_on and self._reapply and self._state is not None and not self._state.on
+        ) or (self._state is not None and self._state.kind == lc.PARTIAL)
 
     def no_server(self, text: str):
         self._pid = None
@@ -549,6 +551,15 @@ class LagCompPanel(QWidget):
                           "Tick it to put it back.")
         if self._retry_due() and not state.on:
             self._dirty = True
+        if state.kind != lc.PARTIAL:
+            self._partial_logged = False
+        elif not self._dirty and time.monotonic() >= self._retry_at:
+            # A switch that did not finish (review P2) is always wrong: finish it
+            # (box ticked) or undo it (unticked) without waiting for a click.
+            self._dirty = True
+            if not self._partial_logged:
+                self._partial_logged = True
+                self._log("Lag compensation: a switch did not finish - putting it right.")
         held = bool(self._dirty and self._wish_on and self._elsewhere and not self._takeover)
         if held:
             # It stays wanted: once that WolfRAT has gone, this one takes over.
@@ -590,7 +601,7 @@ class LagCompPanel(QWidget):
                     self._show_event_log()
                 elif not self._settings.same_core(before):
                     lc.reset_stats(pid, self._helper_name)
-            elif state.on or state.kind == lc.OLD:
+            elif state.on or state.kind in (lc.OLD, lc.PARTIAL):
                 state = lc.turn_off(pid, memory)
                 self._log("Lag compensation OFF: the server is back to normal JO hits.")
                 self._events.note(f"Lag compensation OFF (pid {pid}).", kind="off", pid=pid)
@@ -610,6 +621,8 @@ class LagCompPanel(QWidget):
                                      f"ticked; WolfRAT tries again every {RETRY_SECONDS} s.")
             else:
                 self._failed_text = "⚠ " + str(exc)
+                # Not a retry of the click; only paces the repair of a half-done switch.
+                self._retry_at = time.monotonic() + RETRY_SECONDS
             return state
         self._retry_at = 0.0
         self._last_error = ""
@@ -625,6 +638,9 @@ class LagCompPanel(QWidget):
             text = ("⚠ Something else already changes the game's hit code in this server "
                     "(onHook's own lag compensation?). WolfRAT leaves it alone.")
             self._set_available(False)
+        elif st.kind == lc.PARTIAL:
+            text = ("⚠ Half switched: a change to the game's hit code did not finish. "
+                    "WolfRAT is putting it right.")
         elif st.on:
             mode = "WATCH ONLY - counting, no hits changed" if st.observe else "ON"
             live_extra = st.stats.tune_value_ms if (st.stats and st.stats.has_tuner) else None
