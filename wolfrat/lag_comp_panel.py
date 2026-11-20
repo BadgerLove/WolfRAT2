@@ -157,6 +157,11 @@ class LagCompPanel(QWidget):
         self._retry_at = 0.0            # a failed switch-on tries again from then (0 = none)
         self._last_error = ""           # logged once, not every retry
         self._failed_text = ""          # shown while a ticked box is not running
+        # Two WolfRATs on one server (review P1): never take the calls BY ITSELF
+        # from a helper another WolfRAT is running right now.
+        self._takeover = False          # the admin ticked the box: take it over even then
+        self._elsewhere = False         # another running WolfRAT runs the helper that is on
+        self._held_logged = False       # "leaves it alone" is logged once, not every poll
         self._pid: Optional[int] = None
         self._state: Optional[lc.State] = None
         self._last_record = 0.0
@@ -406,6 +411,7 @@ class LagCompPanel(QWidget):
         if self._updating:
             return
         self._wish_on = bool(on)
+        self._takeover = bool(on)       # a deliberate click, not WolfRAT acting by itself
         self._dirty = True
         self._retry_at = 0.0
         self._last_error = ""
@@ -521,13 +527,16 @@ class LagCompPanel(QWidget):
         except lc.LagCompError as exc:
             self.state_lbl.setText("⚠ " + str(exc))
             return
+        self._elsewhere = state.kind == lc.OLD and lc.managed_elsewhere(state)
         if new_server and self._wish_on and not state.on and not self._dirty:
             if state.kind == lc.OLD:
                 # On already, from another WolfRAT version's helper: the server
-                # did not restart, WolfRAT did (an update).  Carry it on here.
+                # did not restart, WolfRAT did (an update).  Carry it on here -
+                # unless that WolfRAT is still running it (see 'held' below).
                 self._dirty = True
-                self._log("Lag compensation: it is on from another WolfRAT version - "
-                          "moving it to this one.")
+                if not self._elsewhere:
+                    self._log("Lag compensation: it is on from another WolfRAT version - "
+                              "moving it to this one.")
             elif self._reapply:
                 self._dirty = True
                 self._log("Lag compensation: new server - putting it back on.")
@@ -540,17 +549,30 @@ class LagCompPanel(QWidget):
                           "Tick it to put it back.")
         if self._retry_due() and not state.on:
             self._dirty = True
-        if self._dirty:
+        held = bool(self._dirty and self._wish_on and self._elsewhere and not self._takeover)
+        if held:
+            # It stays wanted: once that WolfRAT has gone, this one takes over.
+            if not self._held_logged:
+                self._held_logged = True
+                self._log("Lag compensation: another WolfRAT that is open now is running "
+                          "it - this one leaves it alone.")
+        else:
+            self._held_logged = False
+        if self._dirty and not held:
             if not writable:
                 self.state_lbl.setText("Waiting for write access to the server "
                                        "(run WolfRAT as administrator if this does not clear)...")
                 return
             state = self._write(pid, memory, state)
+            self._elsewhere = state.kind == lc.OLD and lc.managed_elsewhere(state)
         self._state = state
         self._show_state(state)
         if self._failed_text and not state.on:
             self.state_lbl.setText(self._failed_text)
         self._show_reset_button(bool(state.shared))
+        if writable and self._wish_on:
+            # Tell other WolfRATs this one is running it (version 4 helpers).
+            lc.stamp_owner(memory, state)
         self._record_background(state)
 
     def _write(self, pid: int, memory, state: lc.State) -> lc.State:
@@ -592,6 +614,7 @@ class LagCompPanel(QWidget):
         self._retry_at = 0.0
         self._last_error = ""
         self._failed_text = ""
+        self._takeover = False
         try:
             return lc.server_state(pid, self._helper_name)
         except lc.LagCompError:
@@ -610,7 +633,12 @@ class LagCompPanel(QWidget):
                 text += " Waiting for players - an empty server does not run it."
         elif st.kind == lc.OLD:
             # Another WolfRAT version's helper has the game's calls (older or newer).
-            if self._wish_on:
+            if self._elsewhere:
+                text = ("\U0001F7E1 On, run by another WolfRAT that is open now, so this one "
+                        "leaves it alone. "
+                        + ("Untick the box to switch it off, then tick it to run it from here."
+                           if self._wish_on else "Tick the box to run it from here."))
+            elif self._wish_on:
                 text = ("\U0001F7E1 On, from another WolfRAT version. Untick the box to "
                         "switch it off.")
             else:

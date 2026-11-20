@@ -421,3 +421,92 @@ def test_after_a_wolfrat_update_the_ticked_box_carries_on_with_this_version(
     assert any("moving it to this one" in line for line in logs)
     assert not any("restarted and it is off" in line for line in logs)
     assert p.state_lbl.text().startswith("\U0001F7E2 ON")
+
+
+# ------------------------- two WolfRATs on one server (review P1, 2026-11-20)
+class _Writes(_Mem):
+    """A server handle that records what is written through it."""
+
+    def __init__(self):
+        self.writes = []
+
+    def write(self, address, data):
+        self.writes.append((address, bytes(data)))
+
+
+def test_it_never_takes_over_by_itself_from_a_wolfrat_that_is_running_it(
+        qtbot, tmp_path, monkeypatch):
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch,
+                                      {"on": True, "reapply": True}, _other_version_on(),
+                                      elsewhere=True)
+    for _ in range(3):                                         # a new server, then two polls
+        p.server_tick(_Mem(), writable=True)
+    assert calls == []                                         # left alone
+    assert p.on_cb.isChecked() and _saved(tmp_path)["on"] is True      # never unticked
+    assert p.state_lbl.text() == (
+        "\U0001F7E1 On, run by another WolfRAT that is open now, so this one leaves it alone. "
+        "Untick the box to switch it off, then tick it to run it from here.")
+    assert sum("leaves it alone" in line for line in logs) == 1        # said once
+    assert not any("moving it to this one" in line for line in logs)
+
+    now["elsewhere"] = False                                   # that WolfRAT has closed
+    p.server_tick(_Mem(), writable=True)
+    assert calls == ["on"] and p.state_lbl.text().startswith("\U0001F7E2 ON")
+
+
+def test_ticking_the_box_takes_over_even_from_a_running_wolfrat(qtbot, tmp_path, monkeypatch):
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch, {"on": False},
+                                      _other_version_on(), elsewhere=True)
+    p.server_tick(_Mem(), writable=True)
+    assert calls == []
+    assert p.state_lbl.text() == (
+        "\U0001F7E1 On, run by another WolfRAT that is open now, so this one leaves it alone. "
+        "Tick the box to run it from here.")
+    p.on_cb.setChecked(True)                                   # a deliberate click
+    p.server_tick(_Mem(), writable=True)
+    assert calls == ["on"] and p.state_lbl.text().startswith("\U0001F7E2 ON")
+    # Afterwards it is back to never taking over by itself.
+    now["state"], now["elsewhere"] = _other_version_on(), True
+    p._dirty = True                                            # e.g. a setting changed
+    p.server_tick(_Mem(), writable=True)
+    assert calls == ["on"]
+
+
+def test_unticking_still_switches_a_running_wolfrats_helper_off(qtbot, tmp_path, monkeypatch):
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch,
+                                      {"on": True, "reapply": True}, _other_version_on(),
+                                      elsewhere=True)
+    p.server_tick(_Mem(), writable=True)
+    p.on_cb.setChecked(False)
+    p.server_tick(_Mem(), writable=True)
+    assert calls == ["off"]
+    now["elsewhere"] = False
+    p.on_cb.setChecked(True)                                   # and ticking runs it from here
+    p.server_tick(_Mem(), writable=True)
+    assert calls == ["off", "on"]
+
+
+def test_the_wolfrat_running_it_says_so_on_every_poll_with_write_access(
+        qtbot, tmp_path, monkeypatch):
+    state = _loaded(alive=True)
+    state.has_v4 = True
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch,
+                                      {"on": True, "reapply": True}, state)
+    monkeypatch.setattr(lc, "_tick_count", lambda: 987654)
+    mem = _Writes()
+    p.server_tick(mem, writable=True)
+    p.server_tick(mem, writable=True)
+    import struct
+    stamp = (state.shared + lc._OFF["owner_pid"], struct.pack("<II", os.getpid(), 987654))
+    assert mem.writes == [stamp, stamp]                        # one 8-byte write a poll
+    p.server_tick(mem, writable=False)                         # read-only handle: nothing
+    assert len(mem.writes) == 2
+    state.has_v4 = False                                       # an older helper: no room for it
+    p.server_tick(mem, writable=True)
+    assert len(mem.writes) == 2
+    state.has_v4 = True
+    p.on_cb.setChecked(False)                                  # not this WolfRAT's to run
+    now["state"] = state
+    monkeypatch.setattr(lc, "turn_off", lambda pid, memory: state)
+    p.server_tick(mem, writable=True)
+    assert len(mem.writes) == 2

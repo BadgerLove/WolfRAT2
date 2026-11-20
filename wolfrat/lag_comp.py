@@ -31,7 +31,9 @@ import os
 import struct
 import sys
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Callable, Optional
+
+from wolfrat import single_instance
 
 DLL_NAME = "wolfrat_lagcomp.dll"
 LOADED_PREFIX = "wolfrat_lagcomp_"
@@ -395,6 +397,9 @@ class State:
     settings: Optional[Settings] = None
     stats: Optional[Stats] = None
     alive: bool = False               # the server ticked in the last 3 s
+    has_v4: bool = False              # this helper's block is version 4 or later
+    owner_pid: int = 0                # the WolfRAT that says it runs it (v4; 0 = nobody yet)
+    owner_age_ms: Optional[int] = None    # how long ago it last said so (None = never)
 
     @property
     def on(self) -> bool:
@@ -874,9 +879,61 @@ def read_state(proc: ServerProcess, wanted_name: Optional[str] = None) -> State:
     alive = ((_tick_count() - block.heartbeat) & 0xFFFFFFFF) < 3000 if block.heartbeat else False
     settings = Settings(bool(block.observe), block.extra_ms, block.max_ms, block.min_ping_ms,
                         block.tune_mode if stats.has_tuner else TUNE_OFF)
+    owner_pid, owner_age = 0, None
+    if stats.has_v4:
+        owner_pid = int(block.owner_pid)
+        if block.owner_heartbeat:
+            owner_age = (_tick_count() - block.owner_heartbeat) & 0xFFFFFFFF
     return State(kind, mine.base, mine.shared, block.status == 1,
                  block.error.split(b"\0")[0].decode("latin-1"), bool(block.observe),
-                 settings, stats, alive)
+                 settings, stats, alive, stats.has_v4, owner_pid, owner_age)
+
+
+# ------------------------------------------------- one WolfRAT runs it (P1)
+# Two WolfRATs with different helper builds on one server each saw the other's
+# helper as "another version" and took the calls back, restarting the counters
+# every time.  From version 4 the WolfRAT that runs a helper writes its process
+# id and the time into the block on every poll; another WolfRAT never takes
+# over BY ITSELF from one that said so in the last 30 s and is still running.
+OWNER_FRESH_MS = 30000
+
+
+def stamp_owner(memory, state: Optional[State], pid: Optional[int] = None,
+                now_ticks: Optional[int] = None) -> bool:
+    """Say in the helper's block that this WolfRAT runs it (process id + tick
+    count, one 8-byte write).  Only this build's helper while it is on, and only
+    a version 4 block: an older block has no room for it."""
+    if state is None or not state.on or not state.shared or not state.has_v4:
+        return False
+    ticks = _tick_count() if now_ticks is None else now_ticks
+    try:
+        memory.write(state.shared + _OFF["owner_pid"],
+                     struct.pack("<II", os.getpid() if pid is None else pid,
+                                 ticks & 0xFFFFFFFF))
+    except Exception:
+        return False
+    return True
+
+
+def managed_elsewhere(state: Optional[State], own_pid: Optional[int] = None,
+                      pid_running: Optional[Callable[[int], bool]] = None,
+                      other_wolfrat: Optional[Callable[[], bool]] = None) -> bool:
+    """True when another WolfRAT that is running right now looks after the
+    helper that has the calls (``state.kind`` OLD).
+
+    Version 4 block: its WolfRAT's process id is not ours, it said so less than
+    30 s ago, and that process is still running.  Older block (no owner in
+    it): any other WolfRAT running on this PC counts."""
+    if state is None or state.kind != OLD:
+        return False
+    if not state.has_v4:
+        return bool((other_wolfrat or single_instance.other_instance_running)())
+    me = os.getpid() if own_pid is None else own_pid
+    if not state.owner_pid or state.owner_pid == me:
+        return False
+    if state.owner_age_ms is None or state.owner_age_ms >= OWNER_FRESH_MS:
+        return False
+    return bool((pid_running or single_instance.pid_running)(state.owner_pid))
 
 
 # ------------------------------------------------------------- on and off

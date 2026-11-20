@@ -222,3 +222,81 @@ def test_turn_on_takes_over_from_another_builds_helper(server):
     assert after.on and server.targets() == wraps(MINE_BASE)
     assert server.loads == [MINE] and server.block(MINE).enabled == 1
     assert server.block(MINE).extra_ms == 60
+
+
+# --------------------------------------------------------------- P1 (W3)
+def test_the_wolfrat_that_runs_it_says_so_in_a_version_4_block(server):
+    address = server.add_helper(MINE, MINE_BASE)
+    server.point_calls_at(wraps(MINE_BASE))
+    state = lc.read_state(server, MINE)
+    assert state.on and state.has_v4 and state.owner_pid == 0 and state.owner_age_ms is None
+    assert lc.stamp_owner(server, state, pid=777, now_ticks=123456) is True
+    block = server.block(MINE)
+    assert (block.owner_pid, block.owner_heartbeat) == (777, 123456)
+    assert server.read(address + lc._OFF["owner_pid"], 8) == struct.pack("<II", 777, 123456)
+    again = lc.read_state(server, MINE)
+    assert again.owner_pid == 777 and again.owner_age_ms is not None
+
+
+def test_an_older_block_is_never_written_past_its_end(server):
+    address = server.add_helper(MINE, MINE_BASE, version=3)
+    server.point_calls_at(wraps(MINE_BASE))
+    state = lc.read_state(server, MINE)
+    assert state.on and not state.has_v4
+    before = bytes(server.regions[address])
+    assert lc.stamp_owner(server, state, pid=777, now_ticks=5) is False
+    assert bytes(server.regions[address]) == before and len(before) == lc._V3_SIZE
+
+
+def test_only_the_helper_that_is_on_is_stamped(server):
+    server.add_helper(MINE, MINE_BASE)
+    assert lc.stamp_owner(server, lc.read_state(server, MINE), pid=777) is False     # off
+    server.add_helper(OTHER, OTHER_BASE)
+    server.point_calls_at(wraps(OTHER_BASE))
+    state = lc.read_state(server, MINE)                                             # theirs
+    assert state.kind == lc.OLD and lc.stamp_owner(server, state, pid=777) is False
+    assert server.block(OTHER).owner_pid == 0
+    assert lc.stamp_owner(server, None) is False
+
+
+def _theirs(**kw):
+    kw.setdefault("has_v4", True)
+    return lc.State(lc.OLD, base=OTHER_BASE, shared=OTHER_BASE + BLOCK_OFFSET, ready=True, **kw)
+
+
+def test_a_version_4_helper_is_managed_while_its_wolfrat_is_alive_and_fresh():
+    running = {4242}.__contains__
+    fresh = _theirs(owner_pid=4242, owner_age_ms=4000)
+    assert lc.managed_elsewhere(fresh, own_pid=1000, pid_running=running) is True
+    assert lc.managed_elsewhere(fresh, own_pid=4242, pid_running=running) is False   # that is us
+    stale = _theirs(owner_pid=4242, owner_age_ms=lc.OWNER_FRESH_MS)
+    assert lc.managed_elsewhere(stale, own_pid=1000, pid_running=running) is False   # 30 s silent
+    assert lc.managed_elsewhere(fresh, own_pid=1000, pid_running=lambda pid: False) is False
+    nobody = _theirs(owner_pid=0, owner_age_ms=None)
+    assert lc.managed_elsewhere(nobody, own_pid=1000, pid_running=running) is False
+    never = _theirs(owner_pid=4242, owner_age_ms=None)
+    assert lc.managed_elsewhere(never, own_pid=1000, pid_running=running) is False
+
+
+def test_an_older_helper_is_managed_while_any_other_wolfrat_runs():
+    old = _theirs(has_v4=False)
+    assert lc.managed_elsewhere(old, other_wolfrat=lambda: True) is True
+    assert lc.managed_elsewhere(old, other_wolfrat=lambda: False) is False
+
+
+def test_only_another_builds_helper_can_be_managed_elsewhere():
+    for kind in (lc.ON, lc.STOCK, lc.FOREIGN, lc.UNKNOWN):
+        state = lc.State(kind, has_v4=True, owner_pid=4242, owner_age_ms=10)
+        assert lc.managed_elsewhere(state, own_pid=1, pid_running=lambda pid: True) is False
+    assert lc.managed_elsewhere(None) is False
+
+
+def test_read_state_gives_the_owner_of_the_helper_that_is_on(server, monkeypatch):
+    monkeypatch.setattr(lc, "_tick_count", lambda: 50000)
+    server.add_helper(MINE, MINE_BASE)
+    server.add_helper(OTHER, OTHER_BASE, owner_pid=4242, owner_heartbeat=46000)
+    server.point_calls_at(wraps(OTHER_BASE))
+    state = lc.read_state(server, MINE)
+    assert (state.kind, state.has_v4, state.owner_pid, state.owner_age_ms) == (
+        lc.OLD, True, 4242, 4000)
+    assert lc.managed_elsewhere(state, own_pid=1000, pid_running=lambda pid: pid == 4242)
