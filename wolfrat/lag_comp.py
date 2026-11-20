@@ -629,6 +629,8 @@ _PROCESS_VM_READ = 0x0010
 _PROCESS_VM_WRITE = 0x0020
 _PROCESS_QUERY_INFORMATION = 0x0400
 _LIST_MODULES_32BIT = 0x01
+_WAIT_OBJECT_0 = 0
+LOAD_WAIT_MS = 15000     # how long the server gets to load the helper
 
 
 class ServerProcess:
@@ -744,6 +746,7 @@ class ServerProcess:
         mem = self._k.VirtualAllocEx(self._h, None, len(data), 0x3000, 0x04)
         if not mem:
             raise LagCompError("Could not make room in the server (run WolfRAT as administrator?).")
+        free_path = True
         try:
             self.write(int(mem), data)
             thread = self._k.CreateRemoteThread(self._h, None, 0, ctypes.c_void_p(load),
@@ -752,13 +755,21 @@ class ServerProcess:
                 raise LagCompError("Could not start the helper in the server "
                                    "(error %d; run WolfRAT as administrator?)." % ctypes.get_last_error())
             try:
-                self._k.WaitForSingleObject(thread, 15000)
+                if self._k.WaitForSingleObject(thread, LOAD_WAIT_MS) != _WAIT_OBJECT_0:
+                    # Not finished (a frozen or very busy server; review P3).  The
+                    # exit code would read 259 = "still running", which looked like
+                    # a loaded helper.  And the path must stay where it is: the
+                    # server may not have read it yet (a few bytes, left behind).
+                    free_path = False
+                    raise LagCompError("The server took too long to load WolfRAT's lag "
+                                       "compensation helper (is it frozen or very busy?).")
                 code = ctypes.c_uint32()
                 self._k.GetExitCodeThread(thread, ctypes.byref(code))
             finally:
                 self._k.CloseHandle(thread)
         finally:
-            self._k.VirtualFreeEx(self._h, ctypes.c_void_p(mem), 0, 0x8000)
+            if free_path:
+                self._k.VirtualFreeEx(self._h, ctypes.c_void_p(mem), 0, 0x8000)
         if not code.value:
             raise LagCompError("The server would not load WolfRAT's lag compensation helper.")
         return int(code.value)

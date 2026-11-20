@@ -523,3 +523,91 @@ def test_write_code_resumes_the_server_even_when_the_undo_fails(monkeypatch):
     with pytest.raises(weather.WeatherError):
         mem.write_code(WRITES, restore=BEFORE)
     assert win.calls == ["pause", "resume", "close"]
+
+
+# --------------------------------------------------------------- P3 (W5)
+class _LoadKernel:
+    """kernel32 as ServerProcess.load_library uses it."""
+    PATH_BUFFER, THREAD = 0x7000000, 55
+
+    def __init__(self, wait_result, exit_code=MINE_BASE):
+        self.wait_result, self.exit_code = wait_result, exit_code
+        self.freed, self.closed, self.waits = [], [], []
+
+    def VirtualAllocEx(self, handle, address, size, kind, protect):
+        return self.PATH_BUFFER
+
+    def CreateRemoteThread(self, *args):
+        return self.THREAD
+
+    def WaitForSingleObject(self, thread, milliseconds):
+        self.waits.append(milliseconds)
+        return self.wait_result
+
+    def GetExitCodeThread(self, thread, code):
+        code._obj.value = self.exit_code
+        return 1
+
+    def CloseHandle(self, handle):
+        self.closed.append(handle)
+        return 1
+
+    def VirtualFreeEx(self, handle, address, size, kind):
+        self.freed.append(address.value)
+        return 1
+
+
+def _loader(kernel):
+    proc = lc.ServerProcess.__new__(lc.ServerProcess)
+    proc.pid, proc._h, proc._k = PID, 1, kernel
+    proc.modules = lambda: {"kernel32.dll": 0x75000000}
+    proc._remote_export = lambda base, name: 0x75001000
+    proc.written = []
+    proc.write = lambda address, data: proc.written.append((address, data))
+    return proc
+
+
+def test_a_helper_that_loads_in_time_is_loaded_and_the_path_is_freed(tmp_path):
+    kernel = _LoadKernel(wait_result=0)
+    proc = _loader(kernel)
+    assert proc.load_library(str(tmp_path / MINE)) == MINE_BASE
+    assert kernel.waits == [lc.LOAD_WAIT_MS] and kernel.closed == [kernel.THREAD]
+    assert kernel.freed == [kernel.PATH_BUFFER]
+    (address, data), = proc.written
+    assert address == kernel.PATH_BUFFER and data.endswith(MINE.encode() + b"\0")
+
+
+@pytest.mark.parametrize("wait_result", [0x102, -1])           # timed out / the wait failed
+def test_a_helper_still_loading_after_the_wait_is_not_called_loaded(tmp_path, wait_result):
+    """Before: the result of the wait was ignored.  After 15 s the thread's exit
+    code read 259 (still running), which counted as a module address, and the
+    path was freed under a server that might not have read it yet."""
+    kernel = _LoadKernel(wait_result=wait_result, exit_code=259)
+    proc = _loader(kernel)
+    with pytest.raises(lc.LagCompError, match="took too long to load"):
+        proc.load_library(str(tmp_path / MINE))
+    assert kernel.freed == []                                   # the path stays for the server
+    assert kernel.closed == [kernel.THREAD]                     # our handle on the thread goes
+
+
+def test_a_helper_the_server_refuses_still_says_so_and_frees_the_path(tmp_path):
+    kernel = _LoadKernel(wait_result=0, exit_code=0)            # LoadLibrary returned 0
+    with pytest.raises(lc.LagCompError, match="would not load"):
+        _loader(kernel).load_library(str(tmp_path / MINE))
+    assert kernel.freed == [kernel.PATH_BUFFER]
+
+
+def test_a_slow_load_is_an_error_the_page_retries(server):
+    """turn_on passes the timeout on as LagCompError: the page keeps the box
+    ticked and tries again (by then the helper has usually finished loading)."""
+    def slow(path):
+        raise lc.LagCompError("The server took too long to load WolfRAT's lag compensation "
+                              "helper (is it frozen or very busy?).")
+    real_load = server.load_library
+    server.load_library = slow
+    with pytest.raises(lc.LagCompError, match="took too long"):
+        lc.turn_on(PID, server, "unused", lc.Settings())
+    assert server.targets() == STOCK_TARGETS
+    real_load("x/" + MINE)                                      # it finished loading meanwhile
+    server.load_library = slow                                  # must not be asked again
+    assert lc.turn_on(PID, server, "unused", lc.Settings()).on
