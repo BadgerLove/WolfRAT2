@@ -611,3 +611,29 @@ def test_a_slow_load_is_an_error_the_page_retries(server):
     real_load("x/" + MINE)                                      # it finished loading meanwhile
     server.load_library = slow                                  # must not be asked again
     assert lc.turn_on(PID, server, "unused", lc.Settings()).on
+
+
+# ------------------------------------------- follow-ups to B3 (W2)
+def test_new_settings_never_switch_another_builds_running_helper_off(server):
+    """read_state now hands back the block of the helper that is on.  Writing
+    settings into it must leave it enabled (it used to get this build's idle
+    block here, where 'enabled' did not matter)."""
+    server.add_helper(OTHER, OTHER_BASE, version=3, enabled=1, extra_ms=55)
+    server.point_calls_at(wraps(OTHER_BASE))
+    after = lc.apply_settings(PID, lc.Settings(False, 60, 400, 80), MINE)
+    assert after.kind == lc.OLD and server.block(OTHER).extra_ms == 60
+    assert server.block(OTHER).enabled == 1
+    assert server.targets() == wraps(OTHER_BASE)
+
+
+def test_mycomp_answers_when_it_is_on_from_another_wolfrat_version(server):
+    block = helper_block(OTHER_BASE, version=3, enabled=1)
+    row = block.players[4]
+    row.entity, row.ping, row.rewind_ms, row.tests = 0x1234, 142, 212, 5000
+    row.hits, row.plain_hits, row.name = 48, 39, b"BadgerLove"
+    server.add_helper(OTHER, OTHER_BASE, block)
+    assert lc.mycomp_line(lc.read_state(server, MINE), "badgerlove") == lc.MYCOMP_OFF   # not on yet
+    server.point_calls_at(wraps(OTHER_BASE))
+    state = lc.read_state(server, MINE)
+    assert state.kind == lc.OLD
+    assert lc.mycomp_line(state, "badgerlove") == "BadgerLove P142 R212 Hits 48 +9 comp (+23%)"

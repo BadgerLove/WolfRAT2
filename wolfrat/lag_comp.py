@@ -1004,7 +1004,9 @@ def apply_settings(pid: int, settings: Settings, wanted_name: Optional[str] = No
         state = read_state(proc, wanted_name)
         if not state.shared:
             raise LagCompError("Lag compensation is not loaded in this server.")
-        _write_settings(proc, state.shared, settings, state.on)
+        # OLD = another build's helper has the calls and state.shared is ITS
+        # block: it is running, so it must stay enabled.
+        _write_settings(proc, state.shared, settings, state.on or state.kind == OLD)
         return read_state(proc, wanted_name)
 
 
@@ -1152,7 +1154,8 @@ def mycomp_line(state: Optional[State], name: str, limit: int = 118) -> str:
     who was rewound for most of the session gets their numbers, even in a
     second when their ping is under it (review N5).
     """
-    if state is None or not state.on or not state.stats or not state.settings:
+    # ON, or on from another WolfRAT version's helper (its numbers are the live ones).
+    if state is None or state.kind not in (ON, OLD) or not state.stats or not state.settings:
         return MYCOMP_OFF
     row = find_player_stats(state.stats, name)
     shown = (row.name if row else name).strip() or name
