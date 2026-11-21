@@ -68,6 +68,7 @@ from wolfrat.lag_comp_panel import LagCompPanel
 from wolfrat.client_patcher_panel import ClientPatcherPanel
 from wolfrat import manual_mode
 from wolfrat.manual_mode_panel import ManualModeDialog, ManualModePanel
+from wolfrat.map_order_dialog import MapOrderDialog, OrderEntry
 from PyQt6.QtMultimedia import QSoundEffect
 from PyQt6.QtCore import QUrl
 
@@ -1728,6 +1729,7 @@ class MissionsTab(QWidget):
         self._rotation_entries = []  # authoritative MissionEntry per table row
         self._main_window = None  # set by MainWindow after creation
         self._presets = {}  # saved rotation presets
+        self._order_feed_active = False  # Edit Order is re-adding maps
         self._load_presets()
         self._build_ui()
 
@@ -1926,23 +1928,16 @@ class MissionsTab(QWidget):
         action_layout.addWidget(QLabel(""))  # spacer for header alignment
         action_layout.addSpacing(20)
 
-        move_up_btn = SatisfyingButton("Move Up")
-        move_up_btn.setToolTip(
-            "Move the selected map earlier. "
-            "The server has no reorder command, so this changes the list here only. "
-            "Press Save Auto Rotation (or save a preset) to keep the new order."
+        # Replaces Move Up / Move Down (2.6.5-2.10.24), which only moved rows
+        # in this table: the server never saw the new order.
+        self.edit_order_btn = SatisfyingButton("Edit Order /\nShuffle")
+        self.edit_order_btn.setToolTip(
+            "Change the order of the Mission Cycle: drag maps with the mouse, "
+            "move them, or shuffle the list like a deck of cards. OK puts the "
+            "new order on the server."
         )
-        move_up_btn.clicked.connect(self._move_up)
-        action_layout.addWidget(move_up_btn)
-
-        move_down_btn = SatisfyingButton("Move Down")
-        move_down_btn.setToolTip(
-            "Move the selected map later. "
-            "The server has no reorder command, so this changes the list here only. "
-            "Press Save Auto Rotation (or save a preset) to keep the new order."
-        )
-        move_down_btn.clicked.connect(self._move_down)
-        action_layout.addWidget(move_down_btn)
+        self.edit_order_btn.clicked.connect(self._open_order_editor)
+        action_layout.addWidget(self.edit_order_btn)
 
         action_layout.addSpacing(10)
 
@@ -2551,48 +2546,108 @@ class MissionsTab(QWidget):
                 "Clear mission rotation",
             )
 
-    def _move_up(self):
-        row = self.rotation_table.currentRow()
-        if row > 0:
-            self._swap_rotation_rows(row, row - 1)
-            self.rotation_table.setCurrentCell(row - 1, 0)
+    # ---- Edit Order / Shuffle (SgtMudd, 2026-11-21) ----
+    # Retail has no reorder verb (novaworld-net-re.md 5.70.8), so a new order
+    # goes on the server as MISSION CLEAR, then every map added back in order
+    # through _add_missions_in_sequence (the feed Load Preset uses).
 
-    def _move_down(self):
-        row = self.rotation_table.currentRow()
-        if row < self.rotation_table.rowCount() - 1:
-            self._swap_rotation_rows(row, row + 1)
-            self.rotation_table.setCurrentCell(row + 1, 0)
+    def _order_entries(self):
+        """The server's Mission Cycle, in queue order, for the order editor."""
+        missions = sorted(
+            self.server.mission_entries, key=lambda m: m.queue_index
+        )
+        return [
+            OrderEntry(
+                filename=m.filename,
+                title=self._find_display_name(m.filename),
+                double_time=bool(m.double_time),
+                is_current=bool(m.is_current),
+            )
+            for m in missions
+        ]
 
-    def _swap_rotation_rows(self, r1, r2):
-        """Swap two rows in the rotation table and backing list."""
-        # Swap backing list
-        self._rotation_maps[r1], self._rotation_maps[r2] = self._rotation_maps[r2], self._rotation_maps[r1]
-        self._rotation_entries[r1], self._rotation_entries[r2] = (
-            self._rotation_entries[r2],
-            self._rotation_entries[r1],
+    @staticmethod
+    def _same_maps(first, second):
+        """True when both lists hold the same maps (any order), x1/x2 too."""
+        from collections import Counter
+
+        def key(entry):
+            return (entry.filename.casefold(), entry.double_time)
+
+        return Counter(map(key, first)) == Counter(map(key, second))
+
+    def _run_order_dialog(self, entries):
+        """The edited order on OK, None on Cancel (tests replace this)."""
+        return MapOrderDialog.ask(entries, self)
+
+    def _open_order_editor(self):
+        """Edit Order / Shuffle button."""
+        if not self.server.is_connected:
+            QMessageBox.information(
+                self, "Edit Order", "Connect to a server first."
+            )
+            return
+        if self._order_feed_active:
+            QMessageBox.information(
+                self, "Edit Order",
+                "WolfRAT is still putting the last order on the server. "
+                "Try again in a few seconds.",
+            )
+            return
+        before = self._order_entries()
+        if not before:
+            QMessageBox.information(
+                self, "Edit Order",
+                "The Mission Cycle is empty: add some maps first.",
+            )
+            return
+        order = self._run_order_dialog(before)
+        if order is None:
+            return
+        if order == before:
+            self.server._log("Map order unchanged; nothing sent to the server.")
+            return
+        if not self._same_maps(before, self._order_entries()):
+            reply = QMessageBox.question(
+                self, "Edit Order",
+                "The server's map list changed while the editor was open "
+                "(a map was added or removed, or x1/x2 changed).\n\n"
+                "Put your order on the server anyway? Changes made since "
+                "you opened the editor will be lost.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+        self._apply_order(order)
+
+    def _apply_order(self, order):
+        """Clear the server's cycle and add the maps back in ``order``."""
+        maps = [entry.as_preset() for entry in order]
+        self._order_feed_active = True
+        self.server._log(
+            f"Putting the new map order on the server ({len(maps)} maps)..."
         )
 
-        # Swap table cell contents
-        for col in range(self.rotation_table.columnCount()):
-            item1 = self.rotation_table.takeItem(r1, col)
-            item2 = self.rotation_table.takeItem(r2, col)
-            self.rotation_table.setItem(r1, col, item2)
-            self.rotation_table.setItem(r2, col, item1)
+        def finished():
+            self._order_feed_active = False
+            self.server._log(
+                f"New map order is on the server: {len(maps)} maps. Save a "
+                "preset to keep this order."
+            )
 
-    def _on_rotation_reorder(self):
-        """Drag-drop reorder - rebuild filenames and attached identities."""
-        self._rotation_maps = []
-        self._rotation_entries = []
-        by_index = {
-            mission.queue_index: mission
-            for mission in self.server.mission_entries
-        }
-        for i in range(self.rotation_table.rowCount()):
-            file_item = self.rotation_table.item(i, 2)
-            if file_item:
-                self._rotation_maps.append(file_item.text())
-                queue_index = file_item.data(Qt.ItemDataRole.UserRole)
-                self._rotation_entries.append(by_index.get(queue_index))
+        def stopped(_message=None):
+            self._order_feed_active = False
+
+        submit_admin(
+            self,
+            lambda: self.server.clear_missions(),
+            lambda _result: self._add_missions_in_sequence(
+                maps, on_complete=finished, on_stopped=stopped
+            ),
+            "Clear rotation before the new map order",
+            on_failure=stopped,
+        )
 
     def auto_apply_rotation(self):
         """Called on connect. Applies saved rotation automatically."""
@@ -2788,10 +2843,12 @@ class MissionsTab(QWidget):
         )
 
     def _add_missions_in_sequence(
-        self, entries, index=0, on_complete=None, failed=None
+        self, entries, index=0, on_complete=None, failed=None, on_stopped=None
     ):
         """Add a preset serially; a map the server refuses is skipped and
-        listed at the end, it does not stop the rest of the preset."""
+        listed at the end, it does not stop the rest of the preset.
+        ``on_stopped`` runs instead of ``on_complete`` when the connection
+        is lost part way."""
 
         if failed is None:
             failed = []
@@ -2813,24 +2870,27 @@ class MissionsTab(QWidget):
             self,
             lambda: self._send_mission_add(filename, play_count),
             lambda _result: self._mission_added_in_sequence(
-                entries, index, filename, on_complete, failed
+                entries, index, filename, on_complete, failed, on_stopped
             ),
             f"Add preset mission {filename}",
             on_failure=lambda message: self._mission_failed_in_sequence(
-                entries, index, filename, on_complete, failed, message
+                entries, index, filename, on_complete, failed, message,
+                on_stopped,
             ),
         )
 
     def _mission_added_in_sequence(
-        self, entries, index, filename, on_complete, failed=None
+        self, entries, index, filename, on_complete, failed=None,
+        on_stopped=None,
     ):
         self.server._log(f"  [{index + 1}/{len(entries)}] Added {filename}")
         self._add_missions_in_sequence(
-            entries, index + 1, on_complete, failed
+            entries, index + 1, on_complete, failed, on_stopped
         )
 
     def _mission_failed_in_sequence(
-        self, entries, index, filename, on_complete, failed, message
+        self, entries, index, filename, on_complete, failed, message,
+        on_stopped=None,
     ):
         self.server._log(
             f"  [{index + 1}/{len(entries)}] Skipped {filename}: {message}"
@@ -2842,9 +2902,11 @@ class MissionsTab(QWidget):
                 self._preset_entry_file(entry) for entry in entries[index + 1:]
             )
             self._report_failed_preset_adds(failed, disconnected=True)
+            if on_stopped is not None:
+                on_stopped()
             return
         self._add_missions_in_sequence(
-            entries, index + 1, on_complete, failed
+            entries, index + 1, on_complete, failed, on_stopped
         )
 
     def _report_failed_preset_adds(self, failed, disconnected=False):

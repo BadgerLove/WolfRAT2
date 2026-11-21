@@ -4,7 +4,8 @@ Each test pins one fixed defect so it cannot silently come back:
 
 1. ChatBot bad-words list persists across restarts.
 2. ChatBot anti-spam seconds window persists across restarts.
-3. Missions far-right column: stub handlers gone, reorder reachable.
+3. Missions far-right column: stub handlers gone, reorder reachable
+   (Edit Order / Shuffle since 2026-11-21).
 4. ServerTab: password masked, no duplicate saves, port default consistent.
 5. Mods !vote: dead cooldown variable removed (no vote limit wanted).
 6. Settings: ping boxes debounce, dead handlers removed.
@@ -16,7 +17,7 @@ import json
 import time
 
 import pytest
-from PyQt6.QtWidgets import QLineEdit, QTableWidgetItem
+from PyQt6.QtWidgets import QLineEdit
 
 from wolfrat.app import (
     ChatBotTab,
@@ -139,30 +140,22 @@ def test_chatbot_spam_seconds_window_persists(qtbot, tmp_path):
 def test_missions_stub_handlers_removed():
     assert not hasattr(MissionsTab, "_cancel_clicked")
     assert not hasattr(MissionsTab, "_review_event_log")
-    # The real reorder methods still exist.
-    assert hasattr(MissionsTab, "_move_up")
-    assert hasattr(MissionsTab, "_move_down")
+    # Reorder is reachable: since 2026-11-21 through Edit Order / Shuffle,
+    # which replaced the table-only Move Up / Move Down buttons (they never
+    # reached the server). Full coverage: tests/test_map_order.py.
+    assert hasattr(MissionsTab, "_open_order_editor")
+    assert not hasattr(MissionsTab, "_move_up")
+    assert not hasattr(MissionsTab, "_move_down")
 
 
-def test_missions_move_down_reorders_backing_list(qtbot, tmp_path):
+def test_missions_edit_order_button_is_in_the_far_right_column(qtbot, tmp_path):
     rt = DesktopRuntime.isolated(tmp_path)
     tab = MissionsTab(FakeServer(), MissionsStore(rt), rt)
     qtbot.addWidget(tab)
 
-    tab._rotation_maps = ["A.bms", "B.bms"]
-    tab._rotation_entries = [object(), object()]
-    tab.rotation_table.setRowCount(2)
-    for row, label in enumerate(("A", "B")):
-        for col in range(tab.rotation_table.columnCount()):
-            tab.rotation_table.setItem(row, col, QTableWidgetItem(label))
-
-    tab.rotation_table.setCurrentCell(0, 0)
-    tab._move_down()
-    assert tab._rotation_maps == ["B.bms", "A.bms"]
-
-    tab.rotation_table.setCurrentCell(1, 0)
-    tab._move_up()
-    assert tab._rotation_maps == ["A.bms", "B.bms"]
+    labels = [b.text() for b in tab.findChildren(type(tab.edit_order_btn))]
+    assert "Edit Order /\nShuffle" in labels
+    assert "Move Up" not in labels and "Move Down" not in labels
 
 
 # --------------------------------------------------------------------------
