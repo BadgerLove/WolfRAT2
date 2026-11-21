@@ -69,6 +69,7 @@ from wolfrat.client_patcher_panel import ClientPatcherPanel
 from wolfrat import manual_mode
 from wolfrat.manual_mode_panel import ManualModeDialog, ManualModePanel
 from wolfrat.map_order_dialog import MapOrderDialog, OrderEntry
+from wolfrat import map_list_import
 from PyQt6.QtMultimedia import QSoundEffect
 from PyQt6.QtCore import QUrl
 
@@ -1943,6 +1944,15 @@ class MissionsTab(QWidget):
         self.edit_order_btn.clicked.connect(self._open_order_editor)
         action_layout.addWidget(self.edit_order_btn)
 
+        self.import_btn = SatisfyingButton("Import Old\nWolfRAT List")
+        self.import_btn.setToolTip(
+            "Turn map lists saved by the old WolfRAT (or a text file with "
+            "one map file name per line) into saved lists here. Pick one "
+            "next to Preset and press Load to put it on the server."
+        )
+        self.import_btn.clicked.connect(self._import_old_lists)
+        action_layout.addWidget(self.import_btn)
+
         action_layout.addSpacing(10)
 
         save_auto_btn = SatisfyingButton("Save Auto\nRotation")
@@ -2767,6 +2777,115 @@ class MissionsTab(QWidget):
                 self.preset_combo.setCurrentText(name)
         except Exception as e:
             self.server._log(f"Save preset error: {e}")
+
+    # ---- Import from the old WolfRAT (Dale, 2026-11-21) ----
+    # Most admins still keep their rotations in the original WolfRAT. Its
+    # list files (<title>[FILENAME]<file>[ROUNDS]<n>) become saved lists
+    # here; map_list_import reads them. Importing never touches the server.
+
+    def _choose_import_files(self):
+        """The files picked to import (tests replace this)."""
+        from PyQt6.QtWidgets import QFileDialog
+        paths, _filter = QFileDialog.getOpenFileNames(
+            self, "Import map lists from the old WolfRAT", "",
+            "Map lists (*.txt *.lst *.mis *.ini);;All files (*)",
+        )
+        return paths
+
+    def _confirm_import_overwrite(self, name, old_count, new_count):
+        """Replace a saved list with an imported one of the same name?"""
+        reply = QMessageBox.question(
+            self, "Import",
+            f"You already have a saved list called '{name}' ({old_count} "
+            f"maps). Replace it with the imported one ({new_count} maps)?"
+            f"\n\nNo keeps it and saves the import as '{name} (imported)'.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    def _free_preset_name(self, base):
+        name, number = base, 2
+        while name in self._presets:
+            name = f"{base} {number}"
+            number += 1
+        return name
+
+    def _import_old_lists(self):
+        """Import Old WolfRAT List button."""
+        paths = self._choose_import_files()
+        if not paths:
+            return
+        server_files = [
+            mission.filename for mission in self.server.available_mission_entries
+        ]
+        reports, last_name = [], None
+        for path in paths:
+            label = os.path.basename(path)
+            try:
+                imported = map_list_import.parse_map_list(
+                    map_list_import.read_text(path), map_list_import.list_name(path)
+                )
+            except OSError as error:
+                reports.append(f"{label}: could not read it ({error}).")
+                continue
+            if not imported.maps:
+                reports.append(f"{label}: no maps found in it.")
+                continue
+            name = imported.name
+            old = self._presets.get(name)
+            if old == imported.maps:
+                reports.append(f"'{name}' is already saved exactly like that.")
+                last_name = name
+                continue
+            if isinstance(old, list) and not self._confirm_import_overwrite(
+                name, len(old), len(imported.maps)
+            ):
+                name = self._free_preset_name(f"{name} (imported)")
+            self._presets[name] = imported.maps
+            if self.preset_combo.findText(name) < 0:
+                self.preset_combo.addItem(name)
+            last_name = name
+            reports.append(self._import_report(name, imported, server_files))
+        self._save_presets()
+        if last_name is not None:
+            self.preset_combo.setCurrentText(last_name)
+        for line in reports:
+            self.server._log(f"[IMPORT] {line}")
+        QMessageBox.information(
+            self, "Import",
+            "\n\n".join(reports)
+            + "\n\nPick the list next to Preset and press Load to put it on "
+            "the server (Replace clears the cycle first).",
+        )
+
+    @staticmethod
+    def _import_report(name, imported, server_files):
+        parts = [f"'{name}': {len(imported.maps)} maps"]
+        if imported.x2:
+            parts.append(f"{imported.x2} played twice (x2)")
+        if imported.twice:
+            parts.append(f"{imported.twice} listed more than once")
+        text = ", ".join(parts) + "."
+        if imported.left_out:
+            shown = "; ".join(
+                f"line {number}: {why}" for number, _line, why in imported.left_out[:5]
+            )
+            more = len(imported.left_out) - 5
+            text += f" Left out {len(imported.left_out)} line(s): {shown}"
+            text += f" (+{more} more)." if more > 0 else "."
+        if server_files:
+            missing = map_list_import.not_on_server(imported.maps, server_files)
+            if missing:
+                shown = ", ".join(missing[:8])
+                more = f" and {len(missing) - 8} more" if len(missing) > 8 else ""
+                text += (
+                    f" Not on this server: {shown}{more} (Load will ask "
+                    "about them)."
+                )
+        else:
+            text += " Not checked against the server's maps (not connected yet)."
+        return text
 
     @staticmethod
     def _preset_entry_file(entry):
