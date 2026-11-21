@@ -101,9 +101,11 @@ class ServerManagerCallerContractTests(unittest.TestCase):
             "set_next_mission": {"add_if_missing"},
             "switch_mission": {"add_if_missing"},
         }
+        # refresh_missions / refresh_game_state(quiet=...) lost their only
+        # caller on 2026-11-21 with the Missions tab's Auto Refresh timer (an
+        # extra 15 s read on top of ServerManager's own 5 s poll); the
+        # signature check below still holds them.
         caller_exercised = {
-            ("refresh_missions", "quiet"),
-            ("refresh_game_state", "quiet"),
             ("set_callbacks", "on_weapons"),
             ("set_next_mission", "add_if_missing"),
             ("switch_mission", "add_if_missing"),

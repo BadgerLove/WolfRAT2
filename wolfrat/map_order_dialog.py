@@ -6,9 +6,8 @@ like). Nothing reaches the server until OK.
 
 Retail has no reorder verb: the MISSION sub-verbs are LIST, AVAILABLE, ADD,
 REMOVE, CLEAR, CYCLE and SETNEXT (OpenNova docs, net/novaworld-net-re.md
-5.70.8). So MissionsTab applies the new order the way the saved auto rotation
-was meant to be applied on connect: MISSION CLEAR, then every map added
-back in order (the same serial feed Load Preset uses).
+5.70.8). So MissionsTab applies the new order as MISSION CLEAR, then every
+map added back in order (the same serial feed Load Preset uses).
 """
 
 from __future__ import annotations

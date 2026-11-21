@@ -8,7 +8,7 @@ saved list then shrank because Save stores the half-loaded table.
 
 1. Load asks Replace / Add to the end (Replace clears first, in order).
 2. While a load or Edit Order is putting maps on the server, Clear, Load,
-   Edit Order, Remove, x1/x2, Save and Save Auto Rotation wait for it.
+   Edit Order, Remove, x1/x2 and Save wait for it.
 3. Save asks before changing how many maps a saved list holds.
 """
 
@@ -195,14 +195,13 @@ def test_every_list_change_waits_while_a_load_is_running(qtbot, tmp_path, monkey
     tab._remove_mission(mission)
     tab._set_side_switch(mission, True)
     tab._save_preset()
-    tab._ok_clicked()
 
     assert server.calls == sent  # nothing more went to the server
-    assert len(boxes) == 7
+    assert len(boxes) == 6
     assert all("still putting maps on the server (loading '1-coop': 0 of 3 done)" in text
                for _kind, text in boxes)
     with open(tmp_path / "wolfrat_rotations.json", encoding="utf-8") as handle:
-        assert json.load(handle) == {"1-coop": PRESET}  # Save and Save Auto did nothing
+        assert json.load(handle) == {"1-coop": PRESET}  # Save did nothing
 
 
 def test_the_guard_shows_progress_and_frees_up_when_the_load_ends(qtbot, tmp_path, monkeypatch, boxes):

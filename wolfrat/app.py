@@ -1711,8 +1711,11 @@ class MissionsTab(QWidget):
     Layout:
       LEFT:   All Available Missions (QTableWidget: Mission Name | Filename)
       RIGHT:  Mission Cycle          (QTableWidget: Mission Name | r | Filename)
-      FAR RIGHT: Action buttons column (OK, Cancel, Review logs, Auto Refresh)
+      FAR RIGHT: Edit Order / Shuffle, Import Old WolfRAT List, TAC Match priority
       BOTTOM: Status bar (Connected | Game Mode | command | status | players | time)
+
+    The map list on screen is kept current by ServerManager's 5 s poll
+    (_poll_tick reads MISSION LIST); there is no refresh timer of its own.
     """
 
     _feed = None  # class default: the feed lock is free (see _run_feed)
@@ -1775,18 +1778,6 @@ class MissionsTab(QWidget):
                 json.dump(self._presets, f, indent=2)
         except Exception:
             pass
-
-    def _build_auto_preset(self):
-        """Build preset data from current rotation table (filenames + play counts)."""
-        maps = []
-        for row in range(self.rotation_table.rowCount()):
-            file_item = self.rotation_table.item(row, 2)
-            r_item = self.rotation_table.item(row, 1)
-            if file_item:
-                filename = file_item.text()
-                count = int(r_item.text()) if r_item else 1
-                maps.append({"file": filename, "count": count})
-        return maps
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -1959,30 +1950,6 @@ class MissionsTab(QWidget):
         self.import_btn.clicked.connect(self._import_old_lists)
         action_layout.addWidget(self.import_btn)
 
-        action_layout.addSpacing(10)
-
-        save_auto_btn = SatisfyingButton("Save Auto\nRotation")
-        save_auto_btn.setToolTip(
-            "Save this rotation (and its order) so WolfRAT re-applies it "
-            "automatically the next time it connects (it clears the server's "
-            "rotation first, then adds these maps in this order)"
-        )
-        save_auto_btn.clicked.connect(self._ok_clicked)
-        action_layout.addWidget(save_auto_btn)
-
-        action_layout.addSpacing(10)
-
-        review_chat_btn = SatisfyingButton("Review\nChat Log")
-        review_chat_btn.clicked.connect(self._review_chat_log)
-        action_layout.addWidget(review_chat_btn)
-
-        action_layout.addSpacing(10)
-
-        self.auto_refresh_check = QCheckBox("Auto Refresh")
-        self.auto_refresh_check.setChecked(True)
-        self.auto_refresh_check.toggled.connect(self._toggle_auto_refresh)
-        action_layout.addWidget(self.auto_refresh_check)
-
         action_layout.addSpacing(15)
 
         self.tac_fuzzy_cb = QCheckBox("TAC Match priority")
@@ -1999,33 +1966,6 @@ class MissionsTab(QWidget):
         main_h.addWidget(action_col)
 
         layout.addLayout(main_h, 1)  # stretch=1 for main area
-
-        # Auto-refresh timer
-        self._auto_refresh_timer = QTimer(self)
-        self._auto_refresh_timer.timeout.connect(self._auto_refresh_tick)
-        self._auto_refresh_timer.start(15000)  # every 15s
-
-    def _refresh_all(self):
-        """Refresh everything: rotation, available maps, gamestate."""
-        self.server.refresh_missions()
-        self.server.refresh_available_maps()
-        self.server.refresh_game_state()
-
-    def _auto_refresh_tick(self):
-        """Auto-refresh rotation and gamestate periodically."""
-        if not self.auto_refresh_check.isChecked():
-            return
-        if not self.server.is_connected:
-            return
-        self.server.refresh_missions(quiet=True)
-        self.server.refresh_game_state(quiet=True)
-
-    def _toggle_auto_refresh(self, checked):
-        """Toggle auto refresh on/off."""
-        if checked:
-            self._auto_refresh_timer.start(15000)
-        else:
-            self._auto_refresh_timer.stop()
 
     def _parse_mission_name(self, filename):
         """Extract a human-readable mission name from a filename.
@@ -2630,9 +2570,10 @@ class MissionsTab(QWidget):
         return False
 
     def _run_feed(self, entries, label, *, replace, on_complete=None):
-        """Put ``entries`` on the server in order; MISSION CLEAR first when
-        ``replace``. Holds the feed lock (``_feed``) until it ends, whether
-        it finishes, the CLEAR fails or the connection drops."""
+        """Put ``entries`` on the server in order (Load Preset, Edit Order);
+        MISSION CLEAR first when ``replace``. Holds the feed lock (``_feed``)
+        until it ends, whether it finishes, the CLEAR fails or the
+        connection drops."""
         entries = list(entries)
         self._feed = {"label": label, "done": 0, "total": len(entries)}
 
@@ -2749,22 +2690,6 @@ class MissionsTab(QWidget):
             on_complete=lambda: self.server._log(
                 f"New map order is on the server: {len(maps)} maps. Save a "
                 "preset to keep this order."
-            ),
-        )
-
-    def auto_apply_rotation(self):
-        """Called on connect. Applies saved rotation automatically."""
-        saved = self._presets.get('_auto', [])
-        if not saved:
-            return
-
-        if self._feed is not None:
-            return
-        self.server._log(f"Auto-applying saved rotation ({len(saved)} maps)...")
-        self._run_feed(
-            saved, "the auto rotation", replace=True,
-            on_complete=lambda: self.server._log(
-                f"Auto rotation applied: {len(saved)} maps"
             ),
         )
 
@@ -3202,19 +3127,6 @@ class MissionsTab(QWidget):
             self, "Load Preset",
             f"{reason}\n\n{lines}\n\nThe console log says why.",
         )
-
-    def _ok_clicked(self):
-        """Save Auto Rotation - snapshot the current cycle for auto-apply on connect."""
-        if self._feed_busy("Save Auto Rotation"):
-            return
-        self._presets['_auto'] = self._build_auto_preset()
-        self._save_presets()
-        self.server._log("Rotation saved; it will auto-apply on the next connect.")
-
-    def _review_chat_log(self):
-        """Review Chat Log button."""
-        self.server.refresh_chat()
-        self.server._log("Requested chat log.")
 
 
 

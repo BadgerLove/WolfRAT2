@@ -158,6 +158,27 @@ def test_missions_edit_order_button_is_in_the_far_right_column(qtbot, tmp_path):
     assert "Move Up" not in labels and "Move Down" not in labels
 
 
+def test_missions_controls_that_did_nothing_useful_are_gone(qtbot, tmp_path):
+    """Removed 2026-11-21 (Dale: 'if it does nothing useful, we'll get rid of
+    it'): Save Auto Rotation (nothing re-applied the saved list), Review Chat
+    Log (re-read the chat the 5 s poll already reads) and Auto Refresh (an
+    extra 15 s read on top of that poll)."""
+    from PyQt6.QtWidgets import QCheckBox, QPushButton
+
+    rt = DesktopRuntime.isolated(tmp_path)
+    tab = MissionsTab(FakeServer(), MissionsStore(rt), rt)
+    qtbot.addWidget(tab)
+
+    labels = {b.text() for b in tab.findChildren(QPushButton)}
+    assert not labels & {"Save Auto\nRotation", "Review\nChat Log"}
+    assert [c.text() for c in tab.findChildren(QCheckBox)] == ["TAC Match priority"]
+    for gone in ("_ok_clicked", "_review_chat_log", "auto_apply_rotation",
+                 "_build_auto_preset", "_auto_refresh_tick", "_toggle_auto_refresh",
+                 "_refresh_all"):
+        assert not hasattr(MissionsTab, gone), gone
+    assert not hasattr(tab, "auto_refresh_check")
+
+
 # --------------------------------------------------------------------------
 # Bug 4 - ServerTab
 # --------------------------------------------------------------------------

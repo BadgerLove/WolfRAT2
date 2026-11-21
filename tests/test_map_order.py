@@ -2,7 +2,7 @@
 
 The editor reorders a copy of the Mission Cycle (drag and drop, move buttons,
 Shuffle as often as wanted); OK clears the server's list and adds the maps
-back in the new order, the same feed the saved auto rotation uses.
+back in the new order, the same feed Load Preset uses.
 """
 
 import os
