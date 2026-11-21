@@ -3,36 +3,150 @@
 SgtMudd's 3-day log was 1 GB: every 5 s poll reply (the full 172-map list,
 game settings, 500 lines of chat) was written, and every line twice. It was
 also wiped on each start, which loses the history around a problem.
+
+Since 2026-11-21 (his one file had then reached 3.5 GB) it is a logs folder
+next to WolfRAT2.exe, one file per run and per day, named by the local date
+and time it starts, with files older than 30 days deleted.
 """
+
+import time
 
 from wolfrat import protocol
 from wolfrat.admin_commands import AdminOperation
 from wolfrat.admin_session import CommandResult
 
 
-def _use_temp_log(monkeypatch, tmp_path):
-    path = tmp_path / "wolfrat_wire.log"
-    monkeypatch.setattr(protocol, "_wire_log_path", lambda: str(path))
-    monkeypatch.setattr(protocol, "_wire_day", None)
+def _point_at(monkeypatch, tmp_path):
+    logs = tmp_path / "logs"
+    monkeypatch.setattr(protocol, "_wire_log_dir", lambda: str(logs))
+    monkeypatch.setattr(
+        protocol, "_wire_legacy_path", lambda: str(tmp_path / "wolfrat_wire.log")
+    )
     monkeypatch.setattr(protocol, "_wire_last", None)
     monkeypatch.setattr(protocol, "_wire_repeats", 0)
+    return logs
+
+
+def _use_temp_log(monkeypatch, tmp_path):
+    """An already-open file for today, so a test's lines all land in it."""
+    logs = _point_at(monkeypatch, tmp_path)
+    logs.mkdir()
+    path = logs / "wolfrat_wire_test.log"
+    monkeypatch.setattr(protocol, "_wire_file", str(path))
+    monkeypatch.setattr(protocol, "_wire_day", time.strftime("%Y-%m-%d"))
     return path
+
+
+class _Clock:
+    """Stands in for the time module inside protocol: a settable local time."""
+
+    def __init__(self, when):
+        self.set(when)
+
+    def set(self, when):
+        self.now = time.strptime(when, "%Y-%m-%d %H:%M:%S")
+
+    def localtime(self):
+        return self.now
+
+    strftime = staticmethod(time.strftime)
+
+
+def _new_run(monkeypatch, tmp_path, when):
+    """A fresh WolfRAT start at local time ``when``."""
+    logs = _point_at(monkeypatch, tmp_path)
+    clock = _Clock(when)
+    monkeypatch.setattr(protocol, "_time", clock)
+    monkeypatch.setattr(protocol, "_wire_file", None)
+    monkeypatch.setattr(protocol, "_wire_day", None)
+    return logs, clock
 
 
 def _lines(path):
     return path.read_text(encoding="utf-8").splitlines()
 
 
-def test_appends_to_an_existing_log_and_heads_each_day(monkeypatch, tmp_path):
-    path = _use_temp_log(monkeypatch, tmp_path)
-    path.write_text("[23:59:59] yesterday's line\n", encoding="utf-8")
+def test_a_run_writes_a_dated_file_in_the_logs_folder(monkeypatch, tmp_path):
+    logs, _clock = _new_run(monkeypatch, tmp_path, "2026-11-21 14:32:05")
 
-    protocol.wire_log("today's line")
+    protocol.wire_log("hello")
 
-    lines = _lines(path)
-    assert lines[0] == "[23:59:59] yesterday's line"
-    assert lines[1].startswith("---------- ")
-    assert lines[2].endswith("] today's line")
+    path = logs / "wolfrat_wire_2026-11-21_14-32.log"
+    assert _lines(path) == [
+        "---------- Saturday 21 November 2026 ----------",
+        "[14:32:05] hello",
+    ]
+    assert not (tmp_path / "wolfrat_wire.log").exists()
+
+
+def test_local_midnight_starts_the_next_file(monkeypatch, tmp_path):
+    logs, clock = _new_run(monkeypatch, tmp_path, "2026-11-21 23:59:50")
+    for _ in range(3):
+        protocol.wire_log("Connection failed: refused")
+
+    clock.set("2026-11-22 00:00:07")
+    protocol.wire_log("Connected")
+
+    old = _lines(logs / "wolfrat_wire_2026-11-21_23-59.log")
+    new = _lines(logs / "wolfrat_wire_2026-11-22_00-00.log")
+    assert old[-1] == "[23:59:50] (line above repeated 2 more times)"
+    assert new == [
+        "---------- Sunday 22 November 2026 ----------",
+        "[00:00:07] Connected",
+    ]
+
+
+def test_each_start_gets_its_own_file_and_they_sort_in_order(monkeypatch, tmp_path):
+    logs, _clock = _new_run(monkeypatch, tmp_path, "2026-11-21 09:05:00")
+    protocol.wire_log("first run")
+    _new_run(monkeypatch, tmp_path, "2026-11-21 15:30:00")
+    protocol.wire_log("second run")
+    _new_run(monkeypatch, tmp_path, "2026-11-22 08:00:00")
+    protocol.wire_log("next day")
+
+    assert sorted(p.name for p in logs.iterdir()) == [
+        "wolfrat_wire_2026-11-21_09-05.log",
+        "wolfrat_wire_2026-11-21_15-30.log",
+        "wolfrat_wire_2026-11-22_08-00.log",
+    ]
+
+
+def test_files_older_than_30_days_are_deleted_and_nothing_else(monkeypatch, tmp_path):
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    for name in (
+        "wolfrat_wire_2026-10-01_10-00.log",        # 51 days: goes
+        "wolfrat_wire_2026-10-21_23-59.log",        # 31 days: goes
+        "wolfrat_wire_until_2026-10-01_08-00.log",  # the old big log, aged out
+        "wolfrat_wire_2026-10-22_09-00.log",        # 30 days: stays
+        "wolfrat_wire_2026-11-20_12-00.log",        # yesterday: stays
+        "notes.txt",
+        "sett_actions.log",
+    ):
+        (logs / name).write_text("x\n", encoding="utf-8")
+    _new_run(monkeypatch, tmp_path, "2026-11-21 14:00:00")
+
+    protocol.wire_log("cleanup run")
+
+    assert sorted(p.name for p in logs.iterdir()) == [
+        "notes.txt",
+        "sett_actions.log",
+        "wolfrat_wire_2026-10-22_09-00.log",
+        "wolfrat_wire_2026-11-20_12-00.log",
+        "wolfrat_wire_2026-11-21_14-00.log",
+    ]
+
+
+def test_the_old_single_log_moves_into_the_folder_once(monkeypatch, tmp_path):
+    (tmp_path / "wolfrat_wire.log").write_text("[01:02:03] old line\n", encoding="utf-8")
+    logs, _clock = _new_run(monkeypatch, tmp_path, "2026-11-21 14:32:05")
+
+    protocol.wire_log("first line of the new version")
+
+    assert not (tmp_path / "wolfrat_wire.log").exists()
+    moved = logs / "wolfrat_wire_until_2026-11-21_14-32.log"
+    assert _lines(moved) == ["[01:02:03] old line"]
+    assert (logs / "wolfrat_wire_2026-11-21_14-32.log").exists()
 
 
 def test_back_to_back_repeats_fold_into_one_note(monkeypatch, tmp_path):

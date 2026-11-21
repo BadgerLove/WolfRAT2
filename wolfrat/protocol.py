@@ -61,30 +61,92 @@ class TeamWorkflow:
     completion: Future
 
 
+import datetime as _datetime
 import os
+import re as _re
 import sys
 import time as _time
 
-# Wire log. Appends for ever (never wiped on start) - the admin deletes the
-# file when they want a fresh one. It stays small because the 5 s poll
-# replies are only written when they change (ServerManager._wire_changed)
-# and a line repeated back to back is folded into one "repeated" note.
+# Wire log: a "logs" folder next to WolfRAT2.exe, one file per run and per
+# day (Dale, 2026-11-21: SgtMudd's single wolfrat_wire.log, which only ever
+# grew, had reached 3.5 GB). Each file is named after the local date and time
+# it starts, wolfrat_wire_2026-11-21_14-32.log, so the files sort in order. A
+# new file starts when WolfRAT starts and again at the first line after local
+# midnight (the PC's own time zone). Files older than WIRE_LOG_KEEP_DAYS go
+# when a file starts. The old single wolfrat_wire.log is moved into the
+# folder once, as wolfrat_wire_until_<date>_<time>.log, and ages out the same
+# way. Lines stay few because the 5 s poll replies are only written when they
+# change (ServerManager._wire_changed) and a line repeated back to back is
+# folded into one "repeated" note.
+WIRE_LOG_KEEP_DAYS = 30
+_WIRE_FILE_DATE = _re.compile(r"^wolfrat_wire_(?:until_)?(\d{4}-\d{2}-\d{2})(?:_[\d-]+)?\.log$")
 _wire_lock = threading.Lock()
-_wire_day = None          # date of the last line written, for day headers
+_wire_day = None          # local date of the current file, for the midnight switch
+_wire_file = None         # path of the file being written
 _wire_last = None         # last message written (without its time stamp)
 _wire_repeats = 0         # how many times _wire_last repeated since
 _wire_repeat_time = ""    # time of the latest repeat
 
 
-def _wire_log_path():
+def _wire_base_dir():
     if getattr(sys, 'frozen', False):
-        return os.path.join(os.path.dirname(sys.executable), 'wolfrat_wire.log')
-    return os.path.join(os.getcwd(), 'wolfrat_wire.log')
+        return os.path.dirname(sys.executable)
+    return os.getcwd()
+
+
+def _wire_log_dir():
+    return os.path.join(_wire_base_dir(), 'logs')
+
+
+def _wire_legacy_path():
+    """Where versions up to 2.10.24 kept their one, ever-growing log."""
+    return os.path.join(_wire_base_dir(), 'wolfrat_wire.log')
+
+
+def _wire_log_path(now=None):
+    """The file a run or day that starts at ``now`` writes to."""
+    now = now or _time.localtime()
+    return os.path.join(
+        _wire_log_dir(), f"wolfrat_wire_{_time.strftime('%Y-%m-%d_%H-%M', now)}.log"
+    )
+
+
+def _wire_housekeeping(now) -> None:
+    """Make the folder, move the old single log in, delete expired files."""
+    folder = _wire_log_dir()
+    os.makedirs(folder, exist_ok=True)
+    legacy = _wire_legacy_path()
+    if os.path.isfile(legacy):
+        target = os.path.join(
+            folder, f"wolfrat_wire_until_{_time.strftime('%Y-%m-%d_%H-%M', now)}.log"
+        )
+        if not os.path.exists(target):
+            os.replace(legacy, target)
+    today = _datetime.date(now.tm_year, now.tm_mon, now.tm_mday)
+    cutoff = today - _datetime.timedelta(days=WIRE_LOG_KEEP_DAYS)
+    for name in os.listdir(folder):
+        match = _WIRE_FILE_DATE.match(name)
+        if not match:
+            continue
+        try:
+            started = _datetime.date.fromisoformat(match.group(1))
+        except ValueError:
+            continue
+        if started < cutoff:
+            try:
+                os.remove(os.path.join(folder, name))
+            except OSError:
+                pass
+
+
+def _wire_append(path, lines) -> None:
+    with open(path, 'a', encoding='utf-8') as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def wire_log(message: str) -> None:
-    """Append one line to wolfrat_wire.log."""
-    global _wire_day, _wire_last, _wire_repeats, _wire_repeat_time
+    """Append one line to today's wire log (logs/wolfrat_wire_<date>_<time>.log)."""
+    global _wire_day, _wire_file, _wire_last, _wire_repeats, _wire_repeat_time
     now = _time.localtime()
     stamp = _time.strftime('%H:%M:%S', now)
     try:
@@ -94,28 +156,29 @@ def wire_log(message: str) -> None:
                 _wire_repeat_time = stamp
                 return
             lines = []
+            day = _time.strftime('%Y-%m-%d', now)
+            switching = _wire_file is None or day != _wire_day
             if _wire_repeats:
                 times = "once more" if _wire_repeats == 1 else f"{_wire_repeats} more times"
-                lines.append(f"[{_wire_repeat_time}] (line above repeated {times})")
-            day = _time.strftime('%Y-%m-%d', now)
-            if day != _wire_day:
-                lines.append(f"---------- {_time.strftime('%A %d %B %Y', now)} ----------")
+                note = f"[{_wire_repeat_time}] (line above repeated {times})"
+                if switching and _wire_file is not None:
+                    _wire_append(_wire_file, [note])  # it belongs to the old day
+                else:
+                    lines.append(note)
+            if switching:
+                _wire_housekeeping(now)
+                _wire_file = _wire_log_path(now)
                 _wire_day = day
+                lines.append(f"---------- {_time.strftime('%A %d %B %Y', now)} ----------")
             lines.append(f"[{stamp}] {message}")
             _wire_last, _wire_repeats = message, 0
-            with open(_wire_log_path(), 'a', encoding='utf-8') as f:
-                f.write("\n".join(lines) + "\n")
+            _wire_append(_wire_file, lines)
     except Exception as e:
         print(f"WIRE LOG ERROR: {e}")
     _LOGGER.debug("%s", message)
 
 
-# Startup marker. A blank line first so each run stands out in the file.
-try:
-    with open(_wire_log_path(), 'a', encoding='utf-8') as _f:
-        _f.write("\n")
-except Exception as e:
-    print(f"WIRE LOG INIT ERROR: {e}")
+# Startup marker: the first line of this run's file.
 wire_log("=== protocol.py module loaded ===")
 
 
