@@ -1,11 +1,13 @@
-"""The private welcome: a line of chat only the joining player sees.
+"""server.wac: the old script private welcome, and safe file work for the script.
 
-The game has no whisper command, but its mission-script language does the job:
-`PLOOP ... END` runs a block once per connected player, and `ptext("...")`
-inside it sends a chat line to that one player. `onptick(n)` is true during
-second n of the player's own time alive on the map. So the welcome is a few
-lines in the server's `server.wac` - the same file the lightning add-on lives
-in - and WolfRAT's job is only to write those lines safely.
+Until 2.10.25 the private welcome was a few lines WolfRAT wrote into the
+server's `server.wac` (`PLOOP ... END` runs once per player, `ptext("...")`
+sends a line to that one player, `onptick(n)` = second n of their time alive).
+Since 2026-11-21 it goes through the private-line helper instead
+(private_welcome.py: 118 characters, live, no map change), so WolfRAT no
+longer writes that block. This module now reads an old block (its lines are
+copied into the new welcome once) and takes it out when the new welcome is
+switched on; `_read` / `_write` also serve whisper.py's script section.
 
 Rules learned the hard way (see the vault, Weather Control 2e-bis):
 
@@ -17,8 +19,8 @@ Rules learned the hard way (see the vault, Weather Control 2e-bis):
 * Use `then`, never `enter`: `enter` remembers its last result per block, not
   per player, so the second player in the same pass would be skipped.
 
-Our section sits between two marker comments and is the only part of the file
-this module ever changes. Everything else - the lightning block, an admin's
+The old section sits between two marker comments and is the only part of the
+file this module removes. Everything else - the lightning block, an admin's
 own script - is kept byte for byte (apart from normalising line endings).
 """
 
@@ -41,13 +43,11 @@ END = "// <<< WolfRAT private welcome"
 # and the whole server.wac fails to compile - lightning and whispers with it.
 WAC_STRING_MAX = 63
 MAX_TEXT = WAC_STRING_MAX
-MIN_SECONDS, MAX_SECONDS = 3, 300
 DEFAULT_SECONDS = 20
 DEFAULT_COLOUR = "00ff00"
 DEFAULT_COLOUR2 = "ffff00"
-MIN_GAP, MAX_GAP, DEFAULT_GAP = 1, 60, 3
+MIN_GAP, DEFAULT_GAP = 1, 3
 
-_COLOUR_RE = re.compile(r"^[0-9a-fA-F]{6}$")
 _SECTION_RE = re.compile(
     re.escape(BEGIN) + r".*?" + re.escape(END) + r"[^\n]*\n?", re.DOTALL)
 _LINE_RE = re.compile(
@@ -60,6 +60,7 @@ class ServerWacError(Exception):
 
 @dataclass(frozen=True)
 class Welcome:
+    """An old script welcome as read from server.wac."""
     text: str
     seconds: int = DEFAULT_SECONDS
     colour: str = DEFAULT_COLOUR     # "" = the game's normal system colour
@@ -71,7 +72,8 @@ class Welcome:
 
 
 def text_problem(text: str) -> Optional[str]:
-    """Why this text cannot go in the script, or None if it is fine."""
+    """Why this text cannot go in a ptext line of the script, or None if it is
+    fine (whisper.py's lines follow the same rules)."""
     if not text.strip():
         return "Type the welcome message first."
     if len(text) > MAX_TEXT:
@@ -90,52 +92,9 @@ def text_problem(text: str) -> Optional[str]:
 
 
 def compose(text: str, colour: str = "") -> str:
-    """The ptext string exactly as it goes in the script.  Colour codes typed
-    in the text (<cRRGGBB>, <co>) go in as typed - Dale 2026-09-26: admins
-    type the codes, a Colours... box lists them."""
+    """A line of an old welcome as the admin typed it: its colour as a code
+    in front (<cRRGGBB>), codes typed in the text kept as typed."""
     return _code(colour) + text.strip()
-
-
-def line_problem(text: str, colour: str = "") -> Optional[str]:
-    """Why this line cannot go in the script, or None if it is fine."""
-    problem = text_problem(text)
-    if problem:
-        return problem
-    if colour and not _COLOUR_RE.match(colour):
-        return "The colour must be six hex digits, like 00ff00."
-    length = len(compose(text, colour))
-    if length > WAC_STRING_MAX:
-        return (f"Too long: {length} of {WAC_STRING_MAX} characters, colour codes count "
-                "(the game's script cannot hold more).")
-    return None
-
-
-def build_section(welcome: Welcome) -> str:
-    problem = line_problem(welcome.text, welcome.colour)
-    if problem:
-        raise ServerWacError(problem)
-    second = welcome.text2.strip()
-    if second:
-        problem = line_problem(second, welcome.colour2)
-        if problem:
-            raise ServerWacError(f"Second line: {problem}")
-    seconds = max(MIN_SECONDS, min(MAX_SECONDS, int(welcome.seconds)))
-    lines = [
-        BEGIN,
-        "// Only the player who just joined sees these lines.",
-        "PLOOP",
-        f"if onptick({seconds}) then",
-        f'ptext("{compose(welcome.text, welcome.colour)}")',
-        "endif",
-    ]
-    if second:
-        gap = max(MIN_GAP, min(MAX_GAP, int(welcome.gap)))
-        lines += [
-            f"if onptick({seconds + gap}) then",
-            f'ptext("{compose(second, welcome.colour2)}")',
-            "endif",
-        ]
-    return "\n".join(lines + ["END", END]) + "\n"
 
 
 def _code(colour: str) -> str:
@@ -189,24 +148,6 @@ def read_welcome(server_dir) -> Optional[Welcome]:
     seconds2, colour2, text2 = found[1]
     return Welcome(text, int(seconds), colour.lower(), text2, colour2.lower(),
                    max(MIN_GAP, int(seconds2) - int(seconds)))
-
-
-def write_welcome(server_dir, welcome: Welcome) -> str:
-    """Put (or replace) the welcome. Returns "unchanged", "updated" or "added"."""
-    section = build_section(welcome)
-    body = _read(server_dir)
-    if _SECTION_RE.search(body):
-        new = _SECTION_RE.sub(lambda _m: section, body, count=1)
-        result = "updated"
-    else:
-        if body and not body.endswith("\n"):
-            body += "\n"
-        new = body + ("\n" if body else "") + section
-        result = "added"
-    if new == body:
-        return "unchanged"
-    _write(server_dir, new)
-    return result
 
 
 def remove_welcome(server_dir) -> bool:

@@ -29,7 +29,11 @@ def test_block_uses_only_one_number_forms_and_safe_text():
 
 def test_install_keeps_everything_else_and_is_crlf(tmp_path):
     weather.install_addon(tmp_path)                            # the lightning block
-    server_wac.write_welcome(tmp_path, server_wac.Welcome("Welcome to FMJ"))
+    # An old script welcome, as WolfRAT up to 2.10.25 wrote it.
+    old_welcome = "\n".join([
+        server_wac.BEGIN, "PLOOP", "if onptick(20) then",
+        'ptext("<c00ff00>Welcome to FMJ")', "endif", "END", server_wac.END]) + "\n"
+    server_wac._write(tmp_path, server_wac._read(tmp_path) + "\n" + old_welcome)
     before = server_wac._read(tmp_path)
     assert whisper.install(tmp_path) == "added"
     raw = (tmp_path / "server.wac").read_bytes()

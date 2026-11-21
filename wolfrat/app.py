@@ -4706,15 +4706,29 @@ class MessagesTab(QWidget):
             pass
 
     def _build_ui(self):
+        # Three pages (Dale, 2026-11-21: "split that ... rather than having to
+        # scroll everywhere"): Welcome (first-time joiners, where they're
+        # from, the VPN line), Private welcome, and Recurring messages last
+        # (the least used). KD tracking and the message log stay underneath.
         main_layout = QVBoxLayout(self)
 
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QFrame.Shape.NoFrame)
+        # The log first: the pages can write to it while they are built.
+        log_group = QGroupBox("Message Log")
+        log_layout = QVBoxLayout()
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setMaximumHeight(120)
+        log_layout.addWidget(self.log_text)
+        log_group.setLayout(log_layout)
 
-        scroll_content = QWidget()
-        layout = QVBoxLayout(scroll_content)
-        layout.setContentsMargins(0, 0, 0, 0)
+        self.pages = QTabWidget()
+        welcome_area, welcome_page = scroll_column()
+        private_area, private_page = scroll_column()
+        recur_area, recur_page = scroll_column()
+        self.pages.addTab(welcome_area, "Welcome")
+        self.pages.addTab(private_area, "Private welcome")
+        self.pages.addTab(recur_area, "Recurring messages")
+        main_layout.addWidget(self.pages, 1)
 
         # --- Recurring messages ---
         recur_group = QGroupBox("Recurring Messages (rotates through list)")
@@ -4756,7 +4770,8 @@ class MessagesTab(QWidget):
         recur_layout.addLayout(timer_layout)
 
         recur_group.setLayout(recur_layout)
-        layout.addWidget(recur_group)
+        recur_page.addWidget(recur_group)
+        recur_page.addStretch(1)
 
         # --- Welcome messages ---
         welcome_group = QGroupBox("Welcome Messages (first-time joiners)")
@@ -4814,14 +4829,16 @@ class MessagesTab(QWidget):
         welcome_layout.addWidget(self.welcome_log)
 
         welcome_group.setLayout(welcome_layout)
-        layout.addWidget(welcome_group)
+        welcome_page.addWidget(welcome_group)
+        welcome_page.addStretch(1)
 
-        # --- Private welcome (server script, only the joiner sees it) ---
+        # --- Private welcome (only the joiner sees it; private-line helper) ---
         self.private_welcome = PrivateWelcomePanel(
+            self.runtime.path("wolfrat_private_welcome.json"),
             self._game_server_dir,
             log=lambda text: self.log_text.append(f"[{time.strftime('%H:%M:%S')}] {text}"),
         )
-        layout.addWidget(self.private_welcome)
+        private_page.addWidget(self.private_welcome)
 
 
         # --- KD Tracking ---
@@ -4837,20 +4854,8 @@ class MessagesTab(QWidget):
         self.kd_hint_label = kd_hint
         kd_layout.addWidget(kd_hint)
         kd_group.setLayout(kd_layout)
-        layout.addWidget(kd_group)
-
-        # --- Message log ---
-        log_group = QGroupBox("Message Log")
-        log_layout = QVBoxLayout()
-        self.log_text = QTextEdit()
-        self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(150)
-        log_layout.addWidget(self.log_text)
-        log_group.setLayout(log_layout)
-        layout.addWidget(log_group)
-
-        scroll_area.setWidget(scroll_content)
-        main_layout.addWidget(scroll_area)
+        main_layout.addWidget(kd_group)
+        main_layout.addWidget(log_group)
 
     def _add_recurring(self):
         msg = self.recur_input.text().strip()
@@ -4996,6 +5001,7 @@ class MessagesTab(QWidget):
     def check_new_players(self, players):
         """Called when player list updates. Detects first-time joiners."""
         self._refresh_kd_hint()
+        self.private_welcome.players_updated(players)   # every join, its own page
         if not (self._welcome_enabled or self._country_enabled):
             return
         if manual_mode.state.mode == manual_mode.UNDECIDED:
@@ -9936,6 +9942,11 @@ class MainWindow(QMainWindow):
         # !mycmd: the answer goes to the one player through the helper, no sound.
         self.mods_tab.private_line = lambda name, text: self.rank_tone.queue_line(
             name, text, tone=-1, everyone=False)
+        # The private welcome too: the same helper, no sound, to the one player.
+        self.messages_tab.private_welcome.send_private = (
+            lambda name, text: self.rank_tone.queue_line(
+                name, text, tone=-1, everyone=False))
+        self.messages_tab.private_welcome.helper_ready = self.rank_tone.ready
         self.mods_tab.player_commands = lambda: mycmd.player_commands(
             vote=self.mods_tab._vote_enabled,
             skip=self.mods_tab._skip_enabled,
