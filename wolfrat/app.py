@@ -1717,6 +1717,12 @@ class MissionsTab(QWidget):
 
     _feed = None  # class default: the feed lock is free (see _run_feed)
 
+    # Whole minutes left on the map, or None when unknown, stale or untimed
+    # (a co-op map has no clock: the server says 0/30 all game, Dale
+    # 2026-11-01). MainWindow points this at the Map Voting tab's server
+    # time through MapClock, the same reading the sky timer uses.
+    minutes_left = staticmethod(lambda: None)
+
     def __init__(
         self,
         server: ServerManager,
@@ -2590,6 +2596,39 @@ class MissionsTab(QWidget):
         )
         return True
 
+    # A map change stalls the server for ~15 s (Dale's own log: WolfRAT's
+    # commands time out 15-16 s after each map load), long enough to time
+    # out a feed and drop the connection: SgtMudd's load of 219 stopped at
+    # 205 that way (15 Nov 02:48). So a big list waits for a fresh map when
+    # the clock says this one is nearly over (Dale, 2026-11-21).
+    FEED_SECONDS_PER_MAP = 0.4   # his server: 219 maps in 44 s, so x2 to spare
+    FEED_SAFETY_SECONDS = 60     # minutes arrive whole and up to a minute old
+
+    def _feed_time_ok(self, count, title):
+        """False, after telling the admin, when the map ends too soon for
+        ``count`` maps to go on the server. Unknown time (co-op) is allowed."""
+        try:
+            minutes = self.minutes_left()
+        except Exception:
+            minutes = None
+        if minutes is None:
+            return True
+        needed = 10 + self.FEED_SECONDS_PER_MAP * count
+        if minutes * 60 >= needed + self.FEED_SAFETY_SECONDS:
+            return True
+        left = "less than a minute" if minutes < 1 else (
+            "about 1 minute" if minutes == 1 else f"about {minutes} minutes"
+        )
+        took = max(1, round(needed / 60))
+        QMessageBox.information(
+            self, title,
+            f"There is {left} left on this map. Putting {count} maps on the "
+            f"server takes up to {took} minute{'s' if took != 1 else ''}, "
+            "and a map change in the middle would cut it off.\n\n"
+            "Wait until the next map has started, then try again.",
+        )
+        return False
+
     def _run_feed(self, entries, label, *, replace, on_complete=None):
         """Put ``entries`` on the server in order; MISSION CLEAR first when
         ``replace``. Holds the feed lock (``_feed``) until it ends, whether
@@ -2675,12 +2714,16 @@ class MissionsTab(QWidget):
                 "The Mission Cycle is empty: add some maps first.",
             )
             return
+        if not self._feed_time_ok(len(before), "Edit Order"):
+            return
         order = self._run_order_dialog(before)
         if order is None:
             return
         if order == before:
             self.server._log("Map order unchanged; nothing sent to the server.")
             return
+        if not self._feed_time_ok(len(order), "Edit Order"):
+            return  # the map ran down while the editor was open
         if not self._same_maps(before, self._order_entries()):
             reply = QMessageBox.question(
                 self, "Edit Order",
@@ -3052,6 +3095,8 @@ class MissionsTab(QWidget):
         return None
 
     def _start_preset_load(self, name, preset):
+        if not self._feed_time_ok(len(preset), "Load Preset"):
+            return
         replace = False
         if self.server.mission_entries:
             choice = self._ask_replace_or_add(name, len(preset))
@@ -9793,6 +9838,9 @@ class MainWindow(QMainWindow):
             return map_clock.minutes_left(map_name=map_name, remaining=remaining,
                                           read_at=updated, now=now)
         self.weather_tab.sky_page.time_left = sky_minutes_left
+        # Load Preset / Edit Order wait for a fresh map when this one is
+        # nearly over (MissionsTab._feed_time_ok).
+        self.missions_tab.minutes_left = sky_minutes_left
         self.server_link_panel = ServerLinkPanel(
             self.weather_tab.link_state,
             self.weather_tab.link_to_server,

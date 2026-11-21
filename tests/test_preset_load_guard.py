@@ -265,6 +265,56 @@ def test_edit_order_takes_the_same_lock(qtbot, tmp_path, monkeypatch, boxes):
     assert "still putting maps on the server (the new map order: 0 of 3 done)" in boxes[-1][1]
 
 
+# ---- 4. A big list waits for a fresh map when this one is nearly over ----
+# A map change stalls the server ~15 s and cut SgtMudd's load at 205 of 219.
+
+BIG = [{"file": f"MAP{i:03d}.bms", "count": 1} for i in range(219)]
+
+
+@pytest.mark.parametrize("minutes, maps, allowed", [
+    (2, BIG, False),      # 219 maps need ~98 s + 60 s spare > 120 s
+    (3, BIG, True),
+    (1, PRESET, False),   # even 3 maps wait in the last minute
+    (2, PRESET, True),
+    (None, BIG, True),    # co-op / unknown clock: never blocked
+])
+def test_load_waits_when_the_map_is_nearly_over(qtbot, tmp_path, monkeypatch, boxes,
+                                                minutes, maps, allowed):
+    tab, server = _tab(qtbot, tmp_path, queue=[])
+    tab.minutes_left = lambda: minutes
+    tab._start_preset_load("big", maps)
+    if allowed:
+        qtbot.waitUntil(lambda: not tab._feed_active, timeout=5000)
+        assert len(server.calls) == len(maps)
+        assert boxes == []
+    else:
+        assert server.calls == [] and not tab._feed_active
+        assert "left on this map" in boxes[-1][1]
+        assert "Wait until the next map has started" in boxes[-1][1]
+
+
+def test_edit_order_waits_too_and_never_opens_the_editor(qtbot, tmp_path, monkeypatch, boxes):
+    tab, server = _tab(qtbot, tmp_path, queue=[e["file"] for e in BIG])
+    tab.minutes_left = lambda: 1
+    opened = []
+    monkeypatch.setattr(tab, "_run_order_dialog", lambda entries: opened.append(1))
+    tab._open_order_editor()
+    assert opened == [] and server.calls == []
+    assert "about 1 minute left on this map" in boxes[-1][1]
+
+
+def test_a_clock_that_fails_to_read_counts_as_unknown(qtbot, tmp_path, monkeypatch, boxes):
+    tab, server = _tab(qtbot, tmp_path, queue=[])
+
+    def broken():
+        raise RuntimeError("no reading")
+
+    tab.minutes_left = broken
+    tab._start_preset_load("1-coop", PRESET)
+    qtbot.waitUntil(lambda: not tab._feed_active, timeout=3000)
+    assert len(server.calls) == 3
+
+
 # ---- 3. Save asks before changing a saved list's size ------------------
 
 def _save_as(monkeypatch, tab, name, answer):
