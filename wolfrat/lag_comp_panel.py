@@ -139,20 +139,27 @@ class LagCompPanel(QWidget):
         self._history = lc.HistoryBook(str(history_file))
         self._events = lc.EventLogger(str(Path(history_file).parent))
         self._helper_name = lc.loaded_name(self._data_dir)
-        saved = self._load()
+        on_file = self._load()
+        # Recommended settings (lc.SETTINGS_STEPS): an install below the current
+        # level gets each later step once; what the admin chose is left alone.
+        saved, self._level_moved = lc.apply_settings_steps(on_file)
+        self._defaults_level = int(saved["defaults_level"])
+        level_changed = self._defaults_level != on_file.get("defaults_level")
+        # The running server still holds the old values: write them once it is seen on.
+        self._push_level = bool(self._level_moved)
         self._auto_enabled_once = True
         migrated = bool(saved.get("auto_enabled_once", False))
         if not migrated:
             self._wish_on = True
             self._reapply = True
-            tune_mode = lc.TUNE_APPLY
+            tune_mode = lc.DEFAULT_TUNE_MODE
             extra_ms = int(saved.get("extra_ms", lc.DEFAULT_EXTRA_MS))
             if extra_ms == 40:
                 extra_ms = lc.DEFAULT_EXTRA_MS
         else:
             self._wish_on = bool(saved.get("on", True))
             self._reapply = bool(saved.get("reapply", True))
-            tune_mode = int(saved.get("tune_mode", lc.TUNE_APPLY))
+            tune_mode = int(saved.get("tune_mode", lc.DEFAULT_TUNE_MODE))
             extra_ms = int(saved.get("extra_ms", lc.DEFAULT_EXTRA_MS))
         self._settings = lc.Settings(bool(saved.get("observe", False)),
                                      extra_ms,
@@ -178,8 +185,12 @@ class LagCompPanel(QWidget):
         self._updating = False
         self._build()
         self._show_wish()
-        if not migrated:
+        if not migrated or level_changed:
             self._save()
+        if self._level_moved:
+            text = "Recommended settings applied once: " + "; ".join(self._level_moved)
+            self._log("Lag compensation: " + text + ". Change them back on this page if you prefer.")
+            self._events.note(text, kind="settings")
         self._show_history()
         self._show_event_log()
         self.no_server(NO_SERVER)
@@ -570,6 +581,13 @@ class LagCompPanel(QWidget):
                           "Tick it to put it back.")
         if self._retry_due() and not state.on:
             self._dirty = True
+        if self._push_level:
+            # The one-time recommended settings also go into a server that is
+            # already running it with the old ones (WolfRAT restarted, not the server).
+            self._push_level = False
+            if (self._wish_on and state.on and state.settings is not None
+                    and state.settings != self._settings):
+                self._dirty = True
         if state.kind != lc.PARTIAL:
             self._partial_logged = False
         elif not self._dirty and time.monotonic() >= self._retry_at:
@@ -937,7 +955,8 @@ class LagCompPanel(QWidget):
         data = {"on": self._wish_on, "observe": s.observe, "extra_ms": s.extra_ms,
                 "max_ms": s.max_ms, "min_ping_ms": s.min_ping_ms,
                 "tune_mode": s.tune_mode, "reapply": self._reapply,
-                "auto_enabled_once": self._auto_enabled_once}
+                "auto_enabled_once": self._auto_enabled_once,
+                "defaults_level": self._defaults_level}
         try:
             self._file.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except Exception as exc:

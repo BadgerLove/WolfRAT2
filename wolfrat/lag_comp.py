@@ -71,8 +71,67 @@ _RETAIL_SITES = (
 _LEG_TAIL = (0x4EA5C4, b"\x83\xc4\x08\x85\xc0\x75\x2d")
 
 DEFAULT_EXTRA_MS = 70
-DEFAULT_MAX_MS = 400
-DEFAULT_MIN_PING_MS = 80
+DEFAULT_MAX_MS = 300
+DEFAULT_MIN_PING_MS = 0          # everyone is compensated
+DEFAULT_TUNE_MODE = TUNE_WATCH
+
+# Recommended settings, by level.  When the recommended values change, add a
+# step here: (level, {setting: (value before, value now)}).  An install whose
+# saved level is lower gets every later step once, in order, on its next start,
+# and a step only moves a setting that is still on the value it replaces:
+# anything the admin chose stays.  The level is saved per install, so an admin
+# who skips releases still lands on the current values, and nothing is moved twice.
+SETTINGS_STEPS = (
+    # 2026-11-21 (2.10.24): a night with everyone compensated - shooters under 50
+    # ping +8% hits, 100+ ping +21..28%, and Extra scored the same from +0 to +80,
+    # so auto-tune only watches.
+    (1, {"tune_mode": (TUNE_APPLY, TUNE_WATCH),
+         "max_ms": (400, 300),
+         "min_ping_ms": (80, 0)}),
+)
+SETTINGS_LEVEL = SETTINGS_STEPS[-1][0]
+_TUNE_TEXT = {TUNE_OFF: "Off", TUNE_WATCH: "Watch", TUNE_APPLY: "On (apply)"}
+
+
+def _setting_text(key: str, value: int) -> str:
+    if key == "tune_mode":
+        return _TUNE_TEXT.get(value, str(value))
+    if key == "min_ping_ms" and value <= 0:
+        return "0 (everyone)"
+    return f"{value} ms"
+
+
+_SETTING_NAMES = {"tune_mode": "Auto-tune Extra", "max_ms": "Maximum rewind",
+                  "min_ping_ms": "Minimum ping"}
+
+
+def apply_settings_steps(saved: dict) -> tuple:
+    """(the saved settings with every step above their level applied, [what moved]).
+
+    A setting that is not in the file was on the default of its day, so it takes
+    the new value too, but only a setting that was written down counts as moved."""
+    out = dict(saved)
+    try:
+        level = int(out.get("defaults_level", 0))
+    except (TypeError, ValueError):
+        level = 0
+    moved = []
+    for step, changes in SETTINGS_STEPS:
+        if step <= level:
+            continue
+        for key, (before, now) in changes.items():
+            try:
+                current = int(out[key]) if key in out else before
+            except (TypeError, ValueError):
+                current = before
+            if current == before:
+                out[key] = now
+                if key in saved:
+                    moved.append(f"{_SETTING_NAMES.get(key, key)} {_setting_text(key, before)}"
+                                 f" -> {_setting_text(key, now)}")
+        level = step
+    out["defaults_level"] = level
+    return out, moved
 
 STOCK = "stock"        # the game's own calls: lag compensation off
 ON = "on"              # our helper's calls

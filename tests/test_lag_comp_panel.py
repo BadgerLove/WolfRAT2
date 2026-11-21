@@ -193,7 +193,7 @@ def test_one_time_auto_enable_switches_everyone_on_once_then_respects_user_choic
                    encoding="utf-8")
     p1 = _panel(qtbot, tmp_path, monkeypatch, lc.State(lc.STOCK))
     assert p1.on_cb.isChecked() and p1.reapply_cb.isChecked()
-    assert p1._settings.tune_mode == lc.TUNE_APPLY and p1._settings.extra_ms == 70
+    assert p1._settings.tune_mode == lc.TUNE_WATCH and p1._settings.extra_ms == 70
     saved1 = _saved(tmp_path)
     assert saved1["on"] is True and saved1["auto_enabled_once"] is True
 
@@ -680,3 +680,112 @@ def test_the_page_gives_the_check_its_own_data_folder(qtbot, tmp_path, monkeypat
     monkeypatch.setattr(lc, "managed_elsewhere", lambda st, **kw: asked.append(kw) or False)
     p.server_tick(_Mem(), writable=True)
     assert asked and all(kw == {"own_dir": str(tmp_path)} for kw in asked)
+
+
+# ------------------------------------- recommended settings, by level (2026-11-21)
+# Dale, 2026-11-20: the release must put the right lag comp settings on every
+# server, new or updating, even for admins who skip releases - and never undo a
+# value an admin chose.  lc.SETTINGS_STEPS, saved per install as defaults_level.
+
+def test_settings_steps_move_only_values_still_on_the_old_default():
+    old = {"on": True, "extra_ms": 70, "max_ms": 400, "min_ping_ms": 80, "tune_mode": lc.TUNE_APPLY,
+           "reapply": True, "auto_enabled_once": True}
+    out, moved = lc.apply_settings_steps(old)
+    assert (out["max_ms"], out["min_ping_ms"], out["tune_mode"]) == (300, 0, lc.TUNE_WATCH)
+    assert out["extra_ms"] == 70 and out["on"] is True and out["defaults_level"] == lc.SETTINGS_LEVEL
+    assert len(moved) == 3 and any("Minimum ping 80 ms -> 0 (everyone)" in m for m in moved)
+    assert old["max_ms"] == 400                                  # the caller's dict is not changed
+
+    chosen = dict(old, max_ms=500, min_ping_ms=120, tune_mode=lc.TUNE_OFF)
+    out, moved = lc.apply_settings_steps(chosen)
+    assert (out["max_ms"], out["min_ping_ms"], out["tune_mode"]) == (500, 120, lc.TUNE_OFF)
+    assert moved == [] and out["defaults_level"] == lc.SETTINGS_LEVEL
+
+    again, moved = lc.apply_settings_steps(dict(old, defaults_level=lc.SETTINGS_LEVEL))
+    assert (again["max_ms"], again["min_ping_ms"], again["tune_mode"]) == (400, 80, lc.TUNE_APPLY)
+    assert moved == []                                           # put back by the admin: stays
+
+    new, moved = lc.apply_settings_steps({})
+    assert (new["max_ms"], new["min_ping_ms"], new["tune_mode"]) == (300, 0, lc.TUNE_WATCH)
+    assert moved == []                                           # a new install: nothing "moved"
+
+    newer, moved = lc.apply_settings_steps(dict(old, defaults_level=lc.SETTINGS_LEVEL + 5))
+    assert newer["defaults_level"] == lc.SETTINGS_LEVEL + 5 and moved == []
+
+
+def test_a_new_install_starts_on_the_recommended_settings(qtbot, tmp_path, monkeypatch):
+    p = _panel(qtbot, tmp_path, monkeypatch, lc.State(lc.STOCK))
+    s = p._settings
+    assert (s.extra_ms, s.max_ms, s.min_ping_ms, s.tune_mode) == (70, 300, 0, lc.TUNE_WATCH)
+    assert p.on_cb.isChecked() and p.reapply_cb.isChecked()
+    assert _saved(tmp_path)["defaults_level"] == lc.SETTINGS_LEVEL
+
+
+def test_an_updating_server_moves_once_and_writes_it_into_the_running_server(
+        qtbot, tmp_path, monkeypatch):
+    import json
+    cfg = tmp_path / "lc.json"
+    cfg.write_text(json.dumps({"on": True, "observe": False, "extra_ms": 70, "max_ms": 400,
+                               "min_ping_ms": 80, "tune_mode": lc.TUNE_APPLY, "reapply": True,
+                               "auto_enabled_once": True}), encoding="utf-8")
+    running = lc.State(lc.ON, base=0x10000000, shared=0x10001000, ready=True,
+                       settings=lc.Settings(False, 70, 400, 80, lc.TUNE_APPLY),
+                       stats=lc.Stats(seconds=600), alive=True)
+    state = {"now": running}
+    monkeypatch.setattr(lc, "loaded_name", lambda data_dir: "wolfrat_lagcomp_test.dll")
+    monkeypatch.setattr(lc, "server_state", lambda pid, name=None: state["now"])
+    monkeypatch.setattr(lc, "reset_stats", lambda pid, name=None: True)
+    monkeypatch.setattr(lc, "stamp_owner", lambda memory, st: None)
+    written = []
+
+    def turn_on(pid, memory, data_dir, settings):
+        written.append(settings)
+        state["now"] = lc.State(lc.ON, base=0x10000000, shared=0x10001000, ready=True,
+                                settings=settings, stats=lc.Stats(seconds=600), alive=True)
+        return state["now"]
+    monkeypatch.setattr(lc, "turn_on", turn_on)
+    logs = []
+    p = panel_mod.LagCompPanel(cfg, tmp_path / "lc_history.json", tmp_path, log=logs.append)
+    qtbot.addWidget(p)
+    assert (p.max_spin.value(), p.min_spin.value()) == (300, 0)
+    assert p.tune_combo.currentData() == lc.TUNE_WATCH and p.extra_spin.value() == 70
+    assert sum("Recommended settings applied once" in line for line in logs) == 1
+    saved = _saved(tmp_path)
+    assert (saved["max_ms"], saved["min_ping_ms"], saved["tune_mode"]) == (300, 0, lc.TUNE_WATCH)
+    assert saved["defaults_level"] == lc.SETTINGS_LEVEL
+
+    p.server_tick(_Mem(), writable=True)                 # the server still had 400 / 80 / apply
+    assert written == [lc.Settings(False, 70, 300, 0, lc.TUNE_WATCH)]
+    p.server_tick(_Mem(), writable=True)
+    assert len(written) == 1                             # once
+
+    # The admin puts 80 back: the next start leaves it alone and says nothing.
+    p.min_spin.setValue(80)
+    p._settings_settled()
+    assert _saved(tmp_path)["min_ping_ms"] == 80
+    logs2 = []
+    p2 = panel_mod.LagCompPanel(cfg, tmp_path / "lc_history.json", tmp_path, log=logs2.append)
+    qtbot.addWidget(p2)
+    assert p2.min_spin.value() == 80 and p2.max_spin.value() == 300
+    assert not any("Recommended settings" in line for line in logs2)
+
+
+def test_values_an_admin_chose_are_not_moved_and_a_stock_server_is_not_switched_on(
+        qtbot, tmp_path, monkeypatch):
+    import json
+    cfg = tmp_path / "lc.json"
+    cfg.write_text(json.dumps({"on": True, "observe": False, "extra_ms": 55, "max_ms": 500,
+                               "min_ping_ms": 80, "tune_mode": lc.TUNE_OFF, "reapply": False,
+                               "auto_enabled_once": True}), encoding="utf-8")
+    monkeypatch.setattr(lc, "turn_on", lambda *a, **k: (_ for _ in ()).throw(AssertionError("no write")))
+    logs = []
+    monkeypatch.setattr(lc, "loaded_name", lambda data_dir: "wolfrat_lagcomp_test.dll")
+    monkeypatch.setattr(lc, "server_state", lambda pid, name=None: lc.State(lc.STOCK))
+    p = panel_mod.LagCompPanel(cfg, tmp_path / "lc_history.json", tmp_path, log=logs.append)
+    qtbot.addWidget(p)
+    s = p._settings
+    assert (s.extra_ms, s.max_ms, s.min_ping_ms, s.tune_mode) == (55, 500, 0, lc.TUNE_OFF)
+    assert sum("Minimum ping 80 ms -> 0 (everyone)" in line for line in logs) == 1
+    # Restarted server, "put it back" unticked: the level step must not switch it on.
+    p.server_tick(_Mem(), writable=True)
+    assert not p.on_cb.isChecked()
