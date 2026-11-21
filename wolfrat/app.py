@@ -9963,6 +9963,10 @@ class MainWindow(QMainWindow):
             lambda name, text: self.rank_tone.queue_line(
                 name, text, tone=-1, everyone=False))
         self.messages_tab.private_welcome.helper_ready = self.rank_tone.ready
+        # Any tab can send one player a private line the same way (through the server).
+        self.server._private_line = lambda name, text: self.rank_tone.queue_line(
+            name, text, tone=-1, everyone=False)
+        self.server._private_line_ready = self.rank_tone.ready
         self.mods_tab.player_commands = lambda: mycmd.player_commands(
             vote=self.mods_tab._vote_enabled,
             skip=self.mods_tab._skip_enabled,
