@@ -82,6 +82,7 @@ class PrivateWelcomePanel(QWidget):
         self._pending: dict = {}
         self._sent = 0
         self._ready = False
+        self._looked_in = ""          # the server folder already searched for the old welcome
         self.settings = pw.load(self._path) or pw.Settings()
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
@@ -106,6 +107,13 @@ class PrivateWelcomePanel(QWidget):
 
         group = QGroupBox("Private welcome")
         layout = QVBoxLayout(group)
+        # First and in bold (Dale, 2026-11-21): after the update, the old
+        # welcome still in server.wac is the one thing to act on here.
+        self.old_lbl = QLabel()
+        self.old_lbl.setWordWrap(True)
+        self.old_lbl.setStyleSheet("color: #e8c840; font-weight: bold;")
+        self.old_lbl.setVisible(False)
+        layout.addWidget(self.old_lbl)
         self.enabled_cb = QCheckBox("Whisper a welcome to every player who joins")
         self.enabled_cb.toggled.connect(self._edited)
         layout.addWidget(self.enabled_cb)
@@ -149,10 +157,6 @@ class PrivateWelcomePanel(QWidget):
         self.state_lbl = QLabel()
         self.state_lbl.setWordWrap(True)
         layout.addWidget(self.state_lbl)
-        self.old_lbl = QLabel()
-        self.old_lbl.setWordWrap(True)
-        self.old_lbl.setStyleSheet("color: #e8c840;")
-        layout.addWidget(self.old_lbl)
 
         outer.addWidget(group)
         outer.addStretch(1)
@@ -163,33 +167,49 @@ class PrivateWelcomePanel(QWidget):
         for line, text in zip(self.lines, self.settings.lines):
             line.text.setText(text)
 
-    def _import_old_script_lines(self):
-        """Once: bring the old script welcome's text over, so nothing is retyped."""
+    def _import_old_script_lines(self) -> bool:
+        """Bring the old script welcome's text over once, so nothing is retyped.
+        True when it has just been copied in.
+
+        This page is built before WolfRAT knows the server's folder (it is found
+        from the running server later), so it is tried again on every player
+        list, when the page is shown and before the old welcome is taken out.
+        (2026-11-21: it was tried once, too early; switching on then took Dale's
+        welcome out of server.wac with nothing copied over.)"""
         if self.settings.imported or any(self.settings.lines):
-            return
-        old = pw.old_script_lines(self._server_dir())
+            return False                 # done, or the admin's own lines: kept
+        folder = self._server_dir()
+        if not folder or folder == self._looked_in:
+            return False
+        self._looked_in = folder
+        old = pw.old_script_lines(folder)
         if not old:
-            return
+            return False
         lines = (old + ["", "", ""])[:pw.MAX_LINES]
-        self.settings = pw.Settings(False, lines, self.settings.seconds, True)
+        self.settings = pw.Settings(self.settings.enabled, lines, self.settings.seconds, True)
         self._save_now()
-        self._log("Private welcome: the old script welcome's lines were copied in "
-                  "(tick the box to use them).")
+        if self._ready:                  # the form is up: show the lines in it
+            self._ready = False
+            self._fill()
+            self._ready = True
+        self._log("Private welcome: the old script welcome's lines were copied in"
+                  + ("." if self.settings.enabled else " (tick the box to use them)."))
+        return True
 
     def _edited(self, *_):
         if not self._ready:
             return
+        self.settings.enabled = self.enabled_cb.isChecked()
+        self.settings.seconds = self.seconds_spin.value()
+        self.settings.lines = [line.value() for line in self.lines]
+        if self.settings.enabled:
+            self._retire_old_script_welcome()    # copies the old lines in first
         problems = []
         for number, line in enumerate(self.lines, start=1):
             problem = line.refresh()
             if problem:
                 problems.append(f"Line {number}: {problem}")
-        self.settings.enabled = self.enabled_cb.isChecked()
-        self.settings.seconds = self.seconds_spin.value()
-        self.settings.lines = [line.value() for line in self.lines]
         self._save_timer.start(400)
-        if self.settings.enabled:
-            self._retire_old_script_welcome()
         self._show_state(problems)
 
     def _show_state(self, problems=()):
@@ -211,17 +231,26 @@ class PrivateWelcomePanel(QWidget):
         old = pw.old_script_lines(folder) if folder else None
         self.old_lbl.setVisible(bool(old))
         if old:
+            what_to_do = ("Its lines are copied in below: check them, then tick the box to "
+                          "switch to the new private welcome." if self.settings.imported else
+                          "Tick the box to switch to the new private welcome.")
             self.old_lbl.setText(
-                "The old script welcome is still in the server's script. It is taken out "
-                "when you switch this on (the server stops showing it at the next map change).")
+                "Your old welcome is still in the server's script (server.wac). "
+                f"{what_to_do} The old one is taken out when you do (the server stops "
+                "showing it at the next map change).")
         self.try_btn.setEnabled(bool(self.settings.used_lines()) and not problems
                                 and self.try_combo.count() > 0)
 
     def _retire_old_script_welcome(self):
-        """Switching this on takes the old script welcome out, so nobody gets both."""
+        """Switching this on takes the old script welcome out, so nobody gets
+        both, but only once its lines are on this page (or the admin typed
+        their own)."""
         folder = self._server_dir()
         if not folder:
             return
+        self._import_old_script_lines()
+        if not self.settings.imported and not any(self.settings.lines):
+            return                       # nothing here yet: the old one keeps running
         try:
             if server_wac.remove_welcome(folder):
                 self._log("Private welcome: the old script welcome was taken out of "
@@ -236,8 +265,15 @@ class PrivateWelcomePanel(QWidget):
             self._log(f"Private welcome: could not save the settings ({exc}).")
 
     # ------------------------------------------------------------- players
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._ready and self._import_old_script_lines():
+            self._edited()
+
     def players_updated(self, players):
         """Every player list (5 s): note who joined and queue their welcome."""
+        if self._ready and self._import_old_script_lines():
+            self._edited()               # the server's folder is known by now
         names = [str(p.get("name", "")).strip() for p in players]
         self._players = [name for name in names if name]
         current = self.try_combo.currentText()

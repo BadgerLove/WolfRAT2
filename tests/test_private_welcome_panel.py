@@ -132,3 +132,70 @@ def test_lines_already_typed_are_not_replaced_by_the_old_script(qtbot, tmp_path)
     settings = pw.Settings(False, ["My new line", "", ""], 30)
     panel, _path, _logs, _sent = make(qtbot, tmp_path, server_dir=str(server), settings=settings)
     assert panel.lines[0].value() == "My new line"
+
+
+# 2026-11-21, Dale's welcome lost: the page is built before WolfRAT knows the
+# server's folder, so the copy found nothing and was never tried again; ticking
+# the box then took the old welcome out of server.wac with nothing copied over.
+
+OLD_1 = "<c40c0ff>Welcome to <cffff00>Badger's <cff8000>125hz server!"
+OLD_2 = "<c00ff00>For your commands list use<c40c0ff> !mycmd"
+
+
+def late_folder_panel(qtbot, tmp_path):
+    server = tmp_path / "server"
+    server.mkdir()
+    sw._write(server, old_block(OLD_1, OLD_2))
+    found = [""]                                   # not known while the page is built
+    path = tmp_path / "wolfrat_private_welcome.json"
+    logs = []
+    panel = PrivateWelcomePanel(path, lambda: found[0], log=logs.append, clock=Clock())
+    qtbot.addWidget(panel)
+    panel.send_private = lambda name, text: True
+    panel.helper_ready = lambda: True
+    assert [line.value() for line in panel.lines] == ["", "", ""]
+    found[0] = str(server)
+    return panel, server, path, logs
+
+
+def test_the_old_welcome_comes_over_once_the_server_folder_is_known(qtbot, tmp_path):
+    panel, server, path, logs = late_folder_panel(qtbot, tmp_path)
+    panel.players_updated(players("Dale"))         # the next player list
+    assert [line.value() for line in panel.lines] == [OLD_1, OLD_2, ""]
+    assert not panel.enabled_cb.isChecked()         # copied, not switched on
+    assert json.loads(path.read_text())["imported"] is True
+    assert sw.read_welcome(server) is not None       # still running until switched on
+    assert "copied in below" in panel.old_lbl.text()
+    assert "bold" in panel.old_lbl.styleSheet()
+    assert any("copied in" in line for line in logs)
+
+
+def test_switching_on_before_the_copy_brings_the_lines_over_first(qtbot, tmp_path):
+    panel, server, path, logs = late_folder_panel(qtbot, tmp_path)
+    panel.enabled_cb.setChecked(True)               # what Dale did
+    assert [line.value() for line in panel.lines] == [OLD_1, OLD_2, ""]
+    assert sw.read_welcome(server) is None           # taken out only once they are safe
+    assert any("taken out of server.wac" in line for line in logs)
+    qtbot.waitUntil(lambda: bool(json.loads(path.read_text())["enabled"]), timeout=3000)
+    saved = json.loads(path.read_text())
+    assert saved["imported"] is True and saved["lines"][:2] == [OLD_1, OLD_2]
+
+
+def test_the_old_welcome_stays_while_nothing_is_on_the_page(qtbot, tmp_path, monkeypatch):
+    server = tmp_path / "server"
+    server.mkdir()
+    sw._write(server, old_block("Old line"))
+    monkeypatch.setattr(pw, "old_script_lines", lambda _folder: None)   # could not be read
+    panel, _path, _logs, _sent = make(qtbot, tmp_path, server_dir=str(server))
+    panel.enabled_cb.setChecked(True)
+    assert sw.read_welcome(server) is not None       # kept: nothing would replace it
+
+
+def test_the_old_welcome_notice_is_the_first_thing_on_the_page(qtbot, tmp_path):
+    server = tmp_path / "server"
+    server.mkdir()
+    sw._write(server, old_block(OLD_1))
+    panel, _path, _logs, _sent = make(qtbot, tmp_path, server_dir=str(server))
+    group_layout = panel.enabled_cb.parentWidget().layout()
+    assert group_layout.itemAt(0).widget() is panel.old_lbl
+    assert "still in the server's script" in panel.old_lbl.text()

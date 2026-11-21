@@ -4709,7 +4709,9 @@ class MessagesTab(QWidget):
         # Three pages (Dale, 2026-11-21: "split that ... rather than having to
         # scroll everywhere"): Welcome (first-time joiners, where they're
         # from, the VPN line), Private welcome, and Recurring messages last
-        # (the least used). KD tracking and the message log stay underneath.
+        # (the least used). The message log stays underneath. Player stats
+        # (KD tracking) moved to the Sprees tab; its setting is still kept
+        # here, see set_stats_tracking.
         main_layout = QVBoxLayout(self)
 
         # The log first: the pages can write to it while they are built.
@@ -4840,21 +4842,6 @@ class MessagesTab(QWidget):
         )
         private_page.addWidget(self.private_welcome)
 
-
-        # --- KD Tracking ---
-        kd_group = QGroupBox("Player KD Tracking")
-        kd_layout = QVBoxLayout()
-        self.kd_checkbox = QCheckBox("Enable KD Tracking (persistent stats database)")
-        self.kd_checkbox.setChecked(self._kd_enabled)
-        self.kd_checkbox.stateChanged.connect(self._toggle_kd)
-        kd_layout.addWidget(self.kd_checkbox)
-        kd_hint = QLabel(self._kd_tracked_text())
-        kd_hint.setStyleSheet("color: #6a6a30; font-size: 8pt;")
-        kd_hint.setWordWrap(True)
-        self.kd_hint_label = kd_hint
-        kd_layout.addWidget(kd_hint)
-        kd_group.setLayout(kd_layout)
-        main_layout.addWidget(kd_group)
         main_layout.addWidget(log_group)
 
     def _add_recurring(self):
@@ -4941,25 +4928,12 @@ class MessagesTab(QWidget):
         self._welcome_message = text
         self._save_config()
 
-    def _toggle_kd(self, state):
-        self._kd_enabled = (state == 2)
+    def set_stats_tracking(self, on):
+        """Player Stats, the first box on the Sprees tab (moved there
+        2026-11-21). The setting stays in this tab's config as 'kd_enabled',
+        beside the stats store that !kd reads, so nobody's choice is lost."""
+        self._kd_enabled = bool(on)
         self._save_config()
-
-    def _kd_tracked_text(self):
-        count = self.stats_store.get_player_count() if self.stats_store else 0
-        return (
-            "Players can type !kd in game chat to see their stats.\n"
-            f"Tracked: {count} players"
-        )
-
-    def _refresh_kd_hint(self):
-        """Recompute the 'Tracked: N players' hint from the live stats store."""
-        if hasattr(self, 'kd_hint_label'):
-            self.kd_hint_label.setText(self._kd_tracked_text())
-
-    def showEvent(self, event):
-        super().showEvent(event)
-        self._refresh_kd_hint()
 
     def _country_edited(self, *_args):
         if not hasattr(self, 'country_vpn_input'):
@@ -5000,7 +4974,6 @@ class MessagesTab(QWidget):
 
     def check_new_players(self, players):
         """Called when player list updates. Detects first-time joiners."""
-        self._refresh_kd_hint()
         self.private_welcome.players_updated(players)   # every join, its own page
         if not (self._welcome_enabled or self._country_enabled):
             return
@@ -5223,9 +5196,34 @@ class SpreeTab(QWidget):
         self.pages = QTabWidget()
         root.addWidget(self.pages, 1)
 
-        spree_page = QWidget()
-        layout = QVBoxLayout(spree_page)
+        # Scrolls: with Player Stats on top it is taller than a 720-high screen.
+        spree_page, layout = scroll_column()
         self.pages.addTab(spree_page, "Killing sprees")
+
+        # Player Stats first (Dale, 2026-11-21: "that's what people are going to
+        # be looking for straight away"). It was "Player KD Tracking" under the
+        # Messages pages. check_sprees counts the kills from the player list into
+        # the stats store and !kd reads them; MessagesTab keeps the setting.
+        stats_group = QGroupBox("Player Stats")
+        stats_box = QVBoxLayout(stats_group)
+        self.stats_checkbox = QCheckBox("Enable stats tracking")
+        self.stats_checkbox.setChecked(bool(self.messages_tab._kd_enabled))
+        self.stats_checkbox.toggled.connect(self._stats_toggled)
+        stats_box.addWidget(self.stats_checkbox)
+        stats_about = QLabel(
+            "Keeps every player's kills and deaths, added up over maps and visits "
+            "(saved on this PC). Players type !kd in game chat to see theirs, or "
+            "!kd PlayerName for someone else's. It counts from the player list "
+            "WolfRAT already reads, so it works from any PC: WolfRAT does not have "
+            "to run on the server's PC.")
+        stats_about.setWordWrap(True)
+        stats_about.setStyleSheet("color: #a89830; font-size: 9pt;")
+        stats_box.addWidget(stats_about)
+        self.stats_hint_label = QLabel()
+        self.stats_hint_label.setStyleSheet("color: #6a6a30; font-size: 8pt;")
+        stats_box.addWidget(self.stats_hint_label)
+        self.refresh_stats_hint()
+        layout.addWidget(stats_group)
 
         spree_group = QGroupBox("Killing Spree Announcer")
         spree_layout = QVBoxLayout()
@@ -5340,6 +5338,23 @@ class SpreeTab(QWidget):
     def _toggle_first_blood(self, state):
         self._first_blood_enabled = (state == 2)
         self._save_config()
+
+    def _stats_toggled(self, on):
+        self.messages_tab.set_stats_tracking(on)
+
+    def refresh_stats_hint(self, *_players):
+        """The 'Tracked: N players' line under Player Stats (every player list
+        and whenever the tab is shown)."""
+        label = getattr(self, 'stats_hint_label', None)
+        if label is None:
+            return
+        count_players = getattr(getattr(self.messages_tab, 'stats_store', None),
+                                'get_player_count', None)
+        label.setText(f"Tracked: {count_players() if count_players else 0} players")
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.refresh_stats_hint()
 
     def _populate_spree_table(self):
         self._spree_table_loading = True
@@ -9623,6 +9638,7 @@ class MainWindow(QMainWindow):
         self.signals.players_signal.connect(self.mods_tab.update_players)
         self.signals.players_signal.connect(self.messages_tab.check_new_players)
         self.signals.players_signal.connect(self.spree_tab.check_sprees)
+        self.signals.players_signal.connect(self.spree_tab.refresh_stats_hint)
         self.signals.chat_signal.connect(self.chatbot_tab.update_chat)
         self.signals.chat_signal.connect(lambda c: self.web_server.broadcast_chat())
         self.signals.chat_signal.connect(self.mods_tab.update_chat)

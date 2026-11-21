@@ -27,6 +27,7 @@ from wolfrat.app import (
     ModsTab,
     ServerTab,
     SettingsTab,
+    SpreeTab,
     LogSignals,
     _build_update_batch,
 )
@@ -275,14 +276,18 @@ def test_messages_log_is_visible(qtbot, tmp_path):
     assert tab.log_text.isVisibleTo(tab)
 
 
-def test_messages_tracked_count_refreshes(qtbot, tmp_path):
+def test_player_stats_tracked_count_refreshes(qtbot, tmp_path):
+    # The box moved from Messages to the top of the Sprees tab (2026-11-21).
     stats = FakeStats(0)
-    tab = MessagesTab(FakeServer(), stats, DesktopRuntime.isolated(tmp_path))
+    runtime = DesktopRuntime.isolated(tmp_path)
+    messages = MessagesTab(FakeServer(), stats, runtime)
+    qtbot.addWidget(messages)
+    tab = SpreeTab(FakeServer(), messages, runtime)
     qtbot.addWidget(tab)
-    assert "Tracked: 0 players" in tab.kd_hint_label.text()
+    assert "Tracked: 0 players" in tab.stats_hint_label.text()
     stats._count = 7
-    tab._refresh_kd_hint()
-    assert "Tracked: 7 players" in tab.kd_hint_label.text()
+    tab.refresh_stats_hint([])                     # every player list
+    assert "Tracked: 7 players" in tab.stats_hint_label.text()
 
 
 # --------------------------------------------------------------------------

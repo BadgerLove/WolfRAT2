@@ -29,8 +29,8 @@ point, click, done.
 | **Missions** | Map browser, one-click map switching, next map, mission presets |
 | **Settings** | Server config â€” auto-balance, team switching, vote percent, respawn delay |
 | **Chat Bot** | Live chat monitor, send chat, bad word filter, auto-team-swap trigger |
-| **Messages** | Recurring messages, welcome messages, and persistent KD tracking |
-| **Spree** | Kill streak tracker â€” auto-announces 3/5/7/10 kill streaks with gold heat gradient |
+| **Messages** | Welcome messages for first-time joiners (where they're from, VPN), private welcome, recurring messages |
+| **Sprees** | Player stats (!kd), kill streak and first blood announcer, lead announcer |
 | **Mods** | TAC mod management and configuration |
 | **Map Voting** | In-game map voting system |
 | **Weapons** | Weapon loadout editor and configuration |
