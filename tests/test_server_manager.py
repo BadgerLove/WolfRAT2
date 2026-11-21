@@ -645,6 +645,57 @@ class ServerManagerFacadeTests(unittest.TestCase):
 
         self.assertTrue(correct.verified)
 
+    def test_appended_x2_the_server_keeps_at_x1_counts_as_added(self):
+        """Retail's append clears x2 on objective and non-team maps
+        (MissionRotation_Append @0x501aa8). The map is in the queue, so the
+        add is a success with a log line, not 'Skipped ... not verified'."""
+        logs = []
+        self.manager.set_callbacks(on_log=logs.append)
+        before = (
+            MissionEntry(0, "CP08.BMS", revision=7),
+            MissionEntry(1, "CP10.BMS", revision=7),
+        )
+        acknowledgement = CommandResult(
+            AdminOperation.MISSION_ADD, ("OK - Entry Added",), True
+        )
+
+        def add_with_readback(queue):
+            self.session.snapshot = replace(
+                self.session.snapshot, revision=7, missions=before
+            )
+            self.session.result_overrides[AdminOperation.MISSION_ADD] = [
+                acknowledgement
+            ]
+            self.session.result_overrides[AdminOperation.MISSION_LIST] = [
+                CommandResult(
+                    AdminOperation.MISSION_LIST, ("mission list",), True,
+                    queue, verified=True,
+                )
+            ]
+            return self.manager.add_mission(
+                "DM-DUST.NPZ", auto_switch_sides=True
+            ).result()
+
+        kept_at_x1 = add_with_readback(
+            before + (MissionEntry(2, "DM-DUST.NPZ", double_time=False,
+                                   revision=8),)
+        )
+        self.assertTrue(kept_at_x1.verified)
+        self.assertTrue(
+            any("DM-DUST.NPZ added as x1" in line for line in logs), logs
+        )
+
+        logs.clear()
+        kept_at_x2 = add_with_readback(
+            before + (MissionEntry(2, "DM-DUST.NPZ", double_time=True,
+                                   revision=8),)
+        )
+        self.assertTrue(kept_at_x2.verified)
+        self.assertFalse(any("added as x1" in line for line in logs))
+
+        not_added = add_with_readback(before)
+        self.assertFalse(not_added.verified)
+
     def test_filename_switch_adds_reads_back_resolves_then_cycles(self):
         self.manager.switch_mission(
             "DM-DUST.NPZ", add_if_missing=True

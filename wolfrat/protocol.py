@@ -1224,6 +1224,39 @@ class ServerManager:
             if auto_switch_sides is not None or insert_at is not None
             else None
         )
+        # Retail's append clears x2 again on an objective (0x20000) or
+        # non-team (no 0x10000) map: MissionRotation_Append @0x5019D0,
+        # @0x501aa8..0x501ac1 (OpenNova novaworld-net-re.md 5.70.1). The map
+        # IS added, so an appended x2 that reads back x1 is a success told in
+        # the log, not a refusal (it used to read "Skipped ... not verified").
+        # An insert (InsertEntryAtIndex) never clears it, so stays strict.
+        x2_may_drop = expected_double_time is True and insert_at is None
+
+        def verify(ack, readback) -> bool:
+            if not _ack_is(ack, "OK - Entry Added"):
+                return False
+
+            def added(double_time):
+                return _mission_add_readback_matches(
+                    before,
+                    readback.value,
+                    mission.filename,
+                    expected_index=expected_index,
+                    expected_one_shot=bool(one_shot),
+                    expected_double_time=double_time,
+                )
+
+            if added(expected_double_time):
+                return True
+            if x2_may_drop and added(False):
+                self._log(
+                    f"[MISSIONS] {mission.filename} added as x1: the server "
+                    "does not allow x2 on this kind of map (Deathmatch, "
+                    "King of the Hill, co-op objective)"
+                )
+                return True
+            return False
+
         return self._execute(
             AdminCommands.add_mission(
                 mission,
@@ -1232,17 +1265,7 @@ class ServerManager:
                 one_shot=one_shot,
             ),
             confirm=self.refresh_missions,
-            verify=lambda ack, readback: (
-                _ack_is(ack, "OK - Entry Added")
-                and _mission_add_readback_matches(
-                    before,
-                    readback.value,
-                    mission.filename,
-                    expected_index=expected_index,
-                    expected_one_shot=bool(one_shot),
-                    expected_double_time=expected_double_time,
-                )
-            ),
+            verify=verify,
             expected_session=session,
         )
 
