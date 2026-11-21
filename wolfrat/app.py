@@ -1714,6 +1714,8 @@ class MissionsTab(QWidget):
       BOTTOM: Status bar (Connected | Game Mode | command | status | players | time)
     """
 
+    _feed = None  # class default: the feed lock is free (see _run_feed)
+
     def __init__(
         self,
         server: ServerManager,
@@ -1729,7 +1731,9 @@ class MissionsTab(QWidget):
         self._rotation_entries = []  # authoritative MissionEntry per table row
         self._main_window = None  # set by MainWindow after creation
         self._presets = {}  # saved rotation presets
-        self._order_feed_active = False  # Edit Order is re-adding maps
+        # {"label", "done", "total"} while a feed (Load Preset, Edit Order)
+        # is putting maps on the server; None when idle. See _run_feed.
+        self._feed = None
         self._load_presets()
         self._build_ui()
 
@@ -2451,6 +2455,8 @@ class MissionsTab(QWidget):
 
     def _set_side_switch(self, mission, switch_sides):
         """Change one queued map between x1 and x2 in place."""
+        if self._feed_busy("Play Once / Twice"):
+            return
         name = mission.filename
         if bool(mission.double_time) == bool(switch_sides):
             return
@@ -2490,6 +2496,8 @@ class MissionsTab(QWidget):
 
     def _remove_mission(self, mission):
         """Remove one identity-bearing queue occurrence."""
+        if self._feed_busy("Remove"):
+            return
         name = mission.filename
         submit_admin(
             self,
@@ -2533,6 +2541,8 @@ class MissionsTab(QWidget):
             self._remove_mission(mission)
 
     def _clear_rotation(self):
+        if self._feed_busy("Clear Rotation"):
+            return
         reply = QMessageBox.question(
             self, "Clear Rotation",
             "Remove all maps from the rotation?",
@@ -2546,10 +2556,69 @@ class MissionsTab(QWidget):
                 "Clear mission rotation",
             )
 
+    # ---- One feed at a time (SgtMudd, 2026-11-21) ----
+    # A feed is a run of MISSION ADDs: Load Preset or Edit Order / Shuffle.
+    # His log shows him pressing Clear while a Load was still adding (20 Nov
+    # 20:31:44, map 42 of 219): Clear wiped the maps already added, the feed
+    # carried on into the empty list, and 177 of 219 were left. So while a
+    # feed runs, everything that changes or saves the list waits for it.
+
+    @property
+    def _feed_active(self):
+        return self._feed is not None
+
+    def _feed_busy(self, title):
+        """True, after telling the admin, while a feed is still running."""
+        feed = self._feed
+        if feed is None:
+            return False
+        QMessageBox.information(
+            self, title,
+            f"WolfRAT is still putting maps on the server ({feed['label']}: "
+            f"{feed['done']} of {feed['total']} done).\n\n"
+            "Wait until it has finished, then try again.",
+        )
+        return True
+
+    def _run_feed(self, entries, label, *, replace, on_complete=None):
+        """Put ``entries`` on the server in order; MISSION CLEAR first when
+        ``replace``. Holds the feed lock (``_feed``) until it ends, whether
+        it finishes, the CLEAR fails or the connection drops."""
+        entries = list(entries)
+        self._feed = {"label": label, "done": 0, "total": len(entries)}
+
+        def finished():
+            self._feed = None
+            if on_complete is not None:
+                on_complete()
+
+        def stopped(_message=None):
+            self._feed = None
+
+        def start(_result=None):
+            try:
+                self._add_missions_in_sequence(
+                    entries, on_complete=finished, on_stopped=stopped
+                )
+            except Exception as error:
+                self._feed = None
+                self.server._log(f"{label} stopped: {error}")
+
+        if not replace:
+            start()
+            return
+        submit_admin(
+            self,
+            lambda: self.server.clear_missions(),
+            start,
+            f"Clear rotation before {label}",
+            on_failure=stopped,
+        )
+
     # ---- Edit Order / Shuffle (SgtMudd, 2026-11-21) ----
     # Retail has no reorder verb (novaworld-net-re.md 5.70.8), so a new order
     # goes on the server as MISSION CLEAR, then every map added back in order
-    # through _add_missions_in_sequence (the feed Load Preset uses).
+    # through _run_feed (the feed Load Preset uses).
 
     def _order_entries(self):
         """The server's Mission Cycle, in queue order, for the order editor."""
@@ -2587,12 +2656,7 @@ class MissionsTab(QWidget):
                 self, "Edit Order", "Connect to a server first."
             )
             return
-        if self._order_feed_active:
-            QMessageBox.information(
-                self, "Edit Order",
-                "WolfRAT is still putting the last order on the server. "
-                "Try again in a few seconds.",
-            )
+        if self._feed_busy("Edit Order"):
             return
         before = self._order_entries()
         if not before:
@@ -2624,29 +2688,15 @@ class MissionsTab(QWidget):
     def _apply_order(self, order):
         """Clear the server's cycle and add the maps back in ``order``."""
         maps = [entry.as_preset() for entry in order]
-        self._order_feed_active = True
         self.server._log(
             f"Putting the new map order on the server ({len(maps)} maps)..."
         )
-
-        def finished():
-            self._order_feed_active = False
-            self.server._log(
+        self._run_feed(
+            maps, "the new map order", replace=True,
+            on_complete=lambda: self.server._log(
                 f"New map order is on the server: {len(maps)} maps. Save a "
                 "preset to keep this order."
-            )
-
-        def stopped(_message=None):
-            self._order_feed_active = False
-
-        submit_admin(
-            self,
-            lambda: self.server.clear_missions(),
-            lambda _result: self._add_missions_in_sequence(
-                maps, on_complete=finished, on_stopped=stopped
             ),
-            "Clear rotation before the new map order",
-            on_failure=stopped,
         )
 
     def auto_apply_rotation(self):
@@ -2655,17 +2705,14 @@ class MissionsTab(QWidget):
         if not saved:
             return
 
+        if self._feed is not None:
+            return
         self.server._log(f"Auto-applying saved rotation ({len(saved)} maps)...")
-        submit_admin(
-            self,
-            lambda: self.server.clear_missions(),
-            lambda _result: self._add_missions_in_sequence(
-                saved,
-                on_complete=lambda: self.server._log(
-                    f"Auto rotation applied: {len(saved)} maps"
-                ),
+        self._run_feed(
+            saved, "the auto rotation", replace=True,
+            on_complete=lambda: self.server._log(
+                f"Auto rotation applied: {len(saved)} maps"
             ),
-            "Clear rotation before auto-apply",
         )
 
     def _set_next_map(self):
@@ -2674,7 +2721,23 @@ class MissionsTab(QWidget):
         if 0 <= row < len(self._rotation_maps):
             self._set_next_mission(row)
 
+    def _confirm_overwrite(self, name, old_count, new_count):
+        """Ask before a save changes how many maps a saved list holds."""
+        reply = QMessageBox.question(
+            self, "Save Rotation",
+            f"'{name}' already holds {old_count} maps. The Mission Cycle "
+            f"has {new_count} now.\n\nReplace the saved list with these "
+            f"{new_count} maps?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
     def _save_preset(self):
+        # Saving mid-feed stores a half-loaded list: that is how SgtMudd's
+        # 221-map '1-coop' became 175 maps. Save stores the table as it is.
+        if self._feed_busy("Save Rotation"):
+            return
         try:
             from PyQt6.QtWidgets import QInputDialog
             name, ok = QInputDialog.getText(self, "Save Rotation", "Preset name:")
@@ -2689,6 +2752,14 @@ class MissionsTab(QWidget):
                         filename = file_item.text()
                         count = int(r_item.text()) if r_item else 1
                         maps.append({"file": filename, "count": count})
+                old = self._presets.get(name)
+                if (
+                    isinstance(old, list)
+                    and len(old) != len(maps)
+                    and not self._confirm_overwrite(name, len(old), len(maps))
+                ):
+                    self.server._log(f"Kept the saved '{name}' ({len(old)} maps).")
+                    return
                 self._presets[name] = maps
                 self._save_presets()
                 if self.preset_combo.findText(name) < 0:
@@ -2702,6 +2773,8 @@ class MissionsTab(QWidget):
         return entry["file"] if isinstance(entry, dict) else entry
 
     def _load_preset(self):
+        if self._feed_busy("Load Preset"):
+            return
         name = self.preset_combo.currentText()
         if name == "(none)" or name not in self._presets:
             return
@@ -2749,13 +2822,9 @@ class MissionsTab(QWidget):
                 missing.append(filename)
 
         if not missing:
-            reply = QMessageBox.question(
-                self, "Load Preset",
-                f"Add '{name}' maps to current rotation?\n\nOld preset will stay unless you click Cancel.\nClick Clear at the bottom right to remove it.",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
+            # The old "Add to current rotation? ... Click Clear at the bottom
+            # right to remove it" box sent SgtMudd to Clear mid-load. Replace
+            # or add is asked in _start_preset_load instead.
             self._start_preset_load(name, preset)
             return
 
@@ -2831,14 +2900,54 @@ class MissionsTab(QWidget):
             return "remove"
         return None
 
-    def _start_preset_load(self, name, preset):
-        self.server._log(
-            f"Loading preset '{name}' - adding {len(preset)} maps..."
+    def _ask_replace_or_add(self, name, count):
+        """'replace', 'add' or None (Cancel), when the cycle is not empty."""
+        current = len(self.server.mission_entries)
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setWindowTitle("Load Preset")
+        box.setText(
+            f"Load '{name}' ({count} maps)? The server has {current} maps "
+            "in its cycle now."
         )
-        self._add_missions_in_sequence(
-            preset,
+        box.setInformativeText(
+            "Replace: clear the cycle, then add this list.\n"
+            "Add to the end: keep the maps that are there and add this "
+            "list after them.\n\n"
+            "Leave the map list alone until it has finished loading."
+        )
+        replace_button = box.addButton(
+            "Replace", QMessageBox.ButtonRole.AcceptRole
+        )
+        add_button = box.addButton(
+            "Add to the end", QMessageBox.ButtonRole.AcceptRole
+        )
+        box.addButton(QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(replace_button)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked is replace_button:
+            return "replace"
+        if clicked is add_button:
+            return "add"
+        return None
+
+    def _start_preset_load(self, name, preset):
+        replace = False
+        if self.server.mission_entries:
+            choice = self._ask_replace_or_add(name, len(preset))
+            if choice is None:
+                return
+            replace = choice == "replace"
+        how = "replacing the cycle, " if replace else ""
+        self.server._log(
+            f"Loading preset '{name}' - {how}adding {len(preset)} maps..."
+        )
+        tail = "" if replace else " Remove unwanted maps manually."
+        self._run_feed(
+            preset, f"loading '{name}'", replace=replace,
             on_complete=lambda: self.server._log(
-                f"Preset '{name}' loaded. Remove unwanted maps manually."
+                f"Preset '{name}' loaded.{tail}"
             ),
         )
 
@@ -2884,6 +2993,8 @@ class MissionsTab(QWidget):
         on_stopped=None,
     ):
         self.server._log(f"  [{index + 1}/{len(entries)}] Added {filename}")
+        if self._feed is not None:
+            self._feed["done"] = index + 1
         self._add_missions_in_sequence(
             entries, index + 1, on_complete, failed, on_stopped
         )
@@ -2895,15 +3006,17 @@ class MissionsTab(QWidget):
         self.server._log(
             f"  [{index + 1}/{len(entries)}] Skipped {filename}: {message}"
         )
+        if self._feed is not None:
+            self._feed["done"] = index + 1
         failed.append(filename)
         if not self.server.is_connected:
             # Connection gone: the rest would only fail the same way.
             failed.extend(
                 self._preset_entry_file(entry) for entry in entries[index + 1:]
             )
-            self._report_failed_preset_adds(failed, disconnected=True)
             if on_stopped is not None:
-                on_stopped()
+                on_stopped()  # free the map list before the box below
+            self._report_failed_preset_adds(failed, disconnected=True)
             return
         self._add_missions_in_sequence(
             entries, index + 1, on_complete, failed, on_stopped
@@ -2928,6 +3041,8 @@ class MissionsTab(QWidget):
 
     def _ok_clicked(self):
         """Save Auto Rotation - snapshot the current cycle for auto-apply on connect."""
+        if self._feed_busy("Save Auto Rotation"):
+            return
         self._presets['_auto'] = self._build_auto_preset()
         self._save_presets()
         self.server._log("Rotation saved; it will auto-apply on the next connect.")

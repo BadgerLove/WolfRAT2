@@ -391,7 +391,7 @@ def test_ok_clears_the_list_and_adds_the_maps_back_in_the_new_order(
         lambda entries: opened.append(list(entries)) or list(reversed(entries)),
     )
     tab._open_order_editor()
-    qtbot.waitUntil(lambda: not tab._order_feed_active, timeout=3000)
+    qtbot.waitUntil(lambda: not tab._feed_active, timeout=3000)
     assert [e.filename for e in opened[0]] == FILES
     assert opened[0][1].is_current and opened[0][2].double_time
     assert server.calls == [
@@ -470,7 +470,7 @@ def test_a_list_changed_while_editing_asks_first(
     server.queue.pop()
     answers.append(app_module.QMessageBox.StandardButton.Yes)
     tab._open_order_editor()
-    qtbot.waitUntil(lambda: not tab._order_feed_active, timeout=3000)
+    qtbot.waitUntil(lambda: not tab._feed_active, timeout=3000)
     assert server.calls[0] == ("CLEAR",)
     added = [call[1] for call in server.calls[1:]]
     assert added == list(reversed(FILES))  # the edited order; E.bms dropped
@@ -489,14 +489,14 @@ def test_a_second_edit_waits_for_the_first_feed(
     )
     tab._open_order_editor()
     qtbot.waitUntil(lambda: bool(server.held), timeout=2000)
-    assert tab._order_feed_active
+    assert tab._feed_active
     tab._open_order_editor()
     assert opened == [1]
-    assert boxes and "still putting the last order" in boxes[-1][1]
+    assert boxes and "still putting maps on the server" in boxes[-1][1]
     for _ in FILES:  # let the feed finish
         qtbot.waitUntil(lambda: bool(server.held), timeout=2000)
         server.held.pop(0).set_result(_ok("MISSION ADD"))
-    qtbot.waitUntil(lambda: not tab._order_feed_active, timeout=3000)
+    qtbot.waitUntil(lambda: not tab._feed_active, timeout=3000)
 
 
 def test_a_refused_map_is_skipped_and_the_rest_still_go_on(
@@ -509,7 +509,7 @@ def test_a_refused_map_is_skipped_and_the_rest_still_go_on(
         tab, "_run_order_dialog", lambda entries: list(reversed(entries))
     )
     tab._open_order_editor()
-    qtbot.waitUntil(lambda: not tab._order_feed_active, timeout=3000)
+    qtbot.waitUntil(lambda: not tab._feed_active, timeout=3000)
     assert [c[1] for c in server.calls[1:]] == ["D.bms", "B.bms", "A.bms"]
     assert boxes and boxes[-1][0] == "warning" and "C.bms" in boxes[-1][1]
 
@@ -532,6 +532,6 @@ def test_a_lost_connection_part_way_frees_the_editor(
         tab, "_run_order_dialog", lambda entries: list(reversed(entries))
     )
     tab._open_order_editor()
-    qtbot.waitUntil(lambda: not tab._order_feed_active, timeout=3000)
+    qtbot.waitUntil(lambda: not tab._feed_active, timeout=3000)
     assert boxes and "connection to the server was lost" in boxes[-1][1]
     assert not any("New map order is on the server" in m for m in server.logs)
