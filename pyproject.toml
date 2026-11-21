@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "WolfRAT2"
-version = "2.10.25"
+version = "2.10.26"
 description = "Joint Operations retail server administration tool"
 readme = "README.md"
 requires-python = ">=3.11,<3.15"
