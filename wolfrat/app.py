@@ -21,6 +21,7 @@ from PyQt6.QtGui import QColor, QIcon, QTextCursor
 
 from wolfrat import vote_rules
 from wolfrat import map_match
+from wolfrat import first_blood_memory
 from wolfrat import weather
 from wolfrat import start_game
 from wolfrat import coop_guard
@@ -5043,6 +5044,7 @@ class SpreeTab(QWidget):
 
     FIRST_BLOOD_POLL = 1.0          # seconds between player reads while first blood is due
     FIRST_BLOOD_FAST_FOR = 180.0    # ...for at most this long after a map change
+    FIRST_BLOOD_MEMORY_POLL = 0.5   # seconds between server memory reads while first blood is due
 
     def __init__(
         self,
@@ -5094,6 +5096,16 @@ class SpreeTab(QWidget):
         self._fast_poll_timer = QTimer(self)
         self._fast_poll_timer.setInterval(int(self.FIRST_BLOOD_POLL * 1000))
         self._fast_poll_timer.timeout.connect(self._fast_poll)
+        # With the server on this PC, first blood comes from its memory
+        # (first_blood_memory.py, Dale 2026-11-22): the map's first kill in the
+        # order the kills really happened, said within a second, for as long as
+        # first blood is due (players may join long after the map change).  The
+        # player list decides it only while the memory can't be read.
+        self._fb_memory = first_blood_memory.FirstBloodMemory()
+        self._fb_memory_live = False
+        self._memory_timer = QTimer(self)
+        self._memory_timer.setInterval(int(self.FIRST_BLOOD_MEMORY_POLL * 1000))
+        self._memory_timer.timeout.connect(self._memory_tick)
         self._zone_capture_enabled = True
         self._zone_line_player = "{player} takes {zone} for the {team} - first zone!"
         self._zone_line_team = "{team} take {zone} - first zone of the map!"
@@ -5338,6 +5350,8 @@ class SpreeTab(QWidget):
     def _toggle_first_blood(self, state):
         self._first_blood_enabled = (state == 2)
         self._save_config()
+        if self._first_blood_enabled and self._first_blood_ready:
+            self._start_memory_watch(new_map=False)
 
     def _stats_toggled(self, on):
         self.messages_tab.set_stats_tracking(on)
@@ -5441,6 +5455,7 @@ class SpreeTab(QWidget):
             if previous is not None:              # a real change, not WolfRAT starting up
                 self._new_map_since = time.monotonic()
                 self._start_fast_poll()
+            self._start_memory_watch(new_map=previous is not None)
             self._lead_watch.reset()
             wire_log(f"[SPREE] Map changed to {current} - first blood + streaks reset")
 
@@ -5623,6 +5638,49 @@ class SpreeTab(QWidget):
         except Exception:
             pass
 
+    def _start_memory_watch(self, new_map):
+        """Read the server's memory for first blood until it is said.  ``new_map``:
+        a real map change, so the kills already there are this map's."""
+        if not self._first_blood_enabled:
+            return
+        self._fb_memory.start(new_map=new_map)
+        if not self._memory_timer.isActive():
+            self._memory_timer.start()
+
+    def _stop_memory_watch(self):
+        self._memory_timer.stop()
+        self._fb_memory.stop()                  # closes the read-only handle
+        self._fb_memory_live = False
+
+    def _restoring(self, name):
+        """Keep Stats just gave this player their score back (note_stats_restored)."""
+        return self._stats_restored_until.get(name, 0) > time.time()
+
+    def _memory_tick(self):
+        """Twice a second while first blood is due: the kills since the last read,
+        from the server's memory, in the order they happened."""
+        if not self._first_blood_enabled or not self._first_blood_ready:
+            self._stop_memory_watch()
+            return
+        if self._first_blood_pending:
+            return
+        kills = self._fb_memory.poll(skip=self._restoring)
+        live = kills is not None
+        if live != self._fb_memory_live:
+            wire_log("[SPREE] first blood: " + (
+                "reading the server's memory" if live else
+                f"server memory not readable ({self._fb_memory.status}) - the player list decides"))
+        self._fb_memory_live = live
+        if not kills:
+            return
+        first = kills[0]
+        when = f"frame {first.clock}" if first.clock is not None else "time not known"
+        others = ", ".join(k.name for k in kills[1:])
+        wire_log(f"[SPREE] first blood from server memory: {first.name}"
+                 + (f" killed {first.victim}" if first.victim else "")
+                 + f" ({when})" + (f"; same read, later: {others}" if others else ""))
+        self._announce_first_blood(first.name)
+
     @staticmethod
     def _scores_reset(players, stats) -> bool:
         """Does this player list show the new map's scores yet?  At least half
@@ -5648,6 +5706,9 @@ class SpreeTab(QWidget):
         one player list either side of the write is ignored (it may be stale)."""
         name = name.strip()
         self._stats_restored_until[name] = time.time() + STATS_RESTORE_SETTLE_SECONDS
+        memory = getattr(self, '_fb_memory', None)
+        if memory is not None:                    # the memory read counts from the score put back
+            memory.restored(name, kills)
         store = getattr(self.messages_tab, 'stats_store', None)
         if store and self.messages_tab._kd_enabled:
             store.note_restored(name, kills, deaths)
@@ -5700,6 +5761,21 @@ class SpreeTab(QWidget):
             prev = self._player_stats[pid]
             prev['name'] = name
 
+            # First blood: ANY kill counts, also one in the same list as the
+            # killer's own death - a trade, or a satchel that kills its owner too
+            # (2026-11-22: both were skipped and the map's 4th kill got it).  The
+            # list can't say who killed first when two players gain in one list,
+            # so the first of them in list order gets it.  With the server on this
+            # PC its memory decides instead (_memory_tick), in true order.
+            if (
+                kills > prev['kills']
+                and self._first_blood_enabled
+                and self._first_blood_ready
+                and not self._first_blood_pending
+                and not getattr(self, '_fb_memory_live', False)
+            ):
+                self._announce_first_blood(name)
+
             if deaths > prev['deaths']:
                 prev['streak'] = 0
             elif kills > prev['kills']:
@@ -5707,34 +5783,6 @@ class SpreeTab(QWidget):
                 old_streak = prev['streak']
                 new_streak = old_streak + gained
                 prev['streak'] = new_streak
-
-                # First blood check
-                if (
-                    self._first_blood_enabled
-                    and self._first_blood_ready
-                    and not self._first_blood_pending
-                    and new_streak >= 1
-                    and manual_mode.skip("First blood")
-                ):
-                    # Said by the other WolfRAT: it is no longer to come here.
-                    self._first_blood_ready = False
-                elif (
-                    self._first_blood_enabled
-                    and self._first_blood_ready
-                    and not self._first_blood_pending
-                    and new_streak >= 1
-                ):
-                    fb_msg = self._first_blood_line(name)
-                    self._first_blood_pending = True
-                    submit_admin(
-                        self,
-                        lambda message=fb_msg: self.server.send_chat(message),
-                        lambda _result, message=fb_msg: self._first_blood_sent(
-                            message
-                        ),
-                        "Announce first blood",
-                        lambda _message: self._first_blood_failed(),
-                    )
 
                 if self._spree_enabled:
                     thresholds = sorted(self._spree_thresholds.keys(), reverse=True)
@@ -5762,6 +5810,24 @@ class SpreeTab(QWidget):
 
             if kd_enabled and getattr(self.messages_tab, 'stats_store', None):
                 self.messages_tab.stats_store.update_player(name, kills, deaths, prev.get('streak', 0))
+
+    def _announce_first_blood(self, name):
+        """First blood to ``name`` (from the server's memory or the player list)."""
+        if manual_mode.skip("First blood"):
+            # Said by the other WolfRAT: it is no longer to come here.
+            self._first_blood_ready = False
+            return
+        fb_msg = self._first_blood_line(name)
+        self._first_blood_pending = True
+        submit_admin(
+            self,
+            lambda message=fb_msg: self.server.send_chat(message),
+            lambda _result, message=fb_msg: self._first_blood_sent(
+                message
+            ),
+            "Announce first blood",
+            lambda _message: self._first_blood_failed(),
+        )
 
     def _first_blood_line(self, name):
         colour, plain = random.choice(self._first_blood_templates)

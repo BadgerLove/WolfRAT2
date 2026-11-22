@@ -131,6 +131,22 @@ class LocalServerPlayers:
         self.status = why
         self.available = False
 
+    @property
+    def pid(self) -> Optional[int]:
+        return self._pid
+
+    def handle(self):
+        """The read-only handle to the connected server, or None (``status``
+        says why).  For readers with their own layout (first_blood_memory)."""
+        if not self._attach():
+            self.available = False
+            return None
+        return self._memory
+
+    def release(self, why: str) -> None:
+        """Close the handle (a read failed, or it is not needed now)."""
+        self._drop(why)
+
     def exe_path(self) -> str:
         if self._memory is None:
             return ""
