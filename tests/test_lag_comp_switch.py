@@ -630,13 +630,13 @@ def test_mycomp_answers_when_it_is_on_from_another_wolfrat_version(server):
     block = helper_block(OTHER_BASE, version=3, enabled=1)
     row = block.players[4]
     row.entity, row.ping, row.rewind_ms, row.tests = 0x1234, 142, 212, 5000
-    row.hits, row.plain_hits, row.name = 48, 39, b"BadgerLove"
+    row.hits, row.plain_hits, row.name = 148, 120, b"BadgerLove"
     server.add_helper(OTHER, OTHER_BASE, block)
     assert lc.mycomp_line(lc.read_state(server, MINE), "badgerlove") == lc.MYCOMP_OFF   # not on yet
     server.point_calls_at(wraps(OTHER_BASE))
     state = lc.read_state(server, MINE)
     assert state.kind == lc.OLD
-    assert lc.mycomp_line(state, "badgerlove") == "BadgerLove P142 R212 Hits 48 +9 comp (+23%)"
+    assert lc.mycomp_line(state, "badgerlove") == "BadgerLove P142 R212 Hits 148 +28 comp (+23%)"
 
 
 # ------------------- an older helper from this WolfRAT's own folder (W3)
