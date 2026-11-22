@@ -578,3 +578,16 @@ def test_a_hook_inside_the_exe_is_not_smart_resend(tmp_path):
     exe = sp.Exe(fake_exe(LIVE))
     assert sp.smart_resend_hooks(exe, live) is False
     assert sp.smart_resend_hooks(exe, None) is None
+
+def test_tac_launcher_dll_memory_is_found(tmp_path):
+    """TAC launcher onHook 0.1.34 stores the size at [ebp-11Ch], not [ebp-128h], and
+    the same instruction pair also stores other values (2026-11-22)."""
+    size = struct.pack("<I", 0x20000000)
+    other = struct.pack("<I", 0x015B8000)
+    body = (bytes.fromhex("c785e4feffff") + size + bytes.fromhex("c7442410") + size + bytes(40)
+            + bytes.fromhex("c785d0feffff") + other + bytes.fromhex("c7442410") + other)
+    (tmp_path / "binkw32.dll").write_bytes(b"MZ" + bytes(500) + body + bytes(100))
+    assert sp.hook_arena(str(tmp_path)) == 0x20000000
+    live = memory({sp.ARENA_SIZE_VA: struct.pack("<I", 0x20000000)})
+    mem = {f.key: f for f in sp.check(write(tmp_path, STOCK), live).findings}["memory"]
+    assert mem.detail == "512 MB." and mem.level == sp.GOOD

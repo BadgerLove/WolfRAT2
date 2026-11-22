@@ -426,18 +426,23 @@ def _check_fps(exe: Exe, cfg: dict) -> Finding:
 ARENA_VA = 0x4A7CE3          # the exe's start-up size (patch 04)
 ARENA_SIZE_VA = 0x03342E7C    # the size in use, written once at start-up
 ARENA = {0x0C000000: "192 MB (the game's normal)", 0x20000000: "512 MB", 0x40000000: "1 GB"}
-# A hook DLL that sets the size at start-up: mov [ebp-128h], size; mov [esp+10h], size
-_HOOK_ARENA = re.compile(rb"\xc7\x85\xd8\xfe\xff\xff(....)\xc7\x44\x24\x10\1", re.S)
+# A hook DLL that sets the size at start-up: mov [ebp-N], size; mov [esp+10h], size.
+# The stack slot moves between builds (TAC/Super onHook: [ebp-128h]; TAC launcher
+# onHook 0.1.34: [ebp-11Ch]), and the same instruction pair also stores other
+# values, so only a size from ARENA counts (2026-11-22: the row said 192 MB after a
+# restart while the TAC launcher's DLL sets 512 MB).
+_HOOK_ARENA = re.compile(rb"\xc7\x85..\xff\xff(....)\xc7\x44\x24\x10\1", re.S)
 
 
 def hook_arena(folder: str) -> Optional[int]:
     """The mission memory binkw32.dll sets when the server starts, None if it sets none."""
     try:
         with open(os.path.join(folder, "binkw32.dll"), "rb") as handle:
-            found = _HOOK_ARENA.search(handle.read())
+            data = handle.read()
     except OSError:
         return None
-    return struct.unpack("<I", found.group(1))[0] if found else None
+    sizes = {struct.unpack("<I", m.group(1))[0] for m in _HOOK_ARENA.finditer(data)} & set(ARENA)
+    return sizes.pop() if len(sizes) == 1 else None
 
 
 def check_memory(exe: Exe, folder: str = "", live: Optional[LiveRead] = None) -> Finding:
