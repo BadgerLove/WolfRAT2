@@ -72,6 +72,11 @@ class Exe:
         want = bytes.fromhex(hex_bytes)
         return self.read(va, len(want)) == want
 
+    def inside(self, va: int) -> bool:
+        """True when ``va`` is in one of the exe's own sections.  A jump or call
+        that leaves them goes into code a hook DLL put in memory at start-up."""
+        return any(start <= va < start + span for start, span, _o, _s in self._sections)
+
 
 def read_cfg(folder: str) -> dict:
     """game.cfg as {lower-case key: value text}; {} if missing."""
@@ -103,6 +108,20 @@ def _live(read: Optional[LiveRead], va: int, size: int) -> Optional[bytes]:
     except Exception:
         return None
     return data if data is not None and len(data) == size else None
+
+
+def _branch_target(code: Optional[bytes], at: int) -> Optional[int]:
+    """Where a 5-byte E8 call / E9 jmp at ``at`` goes; None if it is neither."""
+    if not code or len(code) < 5 or code[0] not in (0xE8, 0xE9):
+        return None
+    return (at + 5 + struct.unpack("<i", code[1:5])[0]) & 0xFFFFFFFF
+
+
+def _hooked(exe: "Exe", live: Optional[LiveRead], va: int) -> bool:
+    """The running server's call / jmp at ``va`` goes outside the exe: a hook
+    DLL (onHook) took that spot over when the server started."""
+    target = _branch_target(_live(live, va, 5), va)
+    return target is not None and not exe.inside(target)
 
 
 def _now_and_next(now: Optional[str], on_disk: Optional[str]) -> tuple:
@@ -151,12 +170,19 @@ def check_admin_crash(exe: Exe, live: Optional[LiveRead] = None) -> Finding:
     return Finding("admin_crash", title, UNKNOWN, "Cannot tell on this build.", doc)
 
 
-def check_kill_list(exe: Exe) -> Finding:
-    state = _two_way(exe, 0x504C2B, "80e201", "80e200")
+KILL_LIST_VA, KILL_LIST_ON = 0x504C2B, bytes.fromhex("80e200")
+
+
+def check_kill_list(exe: Exe, live: Optional[LiveRead] = None) -> Finding:
+    state = _two_way(exe, KILL_LIST_VA, "80e201", "80e200")
     doc = DOCS + "14-spectator-chat-server.md"
     title = "Kill List crash fix"
     if state:
         return Finding("kill_list", title, GOOD, "In. Players do not crash when a spectator leaves.", doc)
+    if state is False and _live(live, KILL_LIST_VA, 3) == KILL_LIST_ON:
+        # onHook's SpectatorHost writes the same byte at start-up ("row flags @0x504C2B")
+        return Finding("kill_list", title, GOOD, "In (added when the server starts). Players do not "
+                       "crash when a spectator leaves.", doc)
     if state is False:
         return Finding("kill_list", title, WARN,
                        "Missing. Players with the Kill List open can crash when a spectator leaves.", doc)
@@ -220,12 +246,94 @@ def hole_skip_version(exe: Exe) -> Optional[tuple]:
     return (reorder[0], lag[0]) if reorder and lag else None
 
 
-def check_hole_skip(exe: Exe) -> Finding:
-    """Dale 2026-09-27: 64 Hz does not work without it, 125 Hz needs the 125 version."""
+# ---- Smart Resend: the JOTAC network patch in onHook (2026-10-28) -------------
+# Three hooks, all added when the server starts (onHook's NetResend):
+#   the reorder-queue walk  0x626954  stale-head guard (OpenNova D-NET-810)
+#   the resend call         0x6239B6  resend de-dup (one resend per packet per 80 ms)
+#   the NACK call           0x6269CE  NACK pacing (off by default)
+# It replaces what hole-skip was for: on the 125 Hz test the cave fired ~20 times a
+# minute, 80% of them on stale copies, and froze the host for 15 s; with the guard
+# on it fired 0-2 times and the worst stall was under 1 s (RESULTS-125Hz.md).
+RESEND_WALK_VA, RESEND_CALL_VA, RESEND_NACK_VA = 0x626954, 0x6239B6, 0x6269CE
+_RESEND_LOG = re.compile(r"NetResend: StaleHeadGuard (\d+), ResendDedup (\d+), NackPace (\d+)")
+
+
+def smart_resend_hooks(exe: Exe, live: Optional[LiveRead]) -> Optional[bool]:
+    """True = the running server has the Smart Resend hooks, False = it has not,
+    None = WolfRAT cannot read the running server."""
+    if _live(live, RESEND_CALL_VA, 5) is None:
+        return None
+    return any(_hooked(exe, live, va) for va in (RESEND_CALL_VA, RESEND_NACK_VA, RESEND_WALK_VA))
+
+
+def smart_resend_settings(folder: str) -> Optional[tuple]:
+    """(stale-head guard, resend de-dup, NACK pacing) as onHook logged them when
+    this server started (onhook.log in the server folder); None if not logged."""
+    try:
+        with open(os.path.join(folder, "onhook.log"), encoding="latin-1", errors="replace") as handle:
+            found = _RESEND_LOG.findall(handle.read())
+    except OSError:
+        return None
+    return tuple(int(v) for v in found[-1]) if found else None
+
+
+def check_smart_resend(exe: Exe, folder: str = "", live: Optional[LiveRead] = None) -> Optional[Finding]:
+    """None when WolfRAT has no running server to look at (the hooks only exist there)."""
+    hooks = smart_resend_hooks(exe, live)
+    if hooks is None:
+        return None
+    title = "Smart Resend (JOTAC network patch)"
+    if not hooks:
+        return Finding("smart_resend", title, INFO,
+                       "Not in: lost packets are left to the game (and hole-skip, if it is in).")
+    settings = smart_resend_settings(folder) if folder else None
+    if settings and not settings[0]:
+        return Finding("smart_resend", title, WARN,
+                       "In, but the stale-head guard is off (onhook.cfg NetStaleHeadGuardEnabled 0): "
+                       "players can freeze when a packet is lost. Set it to 1 and restart the server.")
+    if settings:
+        dedup = "on" if settings[1] else "off"
+        return Finding("smart_resend", title, GOOD,
+                       f"In (added when the server starts): stale-head guard on, resend de-dup {dedup}. "
+                       "Players do not freeze when a packet is lost.")
+    return Finding("smart_resend", title, GOOD,
+                   "In (added when the server starts). Players do not freeze when a packet is lost.")
+
+
+def _live_hole_settings(exe: Exe, live: Optional[LiveRead]) -> Optional[tuple]:
+    """The hole-skip cave's settings in the running server when a hook DLL put the
+    cave there at start-up (onHook's NetHoleSkip); None if there is no cave."""
+    if exe.read(0x794DF0, 6) == bytes.fromhex("8b8fb8070000"):
+        return None                                 # the exe carries it: the file answers
+    head = _live(live, 0x794DF0, 6)
+    reorder, lag = _live(live, HOLE_REORDER_VA, 1), _live(live, HOLE_LAG_VA, 1)
+    if head != bytes.fromhex("8b8fb8070000") or not reorder or not lag:
+        return None
+    return reorder[0], lag[0]
+
+
+def check_hole_skip(exe: Exe, live: Optional[LiveRead] = None, resend: Optional[bool] = None) -> Finding:
+    """Dale 2026-09-27: 64 Hz does not work without it, 125 Hz needs the 125 version.
+    Dale 2026-11-22: Smart Resend replaced it - with Smart Resend in, hole-skip is
+    not needed and must never show red."""
     state = hole_skip(exe)
     hz = server_speed(exe)
     doc = DOCS + "09-nwu-hole-skip.md"
     title = "Hole-skip (players do not freeze on a lost packet)"
+    if resend:
+        backup = " Hole-skip is still on as a backup." if state or _live_hole_settings(exe, live) else ""
+        return Finding("hole_skip", title, GOOD,
+                       "Not needed: Smart Resend handles lost packets." + backup, doc)
+    if not state:
+        settings = _live_hole_settings(exe, live)
+        if settings:
+            made_for = HOLE_VERSIONS.get(settings)
+            words = (f"{made_for} Hz version" if made_for else "custom settings %d / %d" % settings)
+            if made_for and hz in (64, 125) and made_for != hz:
+                return Finding("hole_skip", title, WARN,
+                               f"In (added when the server starts), but the {made_for} Hz version on a "
+                               f"{hz} Hz server.", doc)
+            return Finding("hole_skip", title, GOOD, f"In (added when the server starts, {words}).", doc)
     if state:
         settings = hole_skip_version(exe)
         made_for = HOLE_VERSIONS.get(settings)
@@ -268,7 +376,28 @@ def fps_for(ms: int) -> str:
     return KNOWN_FPS.get(ms) or f"about {round(1000 / (ms + 0.9))} FPS"
 
 
-def check_fps(exe: Exe, cfg: dict) -> Finding:
+# The game's own frame counter (Game_MainLoop @0x52B630, kong.c): the average FPS
+# over the last ~2 s, refreshed by the main loop.  The game's accounting rounds to
+# 4 ms steps, so it is an "about" figure.
+FPS_AVG_VA = 0x24E1F10
+
+
+def live_fps(live: Optional[LiveRead]) -> Optional[int]:
+    raw = _live(live, FPS_AVG_VA, 4)
+    fps = struct.unpack("<I", raw)[0] if raw else 0
+    return fps if 0 < fps < 2000 else None
+
+
+def check_fps(exe: Exe, cfg: dict, live: Optional[LiveRead] = None) -> Finding:
+    found = _check_fps(exe, cfg)
+    fps = live_fps(live)
+    if fps is None or found.level == UNKNOWN:
+        return found
+    return Finding(found.key, found.title, found.level,
+                   found.detail.rstrip(".") + f". The server runs at about {fps} FPS now.", found.doc)
+
+
+def _check_fps(exe: Exe, cfg: dict) -> Finding:
     doc = DOCS + "11-fps-lock-125.md"
     title = "Frame rate lock"
     lock = _cfg_int(cfg, "lock_framerate")
@@ -287,6 +416,9 @@ def check_fps(exe: Exe, cfg: dict) -> Finding:
         return Finding("fps", title, WARN,
                        "Old 'unlimited FPS' hack: no limit, and it keeps a whole CPU core busy.", doc)
     if all(exe.is_(va, b) for va, b in _FPS_OFF):
+        if lock and lock > 1:
+            return Finding("fps", title, INFO, f"Not patched: the game's normal 62.5 FPS at most. "
+                           f"lock_framerate = {lock} in game.cfg only gives {fps_for(lock)} with this patch.", doc)
         return Finding("fps", title, INFO, "Not patched: the game's normal 62.5 FPS.", doc)
     return Finding("fps", title, UNKNOWN, "Cannot tell on this build.", doc)
 
@@ -365,18 +497,25 @@ def check_spawn(exe: Exe, cfg: dict, live: Optional[LiveRead] = None) -> Finding
         if ticks == 620:
             now = spawn_live_ticks(live)
             if now:
-                return Finding("spawn", title, INFO,
+                return Finding("spawn", title, GOOD,
                                f"About {now * 16 / 1000:.1f} seconds (set when the server starts).", doc)
             return Finding("spawn", title, INFO, "Not patched: the game's normal ~10 seconds.", doc)
         return Finding("spawn", title, INFO, f"Fixed in the exe: about {ticks * 16 / 1000:.1f} seconds.", doc)
     return Finding("spawn", title, UNKNOWN, "Cannot tell on this build.", DOCS + "03-spawn-protection.md")
 
 
-def check_spectator(exe: Exe) -> Finding:
+SPECTATOR_VA = 0x5137C7
+
+
+def check_spectator(exe: Exe, live: Optional[LiveRead] = None) -> Finding:
     doc = DOCS + "14-spectator-chat-server.md"
-    first = exe.read(0x5137C7, 1)
+    first = exe.read(SPECTATOR_VA, 1)
     if first == b"\xe9":
         return Finding("spectator", "Spectator chat", GOOD, "In. Spectators' chat reaches the players.", doc)
+    if first == b"\x80" and _hooked(exe, live, SPECTATOR_VA):
+        # onHook's SpectatorHost ("chat gate @0x5137C7"): its own version, not patch 14's cave
+        return Finding("spectator", "Spectator chat", GOOD, "In (onHook's version, added when the "
+                       "server starts). Spectators' chat reaches the players.", doc)
     if first == b"\x80":
         return Finding("spectator", "Spectator chat", INFO, "Not in (optional).", doc)
     return Finding("spectator", "Spectator chat", UNKNOWN, "Cannot tell on this build.", doc)
@@ -612,7 +751,10 @@ def live_stamp(live: Optional[LiveRead]) -> tuple:
     return (_live(live, SPEED_VA, 1), _live(live, ARENA_SIZE_VA, 4),
             _live(live, ADMIN_FIX_VA, 4), _live(live, SPAWN_VA, 10),
             _live(live, lp.CHUTE_SITE, 5), _live(live, wildlife.KIN_LEG, 8),
-            _live(live, KEEP_DEPLOY_CALL, 5), _live(live, FP_SITE, 5))
+            _live(live, KEEP_DEPLOY_CALL, 5), _live(live, FP_SITE, 5),
+            _live(live, KILL_LIST_VA, 3), _live(live, SPECTATOR_VA, 5),
+            _live(live, RESEND_WALK_VA, 5), _live(live, RESEND_CALL_VA, 5),
+            _live(live, RESEND_NACK_VA, 5), _live(live, HOLE_REORDER_VA, 1))
 
 
 def check(exe_path: str, live: Optional[LiveRead] = None, cfg: Optional[dict] = None) -> Report:
@@ -627,9 +769,14 @@ def check(exe_path: str, live: Optional[LiveRead] = None, cfg: Optional[dict] = 
         return Report(exe_path, False, (), f"Could not read the server exe ({exc}).")
     folder = os.path.dirname(exe_path)
     cfg = read_cfg(folder) if cfg is None else cfg
+    resend = check_smart_resend(exe, folder, live)
+    resend_on = resend is not None and resend.level in (GOOD, WARN)
     findings = (
-        check_admin_crash(exe, live), check_speed(exe, live), check_hole_skip(exe), check_fps(exe, cfg),
-        check_kill_list(exe), check_long_chat(exe), check_spectator(exe), check_spawn(exe, cfg, live),
+        check_admin_crash(exe, live), check_speed(exe, live),
+        check_hole_skip(exe, live, resend_on)) + ((resend,) if resend else ()) + (
+        check_fps(exe, cfg, live),
+        check_kill_list(exe, live), check_long_chat(exe), check_spectator(exe, live),
+        check_spawn(exe, cfg, live),
         check_memory(exe, folder, live), check_laa(exe),
         check_keep(exe, "claymore", live), check_keep(exe, "at_mine", live), check_revive(exe),
         check_first_person(exe, cfg, live),

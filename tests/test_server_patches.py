@@ -458,3 +458,123 @@ def test_shark_fix_row_says_live_or_exe(tmp_path):
     assert row.detail == "In the exe."
     stock = {f.key: f for f in sp.check(write(tmp_path, LIVE), _running(_fake_server())).findings}
     assert stock["sharks"].level == sp.INFO
+
+
+# ---- 2026-11-22: what onHook adds when the server starts (Dale: "WolfRAT2 is not
+# picking these up").  Bytes below were read from the FMJ server's memory on the
+# TAC launcher (stock exe b9971c82 + TAC onHook 0.1.34) that night.
+
+def memory(blocks: dict):
+    """read(address, size) over a pretend running server: {start: bytes}."""
+    def read(address, size):
+        for start, data in blocks.items():
+            if start <= address and address + size <= start + len(data):
+                return data[address - start: address - start + size]
+        return None
+    return read
+
+
+def tac_launcher_server(guard="1", dedup="1", resend=True):
+    """The running FMJ server on 2026-11-22, by the bytes read from it."""
+    blocks = {
+        sp.SPEED_VA: bytes.fromhex("01"),
+        sp.ARENA_SIZE_VA: struct.pack("<I", 0x20000000),
+        sp.ADMIN_FIX_VA: bytes.fromhex("c1e00690"),
+        sp.KILL_LIST_VA: bytes.fromhex("80e200"),
+        sp.SPECTATOR_VA: bytes.fromhex("e944c81103909090"),            # jmp 0x3630010 (onHook cave)
+        0x794DF0: bytes.fromhex("8b8fb807000083c101394e140f84601be9ff8b8fa807000083f9087c2f"
+                                "8b87b40700002b87b80700003d40000000"),  # onHook NetHoleSkip, 8 / 64
+        sp.FPS_AVG_VA: struct.pack("<I", 54),
+    }
+    if resend:
+        blocks[sp.RESEND_WALK_VA] = bytes.fromhex("e9a796ea02909090")   # jmp 0x34D0000
+        blocks[sp.RESEND_CALL_VA] = bytes.fromhex("e875c6ea02")
+        blocks[sp.RESEND_NACK_VA] = bytes.fromhex("e87d96ea02")
+    else:
+        blocks[sp.RESEND_WALK_VA] = bytes.fromhex("e997e41600909090")   # jmp 0x794DF0 (the cave)
+        blocks[sp.RESEND_CALL_VA] = bytes.fromhex("e815b4ffff")
+        blocks[sp.RESEND_NACK_VA] = bytes.fromhex("e88dcbffff")
+    log = (f"NetResend: StaleHeadGuard {guard}, ResendDedup {dedup}, NackPace 0, WindowMs 80, "
+           "LastResortMs 0, CaveCount 0\n")
+    return memory(blocks), log
+
+
+def tac_report(tmp_path, guard="1", dedup="1", resend=True, cfg="lock_framerate       = 7\n"):
+    live, log = tac_launcher_server(guard, dedup, resend)
+    (tmp_path / "onhook.log").write_text("onHook: build jotac\n" + log)
+    sites = {**STOCK, 0x4C4B13: "01"}                       # the stock TAC exe: 125 Hz comes from onHook
+    return sp.check(write(tmp_path, sites, cfg), live)
+
+
+def test_tac_launcher_server_is_not_red(tmp_path):
+    r = tac_report(tmp_path)
+    by = {f.key: f for f in r.findings}
+    assert not [f.title for f in r.findings if f.level == sp.BAD], r.headline
+    assert "MISSING" not in r.headline
+    assert by["smart_resend"].level == sp.GOOD
+    assert "stale-head guard on, resend de-dup on" in by["smart_resend"].detail
+    assert by["hole_skip"].level == sp.GOOD
+    assert by["hole_skip"].detail.startswith("Not needed: Smart Resend handles lost packets.")
+    assert "backup" in by["hole_skip"].detail
+    assert by["kill_list"].level == sp.GOOD and "added when the server starts" in by["kill_list"].detail
+    assert by["spectator"].level == sp.GOOD and "onHook's version" in by["spectator"].detail
+    assert by["admin_crash"].level == sp.GOOD
+
+
+def test_smart_resend_row_sits_under_hole_skip(tmp_path):
+    keys = [f.key for f in tac_report(tmp_path).findings]
+    assert keys.index("smart_resend") == keys.index("hole_skip") + 1
+
+
+def test_frame_lock_still_says_not_patched_and_shows_the_real_rate(tmp_path):
+    fps = {f.key: f for f in tac_report(tmp_path).findings}["fps"]
+    assert fps.level == sp.INFO
+    assert "Not patched" in fps.detail and "62.5 FPS at most" in fps.detail
+    assert "lock_framerate = 7" in fps.detail and "about 54 FPS now" in fps.detail
+
+
+def test_long_chat_is_not_claimed_from_the_hook(tmp_path):
+    """Neither the stock exe nor TAC's onHook has long chat: still 'Not in'."""
+    chat = {f.key: f for f in tac_report(tmp_path).findings}["long_chat"]
+    assert chat.level == sp.INFO and "59 characters" in chat.detail
+
+
+def test_smart_resend_with_the_guard_off_warns(tmp_path):
+    by = {f.key: f for f in tac_report(tmp_path, guard="0").findings}
+    assert by["smart_resend"].level == sp.WARN and "NetStaleHeadGuardEnabled" in by["smart_resend"].detail
+    assert by["hole_skip"].level == sp.GOOD                 # the hooks are still there
+
+
+def test_dedup_off_is_said(tmp_path):
+    by = {f.key: f for f in tac_report(tmp_path, dedup="0").findings}
+    assert by["smart_resend"].level == sp.GOOD and "resend de-dup off" in by["smart_resend"].detail
+
+
+def test_without_smart_resend_the_hooks_hole_skip_is_reported(tmp_path):
+    by = {f.key: f for f in tac_report(tmp_path, resend=False).findings}
+    assert by["smart_resend"].level == sp.INFO and by["smart_resend"].detail.startswith("Not in")
+    hole = by["hole_skip"]
+    assert hole.level == sp.WARN and "added when the server starts" in hole.detail
+    assert "64 Hz version on a 125 Hz server" in hole.detail
+
+
+def test_no_running_server_no_smart_resend_row(tmp_path):
+    r = sp.check(write(tmp_path, LIVE, "lock_framerate       = 7\ne_spawn_protection   = 5\n"))
+    assert "smart_resend" not in {f.key for f in r.findings}
+    assert {f.key: f for f in r.findings}["hole_skip"].detail == "In (125 Hz version)."
+
+
+def test_spawn_protection_set_at_start_up_is_green(tmp_path):
+    live = memory({sp.SPAWN_VA: bytes.fromhex("c7812401000039010000")})       # 313 ticks
+    spawn = {f.key: f for f in sp.check(write(tmp_path, STOCK), live).findings}["spawn"]
+    assert spawn.level == sp.GOOD and "5.0 seconds" in spawn.detail
+
+
+def test_a_hook_inside_the_exe_is_not_smart_resend(tmp_path):
+    """Only a call that leaves the exe's sections counts as a hook DLL."""
+    live = memory({sp.RESEND_CALL_VA: bytes.fromhex("e815b4ffff"),      # stock call
+                   sp.RESEND_NACK_VA: bytes.fromhex("e88dcbffff"),
+                   sp.RESEND_WALK_VA: bytes.fromhex("e997e41600909090")})  # into the exe's own cave
+    exe = sp.Exe(fake_exe(LIVE))
+    assert sp.smart_resend_hooks(exe, live) is False
+    assert sp.smart_resend_hooks(exe, None) is None
