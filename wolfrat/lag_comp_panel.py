@@ -61,6 +61,8 @@ _HELP = (
     "<br>• Slow anyone down or add lag."
     "<br>• Move walls, buildings or vehicles: a wall still stops the bullet."
     "<br>• Rewind someone across a respawn."
+    "<br>• Rewind anyone for a claymore: a claymore fires by itself, so plain JO "
+    "decides its hits."
     "<br><br><b>The numbers.</b> Every shot from a rewound player is checked both ways. "
     "<i>Hits</i> counted, against <i>Without</i> = what plain JO would have given. "
     "<i>Saved</i> = hits only the rewind gave; <i>Cost</i> = shots that would have hit "
@@ -94,7 +96,8 @@ _TARGET_COLUMNS = ["Target", "Ping", "Low shots", "Low hit %", "Lag shots", "Lag
 TARGETS_HELP = (
     "<b>Who is hard to hit?</b> A <i>close shot</i> = a bullet the game itself checked "
     "against that player's body (it came close enough for the game's own hit test), or "
-    "one that hit them; <i>hit %</i> is how many of those hit. Dead bodies don't count. "
+    "one that hit them; <i>hit %</i> is how many of those hit. Dead bodies and claymore "
+    "shrapnel don't count. "
     "<b>Low</b> = shooters under the minimum ping (plain JO, never rewound). "
     "<b>Lag</b> = rewound shooters, against where the target was on their screen; "
     "<b>Plain JO %</b> = the same shots as plain JO would have judged them. "
@@ -125,6 +128,27 @@ def _gain_text(hits: int, plain: int) -> str:
 
 def _signed(ms: Optional[int]) -> str:
     return "-" if ms is None else ("%+d ms" % ms)
+
+
+# Claymore shrapnel (helper version 5): a claymore fires by itself, nobody aimed
+# it, so plain JO decides and it is counted apart from the hits above it.
+CLAYMORE_NOTE = ("Claymore shrapnel: {steps:,} checks, {hits:,} hits - plain JO, never "
+                 "rewound (a claymore fires by itself)")
+CLAYMORE_RULE_OFF = "On this server exe claymores cannot be told apart and are still rewound."
+
+
+def _claymore_notes(st: lc.State, s: lc.Stats) -> list:
+    """The lines under the totals about claymores (none for an older helper).
+
+    The second one is for a server exe the helper fits (``st.ready``) but whose
+    code it does not recognise where a round's ammo is read: there a claymore's
+    rounds look like a player's and are rewound as before."""
+    notes = []
+    if s.has_v5 and s.device_steps:
+        notes.append(CLAYMORE_NOTE.format(steps=s.device_steps, hits=s.device_hits))
+    if s.has_v5 and not s.device_rule and st.ready:
+        notes.append(CLAYMORE_RULE_OFF)
+    return notes
 
 
 class LagCompPanel(QWidget):
@@ -775,10 +799,13 @@ class LagCompPanel(QWidget):
 
     def _show_totals(self, st: lc.State, s: lc.Stats):
         minutes = s.seconds // 60
+        # Version 5: claymore shrapnel is not in the numbers below; it has its own line.
+        notes = "".join(f"<br><span style='font-size:9pt'>{note}</span>"
+                        for note in _claymore_notes(st, s))
         if not s.tests:
             self.totals_lbl.setText(self._with_reset_note(
                 f"Counting for {minutes} min. No bullet checks from rewound players yet"
-                f"(server tick {s.tick_us / 1000:.1f} ms)."))
+                f"(server tick {s.tick_us / 1000:.1f} ms).{notes}"))
         else:
             gain = s.gain_percent
             word = "would have" if st.observe else "counted"
@@ -791,7 +818,7 @@ class LagCompPanel(QWidget):
                 f"(<b>{'-' if gain is None else '%+.0f%%' % gain}</b>)"
                 f"<br>Saved <b>{s.gained:,}</b> · cost <b>{s.lost:,}</b>{dead}"
                 f"<br><span style='font-size:9pt'>{minutes} min · {s.tests:,} bullet "
-                f"checks · server tick {s.tick_us / 1000:.1f} ms</span>"))
+                f"checks · server tick {s.tick_us / 1000:.1f} ms</span>{notes}"))
         suggestion = s.suggested_extra()
         if s.cal_median is None:
             self.tune_lbl.setText("Best rewind: waiting for shots that pass close to someone.")

@@ -43,15 +43,24 @@ def test_block_layout_matches_the_helper():
 
 def test_version_4_block_layout_matches_the_spec():
     # tmp/lagreview_2026-11-19/v4/SPEC.md: 528 bytes appended, nothing before them moves.
-    assert lc.VERSION == 4
     assert lc.ctypes.sizeof(lc._WhatIf) == 68
     assert lc._OFF["bot_totals"] == lc._V3_SIZE == 28420
     assert [lc._OFF[k] - 28420 for k in (
         "dead_hits", "dead_plain_hits", "near_steps", "tracked_persons", "tracked_bots",
         "low_tests", "owner_pid", "owner_heartbeat", "what_if_offset_ms",
         "what_if_band_min_ping", "what_if")] == [32, 36, 40, 44, 48, 52, 56, 60, 64, 96, 120]
-    assert lc.SHARED_SIZE == lc._V4_SIZE == 28420 + 528 == 28948
-    assert lc.ctypes.sizeof(lc._Shared) == 28948
+    # What a version 4 helper's block measures, for good: version 5 comes after it.
+    assert lc._V4_SIZE == 28420 + 528 == 28948
+
+
+def test_version_5_block_layout_matches_the_spec():
+    # tmp/lagcomp-v5/SPEC.md: 16 bytes appended to the version 4 block, which must not move.
+    assert lc.VERSION == 5
+    assert [lc._OFF[k] for k in ("device_steps", "device_hits", "device_rule", "reserved5")] == [
+        28948, 28952, 28956, 28960]
+    assert lc._OFF["device_steps"] == lc._V4_SIZE == 28948
+    assert lc.SHARED_SIZE == lc._V5_SIZE == 28948 + 16 == 28964
+    assert lc.ctypes.sizeof(lc._Shared) == 28964
 
 
 def test_bundled_helper_exports_its_block():
@@ -290,9 +299,15 @@ def test_v3_auto_tune_and_event_logger(tmp_path):
 # Bots are rewound and counted in their own row, dead bodies are counted apart,
 # and every bullet is also judged at seven other rewinds (the what-if table).
 
+# What a version 4 helper's block measures (the size assert in its payload.c).  A
+# number here on purpose, not lc._V4_SIZE: these blocks must stay what that
+# helper really writes even if lag_comp's own idea of the size is ever wrong.
+V4_BYTES = 28948
+
+
 def _v4(**kw):
     b = _block(**kw)
-    b.version, b.size = 4, lc.SHARED_SIZE
+    b.version, b.size = 4, V4_BYTES
     for i, off in enumerate(lc.WHATIF_OFFSETS):        # the helper writes these at load
         b.what_if_offset_ms[i] = off
     for i, ping in enumerate(lc.WHATIF_BAND_MIN_PING):
@@ -456,6 +471,141 @@ def test_a_version_3_snapshot_has_none_of_the_new_keys(tmp_path):
     book = lc.HistoryBook(str(tmp_path / "h.json"))
     book.record(5, s, lc.Settings(), now=1_700_000_000)
     assert "what_if" not in book.rows[0] and "bots" not in book.rows[0]
+
+
+# ------------------------------------------------- helper version 5 (2026-11-22)
+# Claymore shrapnel is never rewound (a claymore fires by itself, nobody aimed
+# it: plain JO decides) and is counted apart.  16 bytes after the version 4 block.
+
+CLAYMORE_KEYS = ("device_steps", "device_hits", "device_rule")
+
+
+def _v5(**kw):
+    b = _v4(**kw)
+    b.version, b.size = 5, lc.SHARED_SIZE
+    return b
+
+
+def test_version_5_counts_claymore_shrapnel_apart():
+    b = _v5(tests=900, hits=200, plain_hits=150, stats_since=1000, dead_hits=7,
+            tracked_bots=40, device_steps=288, device_hits=3, device_rule=1)
+    _what_if(b, 2, 500, [100, 90, 110, 130, 150, 140, 120, 80])
+    _, s = lc.parse_stats(bytes(b), now_ticks=2000)
+    assert s.has_v5 and s.has_v4 and s.has_tuner and s.has_targets
+    assert (s.device_steps, s.device_hits, s.device_rule) == (288, 3, 1)
+    # The version 4 part reads as before; the pellets are in none of it.
+    assert (s.tests, s.hits, s.plain_hits, s.dead_hits) == (900, 200, 150, 7)
+    assert s.bot_totals.players == 40 and s.what_if[2].hits[4] == 150
+    # An exe the helper fits, but where it cannot tell a claymore's rounds apart.
+    b.device_rule = 0
+    _, s = lc.parse_stats(bytes(b), now_ticks=2000)
+    assert s.has_v5 and s.device_rule == 0
+
+
+def test_a_version_4_helpers_block_still_parses_as_version_4():
+    """The trap (claymore design check, risk 5): _V4_SIZE was SHARED_SIZE.  Left
+    like that when the block grew, a version 4 helper's block (28,948 bytes)
+    stopped counting as version 4: no bots row, no what-if table, and no owner
+    stamp, so two WolfRATs would fight over the calls again."""
+    b = _v4(tests=900, hits=200, plain_hits=150, stats_since=1000, dead_hits=7,
+            near_steps=640, tracked_bots=40, owner_pid=4242, owner_heartbeat=99)
+    b.bot_totals.close_lag = 300
+    _what_if(b, 2, 500, [100, 90, 110, 130, 150, 140, 120, 80])
+    # Reading 28,964 bytes of a 28,948-byte block can work, and then the last
+    # 16 are whatever that helper keeps after its block: never claymore counts.
+    b.device_steps, b.device_hits, b.device_rule, b.reserved5 = 0xDEAD, 0xBEEF, 0x77, 0x55
+    its_own = bytes(b)[:V4_BYTES]
+    for raw in (its_own, its_own + b"\0" * 16, bytes(b)):
+        block, s = lc.parse_stats(raw, now_ticks=2000)
+        assert s.has_v4 and s.has_tuner and s.has_targets and not s.has_v5
+        assert (s.device_steps, s.device_hits, s.device_rule) == (0, 0, 0)
+        assert s.bot_totals.close_lag == 300 and s.bot_totals.players == 40
+        assert (s.dead_hits, s.near_steps) == (7, 640) and s.what_if[2].hits[4] == 150
+        assert (block.owner_pid, block.owner_heartbeat) == (4242, 99)
+
+
+def test_reading_a_version_4_helpers_block_falls_back_to_its_own_size():
+    """This WolfRAT with a version 4 helper in the server (another install's, or
+    its own older one before the takeover): 28,964 bytes cannot be read, so the
+    block's own 28,948 are, and it is still a version 4 block."""
+    b = _v4(stats_since=1000, dead_hits=7, owner_pid=4242)
+    _what_if(b, 5, 60, [5, 1, 2, 3, 9, 4, 4, 4])
+    data = bytes(b)[:V4_BYTES]
+    asked = []
+
+    class Proc:
+        def read(self, address, size):
+            asked.append(size)
+            if address + size > len(data):
+                raise lc.LagCompError("past the end")
+            return data[address:address + size]
+
+    raw = lc._read_block(Proc(), 0)
+    assert asked == [28964, 4, 28948]                  # all of it, its size, then that much
+    assert len(raw) == lc.SHARED_SIZE and raw[V4_BYTES:] == b"\0" * 16
+    block, s = lc.parse_stats(raw, now_ticks=2000)
+    assert s.has_v4 and not s.has_v5 and s.dead_hits == 7 and s.what_if[5].steps == 60
+    assert block.owner_pid == 4242
+
+
+def test_a_block_that_says_5_but_is_not_that_big_is_read_as_version_4():
+    b = _v5(stats_since=1000, dead_hits=7, device_steps=288, device_hits=3, device_rule=1)
+    b.size = V4_BYTES
+    _, s = lc.parse_stats(bytes(b), now_ticks=2000)
+    assert s.has_v4 and not s.has_v5 and s.dead_hits == 7
+    assert (s.device_steps, s.device_hits, s.device_rule) == (0, 0, 0)
+    # The same for a read that came back short of the new part.
+    b.size = lc.SHARED_SIZE
+    _, s = lc.parse_stats(bytes(b)[:V4_BYTES], now_ticks=2000)
+    assert s.has_v4 and not s.has_v5 and s.device_steps == 0
+
+
+def test_a_pending_reset_clears_the_claymore_counters_and_keeps_the_rule():
+    b = _v5(reset_seq=2, seen_reset_seq=1, stats_since=1000, dead_hits=7,
+            device_steps=288, device_hits=3, device_rule=1)
+    block, s = lc.parse_stats(bytes(b), now_ticks=5000)
+    assert s.has_v5 and (s.device_steps, s.device_hits, s.dead_hits) == (0, 0, 0)
+    # Not a count: what the helper found in this exe (as the helper's own reset).
+    assert s.device_rule == 1
+    assert (block.device_steps, block.device_hits, block.device_rule) == (0, 0, 1)
+    b.seen_reset_seq = 2                               # nothing pending: the numbers stand
+    _, s = lc.parse_stats(bytes(b), now_ticks=5000)
+    assert (s.device_steps, s.device_hits, s.device_rule) == (288, 3, 1)
+
+
+def test_history_row_and_snapshot_keep_the_claymore_numbers(tmp_path):
+    b = _v5(tests=900, hits=200, plain_hits=150, stats_since=1000, dead_hits=7,
+            device_steps=288, device_hits=3, device_rule=1)
+    s = lc.parse_stats(bytes(b), now_ticks=61000)[1]
+    settings = lc.Settings(False, 70, 300, 0)
+    book = lc.HistoryBook(str(tmp_path / "h.json"))
+    assert book.record(77, s, settings, now=1_700_000_000)
+    book.save()
+    row = json.loads((tmp_path / "h.json").read_text(encoding="utf-8"))[0]
+    assert [row[k] for k in CLAYMORE_KEYS] == [288, 3, 1]
+    assert row["dead_hits"] == 7 and "what_if" in row          # beside the version 4 keys
+
+    logger = lc.EventLogger(str(tmp_path))
+    line = logger.record_poll(77, s, settings, include_snapshot=True, now=1_700_000_000)[-1]
+    assert line.split("] ", 1)[1].startswith("Snapshot (1m): 200 hits vs 150 plain (+33%)")
+    snap = json.loads((tmp_path / "wolfrat_lag_comp_events.jsonl").read_text(
+        encoding="utf-8").splitlines()[-1])
+    assert snap["kind"] == "snapshot" and [snap[k] for k in CLAYMORE_KEYS] == [288, 3, 1]
+    assert snap["dead_hits"] == 7 and snap["tests"] == 900
+
+
+def test_a_version_4_snapshot_has_none_of_the_claymore_keys(tmp_path):
+    s = _v4_stats()
+    assert s.has_v4 and not s.has_v5
+    logger = lc.EventLogger(str(tmp_path))
+    logger.record_poll(5, s, lc.Settings(), include_snapshot=True, now=1_700_000_000)
+    snap = json.loads((tmp_path / "wolfrat_lag_comp_events.jsonl").read_text(
+        encoding="utf-8").splitlines()[-1])
+    assert "dead_hits" in snap and "what_if" in snap             # version 4's own are there
+    assert not any(k in snap for k in CLAYMORE_KEYS)
+    book = lc.HistoryBook(str(tmp_path / "h.json"))
+    book.record(5, s, lc.Settings(), now=1_700_000_000)
+    assert "bots" in book.rows[0] and not any(k in book.rows[0] for k in CLAYMORE_KEYS)
 
 
 # ------------------------------------- the event log across restarts (review B4)

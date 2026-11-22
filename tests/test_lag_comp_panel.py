@@ -342,6 +342,81 @@ def test_page_with_the_what_if_box_fits_1024x768(qtbot, tmp_path, monkeypatch):
     tabs.hide()
 
 
+# ------------------------------------------------- helper version 5 (2026-11-22)
+# Claymore shrapnel is never rewound (a claymore fires by itself: plain JO
+# decides) and is counted apart, so it gets a line of its own under the totals.
+CLAYMORE_LINE = ("Claymore shrapnel: 12,345 checks, 67 hits - plain JO, never rewound "
+                 "(a claymore fires by itself)")
+RULE_OFF_LINE = "On this server exe claymores cannot be told apart and are still rewound."
+
+
+def _v5_state(device_steps=0, device_hits=0, device_rule=1):
+    state = _v4_state()
+    s = state.stats
+    s.has_v5 = True
+    s.device_steps, s.device_hits, s.device_rule = device_steps, device_hits, device_rule
+    return state
+
+
+def test_claymore_shrapnel_has_its_own_line_under_the_totals(qtbot, tmp_path, monkeypatch):
+    p = _panel(qtbot, tmp_path, monkeypatch, _v5_state(device_steps=12345, device_hits=67))
+    p._refresh_stats(force=True)
+    text = p.totals_lbl.text()
+    assert text.endswith("<br><span style='font-size:9pt'>" + CLAYMORE_LINE + "</span>")
+    assert "cannot be told apart" not in text
+    # The numbers above it are as they were: the pellets are not in them.
+    assert "<b>1,200</b> hits on live players and bots counted with it" in text
+    assert "5,000 bullet checks" in text
+    # No claymore has gone off yet: no line.
+    q = _panel(qtbot, tmp_path, monkeypatch, _v5_state())
+    q._refresh_stats(force=True)
+    assert "laymore" not in q.totals_lbl.text()
+
+
+def test_the_claymore_line_shows_when_only_claymores_have_fired(qtbot, tmp_path, monkeypatch):
+    """Their checks are no longer bullet checks from rewound players, so the
+    totals can read 'none yet' while claymores have gone off."""
+    state = _v5_state(device_steps=288, device_hits=2)
+    state.stats.tests = state.stats.hits = state.stats.plain_hits = 0
+    p = _panel(qtbot, tmp_path, monkeypatch, state)
+    p._refresh_stats(force=True)
+    text = p.totals_lbl.text()
+    assert "No bullet checks from rewound players yet" in text
+    assert ("Claymore shrapnel: 288 checks, 2 hits - plain JO, never rewound "
+            "(a claymore fires by itself)") in text
+
+
+def test_an_exe_where_claymores_cannot_be_told_apart_says_so(qtbot, tmp_path, monkeypatch):
+    p = _panel(qtbot, tmp_path, monkeypatch, _v5_state(device_rule=0))
+    p._refresh_stats(force=True)
+    text = p.totals_lbl.text()
+    assert text.endswith("<br><span style='font-size:9pt'>" + RULE_OFF_LINE + "</span>")
+    assert "Claymore shrapnel:" not in text
+    # Not said of an exe the helper does not fit at all: nothing is rewound there.
+    unfit = _v5_state(device_rule=0)
+    unfit.ready = False
+    q = _panel(qtbot, tmp_path, monkeypatch, unfit)
+    q._refresh_stats(force=True)
+    assert "laymore" not in q.totals_lbl.text()
+
+
+def test_an_older_helper_shows_no_claymore_lines(qtbot, tmp_path, monkeypatch):
+    state = _v5_state(device_steps=288, device_hits=2, device_rule=0)
+    state.stats.has_v5 = False                                 # a version 4 helper
+    p = _panel(qtbot, tmp_path, monkeypatch, state)
+    p._refresh_stats(force=True)
+    text = p.totals_lbl.text()
+    assert "laymore" not in text
+    assert text.endswith("5,000 bullet checks · server tick 16.0 ms</span>")   # as before
+
+
+def test_the_help_says_a_claymore_is_never_rewound():
+    assert ("<br>• Rewind anyone for a claymore: a claymore fires by itself, so plain JO "
+            "decides its hits.") in panel_mod._HELP
+    # The "Being shot at" tables do not hold the pellets either.
+    assert "Dead bodies and claymore shrapnel don't count." in panel_mod.TARGETS_HELP
+
+
 # ------------------------- another WolfRAT version's helper is on (review B3)
 def _other_version_on():
     return lc.State(lc.OLD, base=0x20000000, shared=0x20008000, ready=True,

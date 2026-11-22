@@ -39,7 +39,8 @@ DLL_NAME = "wolfrat_lagcomp.dll"
 LOADED_PREFIX = "wolfrat_lagcomp_"
 EXPORT_NAME = b"WolfRatLagComp"
 MAGIC = 0x31434C57
-VERSION = 4              # 4 = bots, dead bodies apart, what-if table, owner (3 = auto-tune)
+VERSION = 5              # 5 = claymore shrapnel never rewound, counted apart
+                         # (4 = bots, dead bodies apart, what-if table, owner; 3 = auto-tune)
 
 SLOTS = 250
 LEGACY_SLOTS = 64
@@ -225,7 +226,15 @@ class _Shared(ctypes.LittleEndianStructure):
                 ("owner_heartbeat", ctypes.c_uint32),   # and GetTickCount() each poll
                 ("what_if_offset_ms", ctypes.c_int32 * WHATIF_COLS),
                 ("what_if_band_min_ping", ctypes.c_int32 * WHATIF_BANDS),
-                ("what_if", _WhatIf * WHATIF_BANDS)]
+                ("what_if", _WhatIf * WHATIF_BANDS),
+                # version 5, appended (tmp/lagcomp-v5/SPEC.md, 2026-11-22): claymore
+                # shrapnel.  A claymore fires by itself, nobody aimed it: plain JO
+                # decides, it is never rewound and it is counted here, apart.
+                ("device_steps", ctypes.c_uint32),  # its bullet steps (not in tests)
+                ("device_hits", ctypes.c_uint32),   # of those, the game's answer hit a live person
+                ("device_rule", ctypes.c_uint32),   # 1 = this exe's ray layout recognised, rule on;
+                                                    # 0 = not: claymores are rewound as before
+                ("reserved5", ctypes.c_uint32)]
 
 
 class _TuneStep(ctypes.LittleEndianStructure):
@@ -241,11 +250,18 @@ _OFF = {name: getattr(_Shared, name).offset for name, _ in _Shared._fields_}
 _MIN_SHARED_SIZE = _OFF["players"] + LEGACY_SLOTS * ctypes.sizeof(_Player)
 _V2_SIZE = _OFF["tune_mode"]               # 26,344: a block this big has the target rows
 _V3_SIZE = _OFF["bot_totals"]              # 28,420: a block this big has the auto-tuner
-_V4_SIZE = SHARED_SIZE                     # 28,948: bots, what-if table, owner
-# The helper checks the same two numbers when it is built (SPEC.md).
+# Pinned to where the version 4 part ends, NOT SHARED_SIZE: a version 4 helper's
+# block is this big for good, however far later versions grow.  Left on
+# SHARED_SIZE it would call every version 4 helper "older than 4" - no bots
+# row, no what-if table, and no owner stamp, so two WolfRATs would fight over
+# the calls again.
+_V4_SIZE = _OFF["device_steps"]            # 28,948: bots, what-if table, owner
+_V5_SIZE = SHARED_SIZE                     # 28,964: claymore shrapnel counted apart
+# The helper checks the same numbers when it is built (SPEC.md).
 assert ctypes.sizeof(_WhatIf) == 68
 assert _V3_SIZE == 28420, "the version 3 part of the block must not move"
-assert ctypes.sizeof(_Shared) == 28948, "version 4 block is 28,948 bytes"
+assert _V4_SIZE == 28948, "the version 4 part of the block must not move"
+assert ctypes.sizeof(_Shared) == 28964, "version 5 block is 28,964 bytes"
 assert _OFF["owner_heartbeat"] == _OFF["owner_pid"] + 4
 
 
@@ -416,6 +432,11 @@ class Stats:
     tracked_bots: int = 0
     what_if: list = field(default_factory=list)            # WhatIfRow, one per shooter band
     what_if_offsets: list = field(default_factory=list)    # ms per column; WHATIF_PLAIN = plain JO
+    has_v5: bool = False                   # helper version 5 or later
+    device_steps: int = 0                  # claymore shrapnel bullet steps: plain JO, never
+    device_hits: int = 0                   #   rewound, counted apart (not in tests / hits)
+    device_rule: int = 0                   # 1 = the helper can tell a claymore's rounds apart on
+                                           # this exe; 0 = it cannot, they are rewound as before
 
     @property
     def gain_percent(self) -> Optional[float]:
@@ -491,6 +512,7 @@ def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, S
     has_targets = len(raw) >= _V2_SIZE and ver >= 2 and sz >= _V2_SIZE
     has_tuner = len(raw) >= _V3_SIZE and ver >= 3 and sz >= _V3_SIZE
     has_v4 = len(raw) >= _V4_SIZE and ver >= 4 and sz >= _V4_SIZE
+    has_v5 = len(raw) >= _V5_SIZE and ver >= 5 and sz >= _V5_SIZE
     if len(raw) < SHARED_SIZE:
         raw = raw + b"\0" * (SHARED_SIZE - len(raw))
     shared = _Shared.from_buffer_copy(raw[:SHARED_SIZE])
@@ -517,6 +539,9 @@ def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, S
         shared.dead_hits = shared.dead_plain_hits = shared.near_steps = shared.low_tests = 0
         ctypes.memset(ctypes.addressof(shared) + _OFF["what_if"], 0,
                       ctypes.sizeof(_WhatIf) * WHATIF_BANDS)
+        # Version 5: the two claymore counters go; device_rule is what the
+        # helper found in this exe, not a count, and stays.
+        shared.device_steps = shared.device_hits = 0
     cal = list(shared.cal)
     low, mid, high = histogram_quantiles(cal)
     stats = Stats(shared.tests, shared.hits, shared.plain_hits, shared.gained,
@@ -587,6 +612,13 @@ def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, S
         for label, low, w in zip(what_if_band_labels(lows), lows, shared.what_if):
             stats.what_if.append(WhatIfRow(label, low, int(w.steps), [int(n) for n in w.hits],
                                            [int(n) for n in w.hits_human]))
+    # Only a block that says 5 AND is that big: past the end of a version 4
+    # helper's block there is other memory of that helper, not these counters.
+    stats.has_v5 = has_v5
+    if has_v5:
+        stats.device_steps = int(shared.device_steps)
+        stats.device_hits = int(shared.device_hits)
+        stats.device_rule = int(shared.device_rule)
     return shared, stats
 
 
@@ -1198,6 +1230,11 @@ def describe_setting(s: Settings, live_extra_ms: Optional[int] = None) -> str:
 
 # ------------------------------------------------------------- !mycomp
 MYCOMP_OFF = "Lag comp is off on this server"
+# A plus or minus of a few hits is luck, not lag compensation.  A player gets
+# the number only when it means something (Dale, 2026-11-22: players were
+# reading minus numbers that were only luck).  The page keeps the raw numbers.
+MYCOMP_MIN_HITS = 50         # fewer hits than this (with it or plain): "too few shots yet"
+MYCOMP_EVEN_PERCENT = 10     # within this % of the plain JO hits: "about even"
 
 
 def find_player_stats(stats: Optional[Stats], name: str) -> Optional[PlayerStats]:
@@ -1231,13 +1268,28 @@ def mycomp_line(state: Optional[State], name: str, limit: int = 118) -> str:
     again (switched on, settings changed, the tab's Reset).  A map change does
     not clear it (2026-10-31..11-10 snapshots: 3 drops in 51,285 carried pairs).
 
-        BadgerLove P142 R212 Hits 48 +9 comp (+23%)
+        BadgerLove P142 R212 Hits 148 +28 comp (+23%)
+        BadgerLove P142 R212 Hits 48: too few shots yet
+        BadgerLove P142 R212 Hits 105: about even with plain JO
         BadgerLove P45 No comp needed (under 80)
+
+    The plus or minus is said only when it means something:
+    - under MYCOMP_MIN_HITS hits (with it or plain JO, whichever is more):
+      "too few shots yet", no number;
+    - a difference no bigger than MYCOMP_EVEN_PERCENT % of the plain JO hits,
+      or than 2 x sqrt(saved + cost), whichever is larger: "about even with
+      plain JO", no number.  The difference is saved - cost, and by luck alone
+      it moves about sqrt(saved + cost) either way, so inside twice that it
+      says nothing about lag compensation;
+    - otherwise the number, plus or minus, as before.
 
     "No comp needed" only for a player with no rewound bullets this session, a
     rewind of 0 now and a minimum ping above 0.  A player near the minimum ping
     who was rewound for most of the session gets their numbers, even in a
     second when their ping is under it (review N5).
+
+    Every case has a long and a short form; the name is cut before the words
+    are, so a stock server (59 characters) still gets a whole line.
     """
     # ON, or on from another WolfRAT version's helper (its numbers are the live ones).
     if state is None or state.kind not in (ON, OLD) or not state.stats or not state.settings:
@@ -1254,9 +1306,20 @@ def mycomp_line(state: Optional[State], name: str, limit: int = 118) -> str:
         return (_fit_name(shown, f" P{row.ping} No comp needed (under {minimum})", limit)
                 or _fit_name(shown, f" P{row.ping} no comp", limit) or MYCOMP_OFF)
     net = row.hits - row.plain_hits
-    pct = f" ({net * 100.0 / row.plain_hits:+.0f}%)" if row.plain_hits else ""
-    long = f" P{row.ping} R{row.rewind_ms} Hits {row.hits} {net:+d} comp{pct}"
-    short = f" P{row.ping} R{row.rewind_ms} {row.hits}h {net:+d}{pct}"
+    head = f" P{row.ping} R{row.rewind_ms}"
+    if max(row.hits, row.plain_hits) < MYCOMP_MIN_HITS:
+        long = f"{head} Hits {row.hits}: too few shots yet"
+        short = f"{head} {row.hits}h too few yet"
+    elif (abs(net) * 100 <= MYCOMP_EVEN_PERCENT * row.plain_hits
+          or net * net <= 4 * (row.gained + row.lost)):
+        # |net| <= the larger of 10% of the plain hits and 2 * sqrt(saved + cost),
+        # in whole numbers so the edges are exact.
+        long = f"{head} Hits {row.hits}: about even with plain JO"
+        short = f"{head} {row.hits}h about even"
+    else:
+        pct = f" ({net * 100.0 / row.plain_hits:+.0f}%)" if row.plain_hits else ""
+        long = f"{head} Hits {row.hits} {net:+d} comp{pct}"
+        short = f"{head} {row.hits}h {net:+d}{pct}"
     return _fit_name(shown, long, limit) or _fit_name(shown, short, limit) or MYCOMP_OFF
 
 
@@ -1269,6 +1332,15 @@ def v4_record(stats: Stats) -> dict:
             "near_steps": stats.near_steps, "low_tests": stats.low_tests,
             "tracked_persons": stats.tracked_persons, "tracked_bots": stats.tracked_bots,
             "what_if": stats.what_if_compact()}
+
+
+def v5_record(stats: Stats) -> dict:
+    """What a version 5 helper adds, for a history row or a snapshot line:
+    claymore shrapnel, which is plain JO and counted apart, and whether the
+    helper can tell it apart on this exe.  Older rows and lines simply do not
+    have these keys."""
+    return {"device_steps": stats.device_steps, "device_hits": stats.device_hits,
+            "device_rule": stats.device_rule}
 
 
 class HistoryBook:
@@ -1313,6 +1385,8 @@ class HistoryBook:
             row["tune_log"] = [st.as_dict() for st in stats.tune_log]
         if stats.has_v4:
             row.update(v4_record(stats))
+        if stats.has_v5:
+            row.update(v5_record(stats))
         if stats.has_targets:
             row["bands"] = [b.as_dict() for b in stats.bands]
             # Players who left keep their last numbers (the helper drops their row).
@@ -1510,6 +1584,7 @@ class EventLogger:
                 players=[p.__dict__ for p in stats.players],
                 targets=[t.__dict__ for t in stats.targets] if stats.has_targets else [],
                 **(v4_record(stats) if stats.has_v4 else {}),
+                **(v5_record(stats) if stats.has_v5 else {}),
             ))
         return added
 
