@@ -79,6 +79,7 @@ def _load_desktop_module():
     protocol.wire_log = lambda _message: None
     protocol.CHAT_MAX_LEN = 62
     protocol.player_entry_from_legacy = lambda player: player
+    protocol.one_chat_line = lambda line, fallback: line
     modules["wolfrat.protocol"] = protocol
 
     web_server = types.ModuleType("wolfrat.web_server")

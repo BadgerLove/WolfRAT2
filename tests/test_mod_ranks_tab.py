@@ -81,7 +81,10 @@ def test_gate_moderator_can_kick_but_not_ban_and_is_told_why(tmp_path):
     # strangers are still ignored silently, web admin still does everything
     rig.tab._check_mod_command("Griefer: !ban Ham")
     assert len(rig.said) == 1 and len(rig.actions) == 1
+    # ...but only from the phone page, never from a chat line that says so
     rig.tab._check_mod_command("[ADMIN] !ban Griefer")
+    assert len(rig.actions) == 1
+    assert rig.tab.run_web_command("!ban Griefer") == {"ok": True, "command": "!ban"}
     assert rig.actions[-1] == "Ban Griefer"
 
 

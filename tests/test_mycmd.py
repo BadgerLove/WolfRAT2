@@ -167,6 +167,9 @@ def test_cooldown_per_player(tmp_path):
 def test_web_admin_gets_nothing(tmp_path):
     rig = rig_with(tmp_path)
     rig.tab._check_mod_command("[ADMIN] !mycmd")
+    answer = rig.tab.run_web_command("!mycmd")
+    assert answer["ok"] is False and "players in the game" in answer["error"]
+    rig.tab._check_mod_command("!mycmd", typed_on_phone=True)
     assert rig.private == [] and rig.said == []
 
 

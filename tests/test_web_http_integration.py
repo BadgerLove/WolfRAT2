@@ -157,10 +157,12 @@ async def test_retail_passwords_never_cross_the_http_boundary(
 
     settings_response = await web_client.get("/api/settings", headers=headers)
     status_response = await web_client.get("/api/status", headers=headers)
+    # The raw-command route is gone (2026-11-23): one token could change the
+    # server password through it.
     command_response = await web_client.post(
         "/api/command",
         headers=headers,
-        json={"command": "SET ServerPassword server-secret"},
+        json={"command": "SET ServerPassword hijacked"},
     )
 
     assert settings_response.status == 200
@@ -171,17 +173,9 @@ async def test_retail_passwords_never_cross_the_http_boundary(
     state = await status_response.json()
     assert state["settings"] == {"ServerName": "Integration Server"}
 
-    result = await command_response.json()
-    assert result == {
-        "ok": True,
-        "accepted": True,
-        "replies": ["OK"],
-        "command": "SET ServerPassword <redacted>",
-    }
-    assert server_manager.raw_commands == [
-        "SET ServerPassword server-secret"
-    ]
-    assert "server-secret" not in repr((state, result))
+    assert command_response.status in (404, 405)
+    assert server_manager.raw_commands == []
+    assert "server-secret" not in repr(state)
 
 
 @pytest.mark.asyncio

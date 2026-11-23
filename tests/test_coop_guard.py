@@ -252,8 +252,9 @@ def test_mods_cannot_swap_mix_or_balance_on_co_op(tmp_path, monkeypatch):
     workflows = []
     monkeypatch.setattr(app_module, "submit_team_workflow", lambda *a, **k: workflows.append(a[2]))
     tab, said, actions = _mods(tmp_path, blocked=True)
-    for line in ("Ham: !swap Griefer", "Ham: !mixteams", "Ham: !balanceteams", "[ADMIN] !mixteams"):
+    for line in ("Ham: !swap Griefer", "Ham: !mixteams", "Ham: !balanceteams"):
         tab._check_mod_command(line)
+    assert tab.run_web_command("!mixteams")["ok"] is True
     assert actions == [] and workflows == []
     assert said == [coop_guard.REFUSAL] * 4
     assert "refused, co-op map" in tab.mod_log.item(tab.mod_log.count() - 1).text()

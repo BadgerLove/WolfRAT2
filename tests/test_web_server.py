@@ -335,21 +335,15 @@ class WebStateTests(unittest.TestCase):
             WolfWebServer._redact_command("GET GAMESTATE"),
         )
 
-    def test_raw_http_handler_awaits_and_reports_retail_rejection(self):
-        manager = FakeServerManager()
-        server = WolfWebServer(manager, host="127.0.0.1", port=0)
-        server._check_auth = lambda _request: True
-
-        with patch.object(web_server_module, "web", FakeWeb, create=True):
-            response = asyncio.run(server._handle_command(
-                FakeRequest({"command": "GET GAMESTATE"})
-            ))
-
-        self.assertEqual(["GET GAMESTATE"], manager.raw_commands)
-        self.assertEqual(200, response["status"])
-        self.assertEqual(False, response["payload"]["ok"])
-        self.assertEqual(["ERROR denied"], response["payload"]["replies"])
-        self.assertEqual("ERROR denied", response["payload"]["error"])
+    def test_there_is_no_raw_command_route(self):
+        server = WolfWebServer(FakeServerManager(), host="127.0.0.1", port=0)
+        self.assertFalse(hasattr(server, "_handle_command"))
+        paths = {
+            route.resource.canonical
+            for route in server.application.router.routes()
+        }
+        self.assertIn("/api/chat/send", paths)
+        self.assertNotIn("/api/command", paths)
 
     def test_quick_actions_call_typed_manager_operations(self):
         manager = FakeServerManager()
@@ -484,29 +478,23 @@ class WebStateTests(unittest.TestCase):
         self.assertIn("out of range", response["payload"]["error"])
         self.assertEqual([], manager.semantic_actions)
 
-    def test_websocket_result_includes_retail_rejection(self):
-        server = WolfWebServer(FakeServerManager(), host="127.0.0.1", port=0)
-        ws = FakeWebSocket()
-        result = Future()
-        result.set_result(RawResult("GET GAMESTATE", ("ERROR denied",), False))
+    def test_phone_chat_result_includes_retail_rejection(self):
+        manager = FakeServerManager()
+        rejected = Future()
+        rejected.set_result(RawResult("CHAT SEND [ADMIN] hi", ("ERROR denied",), False))
+        manager.send_chat = lambda line: rejected
+        server = WolfWebServer(manager, host="127.0.0.1", port=0)
 
-        asyncio.run(server._ws_result(
-            ws,
-            "command",
-            result,
-            command="GET GAMESTATE",
-        ))
+        payload = asyncio.run(server._phone_message("hi"))
 
         self.assertEqual(
             {
-                "type": "command_result",
                 "ok": False,
                 "accepted": False,
                 "replies": ["ERROR denied"],
-                "command": "GET GAMESTATE",
                 "error": "ERROR denied",
             },
-            ws.messages[0],
+            payload,
         )
 
 
