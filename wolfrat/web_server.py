@@ -2325,10 +2325,29 @@ class WolfWebServer:
                 if fallback is None:
                     return web.Response(status=404, text='Not found')
                 data = fallback.encode('utf-8')
+            if filename == 'index.html':
+                data = self._versioned_page(data)
             charset = None if content_type.startswith('image/') else 'utf-8'
             return web.Response(body=data, content_type=content_type, charset=charset)
         serve.__name__ = f"serve_{filename}"
         return serve
+
+    def _versioned_page(self, html):
+        """The page with ?v=<content hash> on its script and style sheet.
+
+        A CDN in front can hand phones its own long browser cache time (the
+        page then ran an old app.js under new HTML); a new name per version
+        makes every phone fetch the new file.
+        """
+        for name in ('app.js', 'style.css'):
+            try:
+                with open(os.path.join(self._template_path, name), 'rb') as handle:
+                    digest = hashlib.sha256(handle.read()).hexdigest()[:12]
+            except OSError:
+                continue
+            path = f'"/static/{name}"'.encode('ascii')
+            html = html.replace(path, f'"/static/{name}?v={digest}"'.encode('ascii'))
+        return html
 
     async def _handle_status(self, request):
         """GET /api/status — Server status overview."""

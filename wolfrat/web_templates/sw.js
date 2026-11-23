@@ -5,7 +5,8 @@
  * are never stored. */
 'use strict';
 
-const CACHE = 'wolfrat-shell-v1';
+// v2: v1 could keep an app.js a CDN had told the phone to hold for hours.
+const CACHE = 'wolfrat-shell-v2';
 const SHELL = [
     '/',
     '/static/app.js',
@@ -19,9 +20,12 @@ const ICON = '/static/icon-192.png';
 const BADGE = '/static/badge-96.png';
 
 self.addEventListener('install', event => {
+    // Straight from WolfRAT ('reload'), never from the phone's own cache.
     event.waitUntil(
         caches.open(CACHE)
-            .then(cache => cache.addAll(SHELL))
+            .then(cache => Promise.all(SHELL.map(path => fetch(path, {cache: 'reload'})
+                .then(response => (response && response.ok ? cache.put(path, response) : undefined))
+                .catch(() => undefined))))
             .catch(() => undefined)
             .then(() => self.skipWaiting()),
     );
@@ -43,7 +47,8 @@ self.addEventListener('fetch', event => {
     if (url.pathname.startsWith('/api/') || url.pathname === '/ws') return;
     if (SHELL.indexOf(url.pathname) < 0) return;
     event.respondWith(
-        fetch(request)
+        // 'no-cache': always ask WolfRAT; the phone's cache is only for offline.
+        fetch(request, {cache: 'no-cache'})
             .then(response => {
                 if (response && response.ok) {
                     const copy = response.clone();

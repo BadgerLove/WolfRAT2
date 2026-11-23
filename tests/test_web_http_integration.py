@@ -106,6 +106,24 @@ async def test_static_web_resources_are_served_by_the_real_http_stack(web_client
 
 
 @pytest.mark.asyncio
+async def test_page_names_its_script_and_style_by_content(web_client):
+    """A CDN can give phones its own long cache time; a new name per version
+    makes them fetch the new app.js (2026-11-23: an installed app kept an old one)."""
+    import hashlib
+    import os
+    from wolfrat.web_server import _get_template_path
+
+    page = await (await web_client.get("/")).text()
+    for name in ("app.js", "style.css"):
+        with open(os.path.join(_get_template_path(), name), "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()[:12]
+        assert f'"/static/{name}?v={digest}"' in page
+        assert f'"/static/{name}"' not in page
+        versioned = await web_client.get(f"/static/{name}?v={digest}")
+        assert versioned.status == 200
+
+
+@pytest.mark.asyncio
 async def test_login_rejects_malformed_json_as_a_client_error(web_client):
     response = await web_client.post(
         "/api/auth",
