@@ -127,6 +127,8 @@ class AutoBalancePanel(QWidget):
             if not key or key in self._seen_chat:
                 continue
             self._seen_chat.add(key)
+            if msg.get("own"):
+                continue                 # WolfRAT's own line, not a volunteer
             text = str(msg.get("text", ""))
             if ":" not in text:
                 continue

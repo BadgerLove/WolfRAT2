@@ -41,6 +41,7 @@ from wolfrat.private_welcome_panel import PrivateWelcomePanel
 from wolfrat.protocol import (
     CHAT_MAX_LEN,
     ServerManager,
+    one_chat_line,
     player_entry_from_legacy,
     wire_log,
 )
@@ -51,6 +52,9 @@ from wolfrat.admin_commands import (
 
 # The server side of the Chat tab's "long chat" tick box.
 MYCOMP_COOLDOWN = 30  # seconds between one player's !mycomp lines
+# Sender name of commands typed on the phone page (ModsTab.run_web_command).
+# Reserved: chat from a player with this name is ignored.
+WEB_ADMIN = 'web_admin'
 LONG_CHAT_URL = ("https://github.com/BadgerLove/jo-server-patches/blob/main/"
                  "docs/patches/15-long-chat-server.md")
 from wolfrat.sounds import generate_all_sounds
@@ -4241,6 +4245,10 @@ class ChatBotTab(QWidget):
             # Manual mode: the chat log is all this WolfRAT does with chat.
             if manual_mode.quiet():
                 continue
+            # WolfRAT's own line handed back by the server: not a player's
+            # words (the name guesses below would pin it on whoever it names).
+            if msg.get('own'):
+                continue
 
             # Check for auto-swap trigger
             if self.auto_swap_cb.isChecked():
@@ -6101,6 +6109,51 @@ class ModsTab(QWidget):
             context=context,
         )
 
+    # Chat commands any player may use (answered before the mod check).
+    PLAYER_COMMANDS = frozenset({
+        '!stats', '!rank', '!kd', '!ping', '!mycomp', '!mycmd', '!list',
+        '!vote', '!skip', '!yes', '!switch',
+    })
+    # Typed on the phone these mean nothing: they are about the player typing.
+    PLAYER_ONLY_COMMANDS = frozenset({
+        '!switch', '!mycomp', '!mycmd', '!yes', '!ping',
+        '!1', '!2', '!3', '!4', '!5',
+    })
+
+    @staticmethod
+    def _mod_commands():
+        """Commands for mods (each rank allows some), plus the map vote numbers."""
+        return {
+            '!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map',
+            '!setnext', '!add', '!remove', '!1', '!2', '!3', '!4', '!5',
+            '!startvote', '!startgame', '!mixteams', '!balanceteams', '!time',
+            '!gametime', *weather.CHAT_COMMANDS,
+        }
+
+    def run_web_command(self, message):
+        """A !command typed on the phone page: run it here as Web Admin.
+
+        The web server hands it straight here; it is not posted to chat and
+        read back.  Manual mode does not stop it: the admin typed it, same as
+        a button (Dale, 2026-11-23).  Returns what the phone shows.
+        """
+        text = " ".join(str(message or "").split())
+        if not text.startswith('!'):
+            return {'ok': False, 'error': 'A command starts with !'}
+        parts = text.split(None, 1)
+        cmd = parts[0].lower()
+        if cmd in self.PLAYER_ONLY_COMMANDS:
+            return {'ok': False, 'command': cmd,
+                    'error': f'{cmd} is for players in the game'}
+        if cmd not in self.PLAYER_COMMANDS and cmd not in self._mod_commands():
+            return {'ok': False, 'command': cmd, 'error': f'Unknown command: {cmd}'}
+        if cmd in ('!kd', '!stats', '!rank') and len(parts) < 2:
+            return {'ok': False, 'command': cmd,
+                    'error': f'Add a player name: {cmd} <name>'}
+        wire_log(f"[MODS] Web Admin typed: {text[:200]}")
+        self._check_mod_command(text, typed_on_phone=True)
+        return {'ok': True, 'command': cmd}
+
     def _submit_mod_action(
         self,
         operation,
@@ -6537,6 +6590,12 @@ class ModsTab(QWidget):
                 continue
             self._seen_chat_ids.add(msg_id)
             text = msg.get('text', '')
+            if msg.get('own'):
+                # One of WolfRAT's own lines, handed back by the server with no
+                # name in front.  Never a command, whatever it says.
+                if '!' in text:
+                    wire_log(f"[MODS] Own line, not read as a command: {text[:120]}")
+                continue
             if manual_mode.quiet():
                 # Marked as seen, so a later switch to Full does not run
                 # commands typed while this WolfRAT was in Manual mode.
@@ -6553,29 +6612,34 @@ class ModsTab(QWidget):
 
         self._forget_chat_ids_outside(messages)
 
-    def _check_mod_command(self, text):
-        """Check if a chat message is a mod command and execute it."""
+    def _check_mod_command(self, text, *, typed_on_phone=False):
+        """Run a chat command, if ``text`` is one its sender may use.
+
+        A chat line counts only as "Name: !command".  A line with no name in
+        front came from the server console (WolfRAT's own lines, or another
+        admin tool's) and is never a command.  The phone's typed commands
+        come in through run_web_command (``typed_on_phone``), not from chat.
+        """
         if '!' not in text:
             return
 
-        # Ignore server error messages (e.g. "Unknown command: !killme")
-        # These contain '!' and ':' and would cause infinite command loops
-        if text.strip().startswith('Unknown command:'):
-            return
-
-        # Extract sender name and verify authorization
-        if ':' not in text:
-            # No colon = sent directly by server console (Web UI / Desktop app)
-            # The Web UI appends '[ADMIN] ' to all messages.
-            if text.startswith('[ADMIN] !'):
-                sender = 'web_admin'
-                message = text[8:].strip()  # Strip off '[ADMIN] '
-            else:
-                return  # Ignore other system messages
+        if typed_on_phone:
+            sender = WEB_ADMIN
+            message = text.strip()
         else:
+            # Ignore server error messages (e.g. "Unknown command: !killme")
+            # These contain '!' and ':' and would cause infinite command loops
+            if text.strip().startswith('Unknown command:'):
+                return
+            if ':' not in text:
+                return  # a console line: never a command (see above)
             # Has colon = sent by a player in-game
             sender = text.split(':')[0].strip().lower()
             message = text.split(':', 1)[1].strip()
+            if sender == WEB_ADMIN:
+                # That name is reserved for the phone page.
+                wire_log("[MODS] chat from a player named web_admin - ignored")
+                return
 
         if not message.startswith('!'):
             return
@@ -6636,7 +6700,10 @@ class ModsTab(QWidget):
                 wire_log(f"[MODS] !kd: sent '{kd_str}'")
             else:
                 self._send_mod_chat(
-                    f"No stats found for {target_name}",
+                    one_chat_line(
+                        f"No stats found for {target_name}",
+                        "No stats found for that name.",
+                    ),
                     "Send missing stats response",
                 )
                 wire_log(f"[MODS] !kd: no stats for '{target_name}'")
@@ -6676,7 +6743,11 @@ class ModsTab(QWidget):
                 for line in map_match.choices_lines(map_name, map_choices):
                     self._send_mod_chat(line, "Send map choices")
             else:
-                self._send_mod_chat(f"Map not found: {map_name}", "Send missing map response")
+                # One line, or a fixed one: the name is the player's own text.
+                self._send_mod_chat(
+                    one_chat_line(f"Map not found: {map_name}", "Map not found."),
+                    "Send missing map response",
+                )
 
         now = time.strftime('%H:%M:%S')
 
@@ -6939,7 +7010,7 @@ class ModsTab(QWidget):
             return
 
         # If it's a ! command but not recognized, tell them
-        valid_commands = {'!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map', '!setnext', '!add', '!remove', '!1', '!2', '!3', '!4', '!5', '!startvote', '!startgame', '!mixteams', '!balanceteams', '!time', '!gametime', *weather.CHAT_COMMANDS}
+        valid_commands = self._mod_commands()
         if cmd not in valid_commands:
             self._reply_privately(
                 sender, whisper.UNKNOWN, f"Unknown command: {cmd}", "Send unknown command response"
@@ -9487,7 +9558,8 @@ class WebAdminTab(QWidget):
     def _regen_token(self):
         reply = QMessageBox.question(
             self, "Regenerate Token",
-            "This will invalidate the current token. All users will need the new token. Continue?",
+            "This will invalidate the current token. Phones signed in now are signed out, "
+            "and everyone will need the new token. Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply == QMessageBox.StandardButton.Yes:
@@ -9641,6 +9713,9 @@ class DownloadWorker(QThread):
 class MainWindow(QMainWindow):
     """WolfRAT 2.10.27 Main Window."""
 
+    # A !command typed on the phone page, with the Future its answer goes in.
+    _web_command_signal = pyqtSignal(str, object)
+
     def __init__(self, runtime: DesktopRuntime | None = None):
         super().__init__()
         self.runtime = runtime or DesktopRuntime.production()
@@ -9709,6 +9784,12 @@ class MainWindow(QMainWindow):
         self.signals.chat_signal.connect(self.chatbot_tab.update_chat)
         self.signals.chat_signal.connect(lambda c: self.web_server.broadcast_chat())
         self.signals.chat_signal.connect(self.mods_tab.update_chat)
+        # Commands typed on the phone run here as Web Admin, on this thread.
+        # They are not posted to chat and read back.
+        self._web_command_signal.connect(
+            self._run_web_command, Qt.ConnectionType.QueuedConnection
+        )
+        self.web_server.on_command = self._queue_web_command
         self.signals.gamestate_signal.connect(self.server_tab.update_gamestate)
         self.signals.gamestate_signal.connect(lambda g: self.web_server.broadcast_state())
         self.signals.missions_signal.connect(self.missions_tab.update_missions)
@@ -9751,6 +9832,22 @@ class MainWindow(QMainWindow):
             self.whisperer.tick()
         except Exception as exc:                       # never let the timer die
             wire_log(f"[WHISPER] tick failed: {exc}")
+
+    def _queue_web_command(self, text):
+        """Web server thread: hand a typed phone command to this window's thread."""
+        from concurrent.futures import Future
+        answer = Future()
+        self._web_command_signal.emit(str(text), answer)
+        return answer
+
+    def _run_web_command(self, text, answer):
+        try:
+            result = self.mods_tab.run_web_command(text)
+        except Exception as error:        # the phone gets the reason, WolfRAT carries on
+            wire_log(f"[MODS] Web Admin command failed: {error}")
+            result = {'ok': False, 'error': str(error)}
+        if not answer.done():
+            answer.set_result(result)
 
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""

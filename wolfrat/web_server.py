@@ -22,7 +22,8 @@ from collections.abc import Mapping
 
 from aiohttp import web
 
-from wolfrat.protocol import wire_log
+from wolfrat.admin_commands import chat_limit
+from wolfrat.protocol import split_chat, wire_log
 
 # Suppress aiohttp access logs (noisy GET /api/status every 5s)
 logging.getLogger('aiohttp.access').setLevel(logging.WARNING)
@@ -47,6 +48,19 @@ class StaleMissionTarget(ValueError):
 
 class StalePlayerTarget(ValueError):
     """A posted player identity no longer matches the roster snapshot."""
+
+
+# In front of every chat line sent from the phone page, so players can see an
+# admin wrote it.  Older pages add it themselves; the server takes it off and
+# puts it back once.
+PHONE_PREFIX = "[ADMIN] "
+# How long a typed phone command may wait for the WolfRAT window to take it.
+PHONE_COMMAND_TIMEOUT = 10.0
+
+
+def _log_text(value, limit=40):
+    """Something a visitor typed, safe for one wire-log line."""
+    return repr(str(value)[:limit])
 
 
 def _get_template_path():
@@ -100,6 +114,10 @@ class WolfWebServer:
         # Auth state — separate from JO server credentials
         self._login_ips = {}  # {ip: last_login_timestamp}
         self.on_login = None  # callback(ip, timestamp) for persistence
+        # callback(text) -> concurrent Future of {'ok', 'command', 'error'}:
+        # runs a !command typed on the phone inside WolfRAT as Web Admin.
+        # Set by the main window; None = typed commands are refused.
+        self.on_command = None
         # Brute-force lockout: {ip: {'guesses': set(digest), 'first': ts, 'until': ts}}
         self._failed_logins = {}
 
@@ -121,7 +139,7 @@ class WolfWebServer:
         application.router.add_get('/api/settings', self._handle_settings)
         application.router.add_get('/api/login-ips', self._handle_login_ips)
         application.router.add_post('/api/action', self._handle_quick_action)
-        application.router.add_post('/api/command', self._handle_command)
+        # No raw-command route (/api/command): the page never used it.
         application.router.add_post('/api/chat/send', self._handle_send_chat)
         application.router.add_post('/api/player/action', self._handle_player_action)
         application.router.add_post('/api/map/switch', self._handle_map_switch)
@@ -139,10 +157,46 @@ class WolfWebServer:
         return self._create_application()
 
     def set_auth(self, username, token):
-        """Set the web admin credentials (called from WebAdminTab)."""
+        """Set the web admin credentials (called from WebAdminTab).
+
+        A new token signs out every phone connected now (Regenerate Token):
+        an open connection was only checked when it opened.
+        """
         with self._auth_lock:
+            old_token = self._web_token
             self._web_username = username or "admin"
             self._web_token = token
+        if old_token and old_token != token:
+            self._close_connections("token changed")
+
+    def _current_token(self):
+        with self._auth_lock:
+            return self._web_token
+
+    def _close_connections(self, reason):
+        """Close every open WebSocket; the page has to sign in again."""
+        loop = self._loop
+        if not self.is_running or loop is None or loop.is_closed():
+            return
+
+        async def close_all():
+            for ws in list(self._ws_clients):
+                try:
+                    await ws.close(code=4001, message=reason.encode("ascii", "replace"))
+                except Exception:
+                    pass
+
+        coroutine = close_all()
+        try:
+            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+        except RuntimeError:
+            coroutine.close()
+            return
+        try:
+            future.result(timeout=3)
+        except Exception:
+            pass
+        wire_log(f"WEB: {reason} - open connections closed")
 
     def start(self):
         """Start the web server in a background thread."""
@@ -590,6 +644,8 @@ class WolfWebServer:
             'settings': self._safe_settings(),
             'player_count': len(players),
             'game_mode': self.sm.game_state.get('mode', 'Unknown') if self.sm.game_state else 'Unknown',
+            # Longest phone chat line: the server's limit less "[ADMIN] ".
+            'chat_max': max(1, chat_limit() - len(PHONE_PREFIX)),
         }
 
     @classmethod
@@ -741,22 +797,52 @@ class WolfWebServer:
     async def _await_result(self, future):
         return await asyncio.wrap_future(future)
 
-    async def _ws_result(self, ws, message_type, future, **context):
-        try:
-            result = await self._await_result(future)
-            payload = self._result_payload(
-                result, type=f'{message_type}_result', **context
+    async def _phone_message(self, message):
+        """One message typed on the phone page: a !command or a chat line.
+
+        A !command runs inside WolfRAT as Web Admin (``on_command``); it is
+        not posted to game chat.  Chat goes out as one "[ADMIN] " line, or is
+        refused when it would not fit one.
+        """
+        if not isinstance(message, str):
+            raise ValueError('Message must be text')
+        text = " ".join(message.split())
+        tag = PHONE_PREFIX.strip()
+        if text == tag or text.startswith(tag + " "):   # older pages add it themselves
+            text = text[len(tag):].strip()
+        if not text:
+            raise ValueError('No message provided')
+        if text.startswith('!'):
+            return await self._run_phone_command(text)
+        line = PHONE_PREFIX + text
+        if len(split_chat(line)) != 1:
+            room = chat_limit() - len(PHONE_PREFIX)
+            raise ValueError(
+                f'Too long for one chat line ({room} characters at most)'
             )
-        except Exception as error:
-            payload = {
-                'type': f'{message_type}_result',
-                'ok': False,
-                'accepted': False,
-                'replies': [],
-                'error': str(error),
-                **context,
-            }
-        await ws.send_str(json.dumps(payload))
+        result = await self._await_result(self.sm.send_chat(line))
+        return self._result_payload(result)
+
+    async def _run_phone_command(self, text):
+        command = text.split(None, 1)[0].lower()
+        refused = {'ok': False, 'accepted': False, 'replies': [], 'command': command}
+        runner = self.on_command
+        if runner is None:
+            return {**refused, 'error': 'Typed commands need the WolfRAT window'}
+        wire_log(f"WEB COMMAND: {text[:120]}")
+        try:
+            outcome = await asyncio.wait_for(
+                asyncio.wrap_future(runner(text)), timeout=PHONE_COMMAND_TIMEOUT
+            )
+        except asyncio.TimeoutError:
+            return {**refused, 'error': 'WolfRAT is busy and has not answered (it may still run it)'}
+        outcome = dict(outcome or {})
+        command = outcome.get('command') or command
+        if not outcome.get('ok'):
+            return {**refused, 'command': command,
+                    'error': outcome.get('error') or 'Not run'}
+        return {'ok': True, 'accepted': True, 'replies': ['Run by WolfRAT'],
+                'command': command}
 
     # --- Auth ---
 
@@ -778,8 +864,12 @@ class WolfWebServer:
                     {'error': 'Request body must be a JSON object'},
                     status=400,
                 )
-            username = body.get('username', '').strip()
-            token = body.get('token', '').strip()
+            username = body.get('username', '')
+            token = body.get('token', '')
+            if not isinstance(username, str) or not isinstance(token, str):
+                return web.json_response({'error': 'Missing username or token'}, status=400)
+            username = username.strip()
+            token = token.strip()
             if not username or not token:
                 return web.json_response({'error': 'Missing username or token'}, status=400)
 
@@ -811,7 +901,7 @@ class WolfWebServer:
                 # Return the access token itself — client uses it for all requests
                 return web.json_response({'ok': True, 'token': token})
 
-            wire_log(f"WEB AUTH FAILED: {username} from {ip}")
+            wire_log(f"WEB AUTH FAILED: {_log_text(username)} from {ip}")
             if self._record_failed_login(ip, username + chr(0) + token):
                 return self._locked_out_response(self.LOCKOUT_SECONDS)
             return web.json_response({'error': 'Invalid username or token'}, status=401)
@@ -939,41 +1029,22 @@ class WolfWebServer:
         except Exception as error:
             return web.json_response({'error': str(error)}, status=502)
 
-    async def _handle_command(self, request):
-        """POST /api/command — Send a raw command to the server."""
-        if not self._check_auth(request):
-            return web.json_response({'error': 'Unauthorized'}, status=401)
-        try:
-            body = await request.json()
-            cmd = body.get('command', '').strip()
-            if not cmd:
-                return web.json_response({'error': 'No command provided'}, status=400)
-            if not self.sm.is_connected:
-                return web.json_response({'error': 'Not connected to server'}, status=503)
-            display_command = self._redact_command(cmd)
-            wire_log(f"WEB CMD: {display_command}")
-            result = await self._await_result(self.sm.execute_raw(cmd))
-            return web.json_response(
-                self._result_payload(result, command=display_command)
-            )
-        except ValueError as e:
-            return web.json_response({'error': str(e)}, status=400)
-        except Exception as e:
-            return web.json_response({'error': str(e)}, status=502)
-
     async def _handle_send_chat(self, request):
-        """POST /api/chat/send — Send a chat message."""
+        """POST /api/chat/send — A chat line or a typed !command from the phone."""
         if not self._check_auth(request):
             return web.json_response({'error': 'Unauthorized'}, status=401)
         try:
             body = await request.json()
-            msg = body.get('message', '').strip()
-            if not msg:
+            if not isinstance(body, Mapping):
+                return web.json_response(
+                    {'error': 'Request body must be a JSON object'}, status=400
+                )
+            msg = body.get('message', '')
+            if not isinstance(msg, str) or not msg.strip():
                 return web.json_response({'error': 'No message provided'}, status=400)
             if not self.sm.is_connected:
                 return web.json_response({'error': 'Not connected to server'}, status=503)
-            result = await self._await_result(self.sm.send_chat(msg))
-            return web.json_response(self._result_payload(result))
+            return web.json_response(await self._phone_message(msg))
         except ValueError as e:
             return web.json_response({'error': str(e)}, status=400)
         except Exception as e:
@@ -1092,6 +1163,8 @@ class WolfWebServer:
         """WebSocket endpoint for live state updates."""
         if not self._check_auth(request):
             return web.Response(status=401, text='Unauthorized')
+        # The token it opened with; a new one (Regenerate) ends this connection.
+        ws_token = self._current_token()
         ws = web.WebSocketResponse()
         await ws.prepare(request)
         self._ws_clients.add(ws)
@@ -1105,11 +1178,18 @@ class WolfWebServer:
 
         try:
             async for msg in ws:
+                if self._current_token() != ws_token:
+                    await ws.close(code=4001, message=b'token changed')
+                    break
                 if msg.type == web.WSMsgType.TEXT:
                     try:
                         data = json.loads(msg.data)
+                        if not isinstance(data, Mapping):
+                            raise ValueError('Message must be a JSON object')
                         message_type = data.get('type')
-                        if message_type not in {'command', 'chat'}:
+                        # Only 'chat': the raw 'command' message is gone (see
+                        # _create_application), typed !commands come as chat.
+                        if message_type != 'chat':
                             await ws.send_str(json.dumps({
                                 'type': 'error',
                                 'error': f'Unknown message type: {message_type}',
@@ -1117,32 +1197,23 @@ class WolfWebServer:
                             continue
                         if not self.sm.is_connected:
                             await ws.send_str(json.dumps({
-                                'type': f'{message_type}_result',
+                                'type': 'chat_result',
                                 'ok': False,
                                 'accepted': False,
                                 'replies': [],
                                 'error': 'Not connected to server',
                             }))
                             continue
-                        if message_type == 'command':
-                            command = str(data.get('command', '')).strip()
-                            if not command:
-                                raise ValueError('No command provided')
-                            await self._ws_result(
-                                ws,
-                                message_type,
-                                self.sm.execute_raw(command),
-                                command=self._redact_command(command),
-                            )
-                        else:
-                            message = str(data.get('message', '')).strip()
-                            if not message:
-                                raise ValueError('No message provided')
-                            await self._ws_result(
-                                ws,
-                                message_type,
-                                self.sm.send_chat(message),
-                            )
+                        try:
+                            payload = await self._phone_message(data.get('message', ''))
+                        except Exception as error:   # the page pairs it with its message
+                            payload = {
+                                'ok': False,
+                                'accepted': False,
+                                'replies': [],
+                                'error': str(error),
+                            }
+                        await ws.send_str(json.dumps({'type': 'chat_result', **payload}))
                     except (json.JSONDecodeError, ValueError) as error:
                         await ws.send_str(json.dumps({
                             'type': 'error',

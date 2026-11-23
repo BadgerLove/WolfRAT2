@@ -791,6 +791,8 @@ class BansTab(QWidget):
             if not key or key in self._seen_chat:
                 continue
             self._seen_chat.add(key)
+            if msg.get("own"):
+                continue                 # WolfRAT's own line, not a player's words
             text = str(msg.get("text", ""))
             if ":" in text:
                 who, said = text.split(":", 1)

@@ -250,7 +250,14 @@ class ServerManager:
         self.available_maps_data = ""
         self.weapons: list[dict[str, object]] = []
         self._last_raw_chat_lines: tuple[str, ...] = ()
+        self._last_raw_chat_own: tuple[bool, ...] = ()
         self._chat_message_id = 0
+        # Lines WolfRAT sent with CHAT SEND, waiting to come back in CHAT GET
+        # (the server hands them back with no name in front).  A line that
+        # matches one is marked "own": nothing reads it as a player's words
+        # or as a command.
+        self._own_chat_lock = threading.Lock()
+        self._own_chat: list[tuple[str, float]] = []
 
         self._on_players = None
         self._on_chat = None
@@ -443,6 +450,11 @@ class ServerManager:
         """The sole untyped command entry point, for an explicit raw console."""
 
         self._log(f">> RAW {_redact_raw_command(user_text)}")
+        raw_chat = _re.fullmatch(
+            r"\s*CHAT[ \t]+SEND[ \t]+(.+)", str(user_text or ""), _re.IGNORECASE
+        )
+        if raw_chat:
+            self._remember_own_chat((raw_chat.group(1),))
         return self._serialize_mutation(
             lambda session: self._execute_raw_now(
                 user_text, expected_session=session
@@ -820,6 +832,7 @@ class ServerManager:
 
     def send_chat(self, message, quiet=False) -> Future:
         chunks = _split_chat_message(message)
+        self._remember_own_chat(chunks)
         return self._serialize_mutation(
             lambda session: self._send_chat_chunks(
                 chunks,
@@ -2276,25 +2289,75 @@ class ServerManager:
         wire_log(f"Mission queue unchanged ({count} maps), current is now {current}")
         return False
 
+    # How long a sent line waits to come back, and how many are remembered.
+    OWN_CHAT_SECONDS = 300.0
+    OWN_CHAT_MAX = 256
+
+    def _remember_own_chat(self, chunks: Iterable[str]) -> None:
+        """Note lines this WolfRAT is about to send (see _claim_own_chat)."""
+        now = _time.monotonic()
+        keys = [_own_chat_key(chunk) for chunk in chunks]
+        with self._own_chat_lock:
+            self._own_chat = [
+                (text, expires) for text, expires in self._own_chat
+                if expires > now
+            ]
+            self._own_chat.extend(
+                (key, now + self.OWN_CHAT_SECONDS) for key in keys if key
+            )
+            del self._own_chat[:-self.OWN_CHAT_MAX]
+
+    def _claim_own_chat(self, line: str) -> bool:
+        """True when ``line`` is one this WolfRAT sent; uses up that record.
+
+        Exact text only (colour tags and spacing aside): a player's line has
+        their name in front, so it can only match a line WolfRAT itself sent
+        in the shape "Name: words", and that one must not count as theirs.
+        """
+        key = _own_chat_key(line)
+        if not key:
+            return False
+        now = _time.monotonic()
+        with self._own_chat_lock:
+            for index, (text, expires) in enumerate(self._own_chat):
+                if expires > now and text == key:
+                    del self._own_chat[index]
+                    return True
+        return False
+
     def _apply_chat(self, lines: tuple[str, ...]) -> None:
-        raw = "\n".join(lines)
-        if self._on_raw_chat:
-            self._on_raw_chat(raw)
         overlap = 0
         maximum = min(len(self._last_raw_chat_lines), len(lines))
         for size in range(maximum, 0, -1):
             if self._last_raw_chat_lines[-size:] == lines[:size]:
                 overlap = size
                 break
+        # Which lines are WolfRAT's own.  Lines seen last time keep their mark;
+        # each new line may use up one record of what was sent.
+        own_flags = list(self._last_raw_chat_own[-overlap:]) if overlap else []
+        if len(own_flags) != overlap:
+            own_flags = [False] * overlap
         for line in lines[overlap:]:
+            own_flags.append(self._claim_own_chat(line))
+        if self._on_raw_chat:
+            # The map vote counter reads this; WolfRAT's own lines are never votes.
+            raw = "\n".join(
+                line for line, own in zip(lines, own_flags) if not own
+            )
+            self._on_raw_chat(raw)
+        for line, own in zip(lines[overlap:], own_flags[overlap:]):
             self._chat_message_id += 1
-            self.chat_messages.append({
+            message = {
                 "id": self._chat_message_id,
                 "time": "",
                 "text": line,
                 "raw": line,
-            })
+            }
+            if own:
+                message["own"] = True
+            self.chat_messages.append(message)
         self._last_raw_chat_lines = lines
+        self._last_raw_chat_own = tuple(own_flags)
         self.chat_messages = self.chat_messages[-500:]
         if self._on_chat:
             self._on_chat(self.chat_messages)
@@ -2497,8 +2560,51 @@ def _setting_matches(
     return str(actual) == str(expected)
 
 
+# Colour tags (chat_markup.TAG_RE): a stock server may drop them from a line.
+_CHAT_TAG_RE = _re.compile(r"<(?:c[0-9a-fA-F]{6}|co)>", _re.IGNORECASE)
+# "Name: !command", with spaces or colour tags between the colon and the "!".
+_COLON_COMMAND_RE = _re.compile(
+    r":((?:\s|<(?:c[0-9a-fA-F]{6}|co)>)*)!", _re.IGNORECASE
+)
+# Put in front of a line that would otherwise start like a command.
+_CHAT_LEAD = "-"
+
+
+def _own_chat_key(text: str) -> str:
+    """A line as it may come back from the server: tags out, spaces squeezed."""
+    return " ".join(_CHAT_TAG_RE.sub("", str(text)).split())
+
+
+def _defuse_chat(message: str) -> str:
+    """No "Name: !command" anywhere in a line WolfRAT sends: "Name - !command".
+
+    Every chat reader takes "Name: words" as Name saying the words: this
+    WolfRAT's mods tab, another WolfRAT on the same server, and the vote
+    counter, which takes any "...: !3".  WolfRAT's own lines stay out of that.
+    """
+    return _COLON_COMMAND_RE.sub(lambda match: " -" + match.group(1) + "!", message)
+
+
+def _starts_like_command(words: list[str], index: int) -> bool:
+    """Would a line beginning at ``words[index]`` read as a command?
+
+    "!..." does on a listen server (the host's name goes in front of console
+    lines) and older WolfRATs took "[ADMIN] !..." for a phone command.
+    Colour tags count as nothing.
+    """
+    visible = " ".join(
+        part for part in (_CHAT_TAG_RE.sub("", word) for word in words[index:index + 4])
+        if part
+    )
+    return visible.startswith("!") or visible.startswith("[ADMIN] !")
+
+
 def _split_chat_message(message: str) -> tuple[str, ...]:
-    """Split chat without crossing retail's byte or dispatcher-token caps."""
+    """Split chat without crossing retail's byte or dispatcher-token caps.
+
+    No piece may read as a command: "Name: !x" becomes "Name - !x", and a
+    piece that would start with "!" or "[ADMIN] !" gets a "-" in front.
+    """
 
     if not isinstance(message, str):
         raise TypeError("chat message must be text")
@@ -2512,31 +2618,61 @@ def _split_chat_message(message: str) -> tuple[str, ...]:
         raise ValueError("retail command arguments are ASCII only") from error
 
     limit = chat_limit()
+    all_words = _defuse_chat(message).split()
     chunks: list[str] = []
     words: list[str] = []
     length = 0
-    for word in message.split():
+
+    def lead_for(index: int) -> list[str]:
+        if not _starts_like_command(all_words, index):
+            return []
+        if len(all_words[index]) + len(_CHAT_LEAD) + 1 > limit:
+            raise ValueError(f"chat word cannot exceed {limit - 2} characters here")
+        return [_CHAT_LEAD]
+
+    for index, word in enumerate(all_words):
         if len(word) > limit:
             raise ValueError(
                 f"chat word cannot exceed {limit} characters"
             )
+        if not words:
+            words = lead_for(index)
+            length = len(" ".join(words))
         added_length = len(word) + (1 if words else 0)
         if (
             words
+            and words != [_CHAT_LEAD]
             and (
                 len(words) >= MAX_CHAT_TOKENS
                 or length + added_length > limit
             )
         ):
             chunks.append(" ".join(words))
-            words = []
-            length = 0
-            added_length = len(word)
+            words = lead_for(index)
+            length = len(" ".join(words))
+            added_length = len(word) + (1 if words else 0)
         words.append(word)
         length += added_length
     if words:
         chunks.append(" ".join(words))
     return tuple(chunks)
+
+
+def split_chat(message: str) -> tuple[str, ...]:
+    """The CHAT SEND lines WolfRAT would send for ``message``."""
+    return _split_chat_message(message)
+
+
+def one_chat_line(line: str, fallback: str) -> str:
+    """``line`` when it goes out as one chat line, else ``fallback``.
+
+    For replies that repeat what a player typed ("Map not found: ..."), so
+    they stay one line.
+    """
+    try:
+        return line if len(_split_chat_message(line)) == 1 else fallback
+    except ValueError:
+        return fallback
 
 
 def completed_future(value) -> Future:

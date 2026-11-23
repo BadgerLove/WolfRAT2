@@ -298,7 +298,12 @@ function updateUI(state) {
     document.getElementById('dash-status').textContent = state.connected ? 'Online' : 'Offline';
     document.getElementById('dash-status').style.color = state.connected ? '#50ff50' : '#ff4040';
     document.getElementById('dash-players').textContent = state.player_count;
-    document.getElementById('dash-mode').textContent = state.game_mode || '—';
+    document.getElementById('dash-mode').textContent = state.game_mode || '-';
+
+    // Chat box: the server says how long one line may be (51, or 110 with long chat).
+    if (Number(state.chat_max) > 0) {
+        document.getElementById('chat-input').maxLength = Number(state.chat_max);
+    }
 
     // Dashboard mini-chat
     renderMiniChat(state.chat || []);

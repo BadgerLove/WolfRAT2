@@ -101,10 +101,11 @@
                     <h2>Server Chat</h2>
                     <div id="chat-messages" class="chat-messages"></div>
                     <div class="chat-input-row">
-<!-- 54 = the 62-char server chat limit minus the 8-char "[ADMIN] " prefix
-                             app.js prepends. At 65 the tail was silently eaten, which
-                             also mangled !commands the mods tab matches on. -->
-                        <input id="chat-input" type="text" placeholder="Type a message or !command..." maxlength="54" autocomplete="off">
+<!-- 51 = stock 59-character chat less the 8-character "[ADMIN] " prefix.
+                             The server sends chat_max in every update (110 with the
+                             long-chat patch) and refuses a line that will not fit.
+                             !commands are not sent to chat: WolfRAT runs them. -->
+                        <input id="chat-input" type="text" placeholder="Type a message or !command..." maxlength="51" autocomplete="off">
                         <button class="btn btn-send" onclick="sendChat()">Send</button>
                     </div>
                 </div>
