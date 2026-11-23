@@ -6409,7 +6409,8 @@ class ModsTab(QWidget):
             ("!list", "Show the map rotation", False),
             ("!ping", "Show your own ping", False),
             ("!mycomp", "Your lag compensation: P ping, R rewind (ms), hits since you "
-             "joined, hits it added (or took), and that as a %. Once per 30 s each", False),
+             "joined, and what it added (or took) once that is more than luck: under 50 hits "
+             "it says too few shots yet, a small difference about even. Once per 30 s each", False),
             ("!mycmd", "The commands you may use (your rank's, or the player ones), sent to you "
              "only - nobody else sees it. Needs the server on this PC", False),
         )),

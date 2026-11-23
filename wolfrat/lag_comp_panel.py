@@ -804,7 +804,7 @@ class LagCompPanel(QWidget):
                         for note in _claymore_notes(st, s))
         if not s.tests:
             self.totals_lbl.setText(self._with_reset_note(
-                f"Counting for {minutes} min. No bullet checks from rewound players yet"
+                f"Counting for {minutes} min. No bullet checks from rewound players yet "
                 f"(server tick {s.tick_us / 1000:.1f} ms).{notes}"))
         else:
             gain = s.gain_percent
