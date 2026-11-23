@@ -1,9 +1,11 @@
 // Behaviour tests for the phone page's app.js, run by tests/test_web_client.py:
 //     node tests/web_client_result_test.js wolfrat/web_templates/app.js
 // Each case loads app.js into a fresh fake browser (a small fake DOM, storage,
-// fetch and WebSocket) and drives it through its own functions.
+// fetch and WebSocket) and drives it through its own functions. The service
+// worker (sw.js, next to app.js) runs in its own fake worker scope.
 const assert = require('assert');
 const fs = require('fs');
+const path = require('path');
 const vm = require('vm');
 
 const sourcePath = process.argv[2];
@@ -11,8 +13,12 @@ if (!sourcePath) {
     throw new Error('usage: node web_client_result_test.js <app.js>');
 }
 const SOURCE = fs.readFileSync(sourcePath, 'utf8');
+const workerPath = path.join(path.dirname(sourcePath), 'sw.js');
+const WORKER_SOURCE = fs.readFileSync(workerPath, 'utf8');
 const UA = 'Mozilla/5.0 (Linux; Android 15; Pixel 8) AppleWebKit/537.36 '
     + '(KHTML, like Gecko) Chrome/141.0.0.0 Mobile Safari/537.36';
+const IPHONE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_1 like Mac OS X) AppleWebKit/605.1.15 '
+    + '(KHTML, like Gecko) Version/18.1 Mobile/15E148 Safari/604.1';
 
 // ------------------------------------------------------------ fake browser
 class FakeClassList {
@@ -138,10 +144,63 @@ function respond(status, body, headers = {}) {
 }
 
 /**
+ * A browser's Push API for one page: a service worker registration whose
+ * push manager remembers its subscription, and Notification permission.
+ * `answer` = what the permission prompt answers.
+ */
+function fakePush({permission = 'default', answer = 'granted', subscribedWith = null} = {}) {
+    const env = {subscribeCalls: [], unsubscribed: 0, permissionAsked: 0, current: null};
+    const makeSub = key => ({
+        endpoint: 'https://fcm.googleapis.com/fcm/send/fake-endpoint',
+        options: {applicationServerKey: key},
+        toJSON() {
+            return {endpoint: this.endpoint, expirationTime: null, keys: {p256dh: 'BPfake', auth: 'AUfake'}};
+        },
+        async unsubscribe() {
+            env.unsubscribed += 1;
+            if (env.current === this) env.current = null;
+            return true;
+        },
+    });
+    if (subscribedWith) env.current = makeSub(subscribedWith);
+    const registration = {
+        pushManager: {
+            async getSubscription() {
+                return env.current;
+            },
+            async subscribe(options) {
+                env.subscribeCalls.push(options);
+                env.current = makeSub(options.applicationServerKey);
+                return env.current;
+            },
+        },
+    };
+    env.serviceWorker = {
+        register: async () => registration,
+        ready: Promise.resolve(registration),
+        getRegistration: async () => registration,
+    };
+    env.Notification = {
+        permission,
+        async requestPermission() {
+            env.permissionAsked += 1;
+            env.Notification.permission = answer;
+            return answer;
+        },
+    };
+    return env;
+}
+
+/**
  * A fresh page: app.js loaded with the given storage and address hash.
  * `serve(request)` answers fetch() calls ({path, method, headers, body}).
+ * `secure` = an HTTPS page; `push` = fakePush() (a browser with the Push API);
+ * `standalone` = opened as the installed app.
  */
-function makePage({local = {}, session = {}, hash = '', serve = null} = {}) {
+function makePage({
+    local = {}, session = {}, hash = '', serve = null,
+    secure = false, push = null, ua = UA, standalone = false,
+} = {}) {
     const doc = {
         elements: new Map(),
         activeElement: null,
@@ -213,6 +272,7 @@ function makePage({local = {}, session = {}, hash = '', serve = null} = {}) {
     }
     FakeWebSocket.OPEN = 1;
 
+    const windowListeners = {};
     const page = {
         doc, events, requests, sockets, history, location,
         local: new FakeStorage(local),
@@ -220,8 +280,15 @@ function makePage({local = {}, session = {}, hash = '', serve = null} = {}) {
         serve: serve || (() => respond(500, {error: 'no server in this test'})),
         el: id => doc.getElementById(id),
         run: code => vm.runInContext(code, context),
+        // A value from the page as plain JSON (objects made inside the page
+        // have the page's own prototypes, which deepStrictEqual refuses).
+        json: code => JSON.parse(vm.runInContext(`JSON.stringify(${code})`, context)),
         shown: id => !doc.getElementById(id).classList.contains('hide'),
+        fire: (type, event) => (windowListeners[type] || []).map(handler => handler(event)),
     };
+    const navigator = {userAgent: ua};
+    if (push) navigator.serviceWorker = push.serviceWorker;
+    const pushGlobals = push ? {PushManager: function PushManager() {}, Notification: push.Notification} : {};
     const context = vm.createContext({
         console,
         document: doc,
@@ -229,7 +296,9 @@ function makePage({local = {}, session = {}, hash = '', serve = null} = {}) {
         sessionStorage: page.session,
         location,
         history,
-        navigator: {userAgent: UA},
+        navigator,
+        ...pushGlobals,
+        atob: text => Buffer.from(String(text), 'base64').toString('binary'),
         WebSocket: FakeWebSocket,
         fetch: async (path, options = {}) => {
             const request = {
@@ -249,9 +318,11 @@ function makePage({local = {}, session = {}, hash = '', serve = null} = {}) {
         innerHeight: 800,
         scrollY: 0,
         scrollTo: () => {},
-        matchMedia: () => ({matches: false}),
-        isSecureContext: false,
-        addEventListener: () => {},
+        matchMedia: query => ({matches: standalone && /display-mode: standalone/.test(query)}),
+        isSecureContext: secure,
+        addEventListener: (type, handler) => {
+            (windowListeners[type] = windowListeners[type] || []).push(handler);
+        },
     });
     context.window = context;
     vm.runInContext(SOURCE, context, {filename: sourcePath});
@@ -285,6 +356,24 @@ const ALL_FEATURES = {
     lag_comp: true, manual_switch: true, set_next: true,
     ban_expiry: [{id: '', label: 'Never'}, {id: '7d', label: '7 days'}],
 };
+
+/** Lets the page's pending promises run (fetch answers, awaits). */
+async function settle(rounds = 6) {
+    for (let i = 0; i < rounds; i += 1) await new Promise(resolve => setImmediate(resolve));
+}
+
+const NOW = Math.floor(Date.now() / 1000);
+const EVENTS = [
+    {id: 1, ts: NOW - 600, kind: 'join', text: 'Kestrel joined (1 player on)', name: 'Kestrel'},
+    {id: 2, ts: NOW - 300, kind: 'map', text: 'Cold Water Gap started', name: null},
+    {id: 3, ts: NOW - 120, kind: 'kick', text: 'Rook was kicked by an admin', name: 'Rook'},
+];
+const event4 = {id: 4, ts: NOW - 20, kind: 'leave', text: 'Kestrel left', name: 'Kestrel'};
+const event5 = {id: 5, ts: NOW - 5, kind: 'ban', text: 'Ali banned (name and IP, for 7 days)', name: 'Ali'};
+// WolfRAT's public key: a 65-byte uncompressed P-256 point, base64url.
+const KEY_BYTES = [4, ...Array.from({length: 64}, (_, i) => (i * 7 + 3) % 256)];
+const PUBLIC_KEY = Buffer.from(KEY_BYTES).toString('base64url');
+const PUSH_FEATURES = {...ALL_FEATURES, push: true};
 
 const ok = (extra = {}) => respond(200, {ok: true, accepted: true, replies: ['OK'], ...extra});
 const refused = message => respond(200, {ok: false, accepted: false, replies: [message], error: message});
@@ -784,11 +873,26 @@ test('the page hides features this WolfRAT cannot do', async () => {
 
 test('missing and null fields from an older WolfRAT do not break the page', async () => {
     const page = await signedInPage({type: 'state'});
-    page.run(`updateUI({type: 'state', players: null, chat: null, missions: null, server: null, teams: null, vote: null, weather: null, lag_comp: null, features: null, next_map: null, settings: null})`);
+    page.run(`updateUI({type: 'state', players: null, chat: null, missions: null, server: null, teams: null, vote: null, weather: null, lag_comp: null, features: null, next_map: null, settings: null, events: null, events_last_id: null})`);
     page.run(`updateUI({type: 'state', connected: false, players: [{id: 'x', name: ''}, null, {id: 3}], missions: [{filename: ''}, null], chat: [null, {text: null}], settings: {GameTime: '12/30'}})`);
     assert.strictEqual(page.el('hdr-sub').textContent, 'No link to the game server');
     assert.strictEqual(page.el('now-left').textContent, '12', 'time left falls back to settings.gametime');
     assert.match(page.el('plist').innerHTML, /No players/);
+    assert(!page.shown('hdr-bell'), 'no alerts from this WolfRAT: no bell');
+    assert(!page.shown('tile-notify'), 'no features.push: no Notifications tile');
+
+    page.run(`updateUI({type: 'state', events: [null, {id: 'x'}, {id: 2.5}, {id: -1}, {id: true}, {id: 3, kind: null, text: null, name: null, ts: null}], events_last_id: 'abc', features: {push: true}, server: {secure_address: null}})`);
+    assert(page.shown('hdr-bell'));
+    assert.deepStrictEqual(page.json('currentEvents.map(e => e.id)'), [3], 'only whole ids from 0 up');
+    page.run('openAlerts()');
+    assert.match(page.el('sheet-body').innerHTML, /<div class="al new"><span class="ic"><svg class="i sm"><use href="#info"\/>/);
+    page.run('closeSheet()');
+    page.serve = () => respond(404, {error: 'Not Found'});
+    await page.run(`go('notify')`);
+    await settle();
+    assert.match(page.el('nt-count').textContent, /\u2014/, 'no setting from this WolfRAT');
+    assert(page.el('nt-plus').disabled && page.el('nt-minus').disabled);
+    assert(!page.shown('nt-secure-link'));
 });
 
 test('maps: Run now asks first and keeps the queue identity; Set next posts the map', async () => {
@@ -940,6 +1044,429 @@ test('devices: the list loads with the key and another phone can be signed out',
     page.run(`askSignOutDevice('cc33dd44', "Tinman's phone")`);
     await page.run(`sheetAct('yes')`);
     assert.strictEqual(page.el('operation-result').dataset.outcome, 'accepted');
+});
+
+// ---------------------------------------------------------- the bell
+test('the bell shows a red dot for alerts this phone has not seen', async () => {
+    const page = await signedInPage(stateWith({events: EVENTS, events_last_id: 3}));
+    assert(page.shown('hdr-bell'));
+    assert(page.shown('hdr-pip'), 'nothing seen yet on this phone');
+
+    const seen = await signedInPage(stateWith({events: EVENTS, events_last_id: 3}), {local: {wolfkey: 'k1', wolfseen: '3'}});
+    assert(!seen.shown('hdr-pip'), 'all seen');
+    seen.run(`handleWebSocketMessage(${JSON.stringify({type: 'event', event: event4})})`);
+    assert(seen.shown('hdr-pip'), 'a new alert from the socket lights it');
+    assert.deepStrictEqual(seen.json('currentEvents.map(e => e.id)'), [1, 2, 3, 4]);
+    assert.strictEqual(seen.local.getItem('wolfseen'), '3', 'only opening the sheet marks them read');
+
+    const older = await signedInPage(stateWith());
+    assert(!older.shown('hdr-bell'), 'a WolfRAT that sends no alerts gets no bell');
+});
+
+test('the Alerts sheet: newest first, icon per kind, name in bold; opening marks all read', async () => {
+    const page = await signedInPage(stateWith({events: EVENTS, events_last_id: 3}), {local: {wolfkey: 'k1', wolfseen: '1'}});
+    page.el('hdr-bell').click();
+    assert.strictEqual(page.run('sheet.kind'), 'alerts');
+    const html = page.el('sheet-body').innerHTML;
+    assert.match(html, /<p class="sh-title">Alerts<\/p>/);
+    assert(html.indexOf('Rook') < html.indexOf('Cold Water Gap'), 'newest first');
+    assert(html.indexOf('Cold Water Gap') < html.indexOf('Kestrel'));
+    assert(html.includes('<div class="tx"><b>Kestrel</b> joined (1 player on)</div><small>10 min ago</small>'), html);
+    assert(html.includes('<div class="tx"><b>Rook</b> was kicked by an admin</div><small>2 min ago</small>'));
+    assert(html.includes('<div class="tx">Cold Water Gap started</div><small>5 min ago</small>'));
+    assert(html.includes('<span class="ic k-join"><svg class="i sm"><use href="#join"/>'));
+    assert(html.includes('<span class="ic k-map"><svg class="i sm"><use href="#map"/>'));
+    assert(html.includes('<span class="ic k-kick"><svg class="i sm"><use href="#kick"/>'));
+    assert.strictEqual((html.match(/class="al new"/g) || []).length, 2, 'the two not seen before are marked new');
+    assert.strictEqual(page.local.getItem('wolfseen'), '3');
+    assert(!page.shown('hdr-pip'));
+
+    page.run(`handleWebSocketMessage(${JSON.stringify({type: 'event', event: event4})})`);
+    assert(page.el('sheet-body').innerHTML.indexOf('left') < page.el('sheet-body').innerHTML.indexOf('Rook'), 'a new one shows at the top');
+    assert.strictEqual(page.local.getItem('wolfseen'), '4', 'seen while the sheet is open');
+    assert(!page.shown('hdr-pip'));
+    page.run('closeSheet()');
+    page.run(`handleWebSocketMessage(${JSON.stringify({type: 'event', event: event5})})`);
+    assert(page.shown('hdr-pip'));
+
+    const empty = await signedInPage(stateWith({events: [], events_last_id: 0}));
+    assert(!empty.shown('hdr-pip'));
+    empty.run('openAlerts()');
+    assert.match(empty.el('sheet-body').innerHTML, /<p class="empty">Nothing yet<\/p>/);
+});
+
+test('alert names, texts and kinds are escaped', async () => {
+    const evil = '<img src=x onerror=alert(1)>';
+    const page = await signedInPage(stateWith({
+        events: [
+            {id: 1, ts: NOW, kind: 'join" onclick="x', text: `${evil} joined <b>now</b>`, name: evil},
+            {id: 2, ts: NOW, kind: 'warn', text: 'Warned someone', name: '"><svg onload=alert(2)>'},
+        ],
+        events_last_id: 2,
+    }));
+    page.run('openAlerts()');
+    const html = page.el('sheet-body').innerHTML;
+    assert(!html.includes('<img'), html);
+    assert(!html.includes('<svg onload'), html);
+    assert(!html.includes('onclick="'), 'an unknown kind never reaches the markup');
+    assert(html.includes('<b>&lt;img src=x onerror=alert(1)&gt;</b> joined &lt;b&gt;now&lt;/b&gt;'));
+    assert(html.includes('<b>&quot;&gt;&lt;svg onload=alert(2)&gt;</b> \u00b7 Warned someone'), 'a name not in the text goes in front');
+    assert(html.includes('<use href="#alert"/>'), 'warn uses the warning icon');
+});
+
+test('after a reconnect the missed alerts are fetched, each kept once', async () => {
+    const page = await signedInPage(stateWith({events: EVENTS, events_last_id: 3}));
+    assert(!page.requests.some(r => r.path.startsWith('/api/events')), 'the first state is enough on arrival');
+    page.sockets[0].onclose({code: 1006});
+    page.serve = request => {
+        if (request.path.startsWith('/api/events')) {
+            return respond(200, {events: [EVENTS[2], event4, event5], last_id: 5});
+        }
+        return respond(200, stateWith({events: EVENTS, events_last_id: 3}));
+    };
+    page.run('connectWS()');
+    const socket = page.sockets[1];
+    socket.readyState = 1;
+    socket.onopen();
+    await settle();
+    const fetched = page.requests.filter(r => r.path.startsWith('/api/events'));
+    assert.strictEqual(fetched.length, 1);
+    assert.strictEqual(fetched[0].path, '/api/events?after=3');
+    assert.strictEqual(fetched[0].headers.Authorization, 'Bearer k1');
+    socket.onmessage({data: JSON.stringify(stateWith({events: [...EVENTS, event4, event5], events_last_id: 5}))});
+    socket.onmessage({data: JSON.stringify({type: 'event', event: event5})});
+    assert.deepStrictEqual(page.json('currentEvents.map(e => e.id)'), [1, 2, 3, 4, 5]);
+    assert(page.shown('hdr-pip'));
+});
+
+test('a WolfRAT restart starts the alerts again; a late state does not', async () => {
+    const page = await signedInPage(stateWith({events: EVENTS, events_last_id: 3}), {local: {wolfkey: 'k1', wolfseen: '3'}});
+    // A newer alert on the socket, then a state made a moment before it.
+    page.run(`handleWebSocketMessage(${JSON.stringify({type: 'event', event: event4})})`);
+    page.run(`updateUI(${JSON.stringify(stateWith({events: EVENTS, events_last_id: 3}))})`);
+    assert.deepStrictEqual(page.json('currentEvents.map(e => e.id)'), [1, 2, 3, 4]);
+    assert.strictEqual(page.local.getItem('wolfseen'), '3');
+
+    // WolfRAT restarted: its ids begin at 1 again.
+    const fresh = {id: 1, ts: NOW, kind: 'join', text: 'Moose.UK joined (1 player on)', name: 'Moose.UK'};
+    page.run(`updateUI(${JSON.stringify(stateWith({events: [fresh], events_last_id: 1}))})`);
+    assert.deepStrictEqual(page.json('currentEvents.map(e => e.text)'), ['Moose.UK joined (1 player on)']);
+    assert.strictEqual(page.local.getItem('wolfseen'), null, 'the old seen mark goes');
+    assert(page.shown('hdr-pip'));
+
+    const reloaded = await signedInPage(stateWith({events: EVENTS, events_last_id: 3}), {local: {wolfkey: 'k1', wolfseen: '57'}});
+    assert(reloaded.shown('hdr-pip'), 'a seen mark from before a restart does not hide new alerts');
+});
+
+// ------------------------------------------------------- notifications
+test('Notifications on plain HTTP: one line, and the secure address as a link', async () => {
+    const page = await signedInPage(stateWith({
+        features: PUSH_FEATURES,
+        server: {name: 'srv', secure_address: 'https://wolfrat.example.com'},
+    }));
+    assert(page.shown('tile-notify'));
+    page.serve = request => {
+        assert.strictEqual(request.path, '/api/push');
+        return respond(200, {public_key: PUBLIC_KEY, subscribed: false, first_joins: 2});
+    };
+    page.run(`go('notify')`);
+    await settle();
+    assert(page.shown('nt-insecure'));
+    assert(!page.shown('nt-phone'), 'no Turn on button where it cannot work');
+    assert(!page.shown('nt-install-card'), 'installing needs the secure address too');
+    assert(page.shown('nt-secure-link'));
+    assert.strictEqual(page.el('nt-secure-link').getAttribute('href'), 'https://wolfrat.example.com');
+    assert.strictEqual(page.el('nt-secure-text').textContent, 'https://wolfrat.example.com');
+    assert.strictEqual(page.el('nt-count').textContent, '2', 'the join setting works from here too');
+    assert.strictEqual(page.el('tile-notify-sub').textContent, 'Off');
+
+    page.run(`updateUI(${JSON.stringify(stateWith({features: PUSH_FEATURES, server: {secure_address: 'javascript:alert(1)'}}))})`);
+    assert(!page.shown('nt-secure-link'), 'only an https address becomes a link');
+    assert.strictEqual(page.el('nt-secure-link').getAttribute('href'), '/');
+    page.run(`updateUI(${JSON.stringify(stateWith({features: PUSH_FEATURES}))})`);
+    assert(!page.shown('nt-secure-link'));
+    assert(page.shown('nt-insecure'));
+    page.run(`updateUI(${JSON.stringify(stateWith({features: {...ALL_FEATURES, push: false}}))})`);
+    assert(!page.shown('tile-notify'));
+});
+
+test('Notifications on HTTPS: turn on asks, subscribes with the key and posts the subscription', async () => {
+    const env = fakePush();
+    const page = await signedInPage(stateWith({features: PUSH_FEATURES}), {secure: true, push: env});
+    const posted = [];
+    let pushState = {public_key: PUBLIC_KEY, subscribed: false, first_joins: 2};
+    page.serve = request => {
+        posted.push([request.path, request.body]);
+        if (request.path === '/api/push') return respond(200, pushState);
+        if (request.path === '/api/push/subscribe') {
+            pushState = {...pushState, subscribed: true};
+            return respond(200, {ok: true});
+        }
+        if (request.path === '/api/push/unsubscribe') {
+            pushState = {...pushState, subscribed: false};
+            return respond(200, {ok: true});
+        }
+        if (request.path === '/api/push/test') return respond(200, {ok: true});
+        return respond(404, {error: 'Not Found'});
+    };
+    page.run(`go('notify')`);
+    await settle();
+    assert(!page.shown('nt-insecure'));
+    assert(page.shown('nt-phone'));
+    assert(page.shown('nt-on'));
+    assert(!page.shown('nt-test') && !page.shown('nt-off'));
+    assert.match(page.el('nt-status').textContent, /^Off/);
+
+    await page.run('turnOnNotifications()');
+    assert.strictEqual(env.permissionAsked, 1);
+    assert.strictEqual(env.subscribeCalls.length, 1);
+    assert.strictEqual(env.subscribeCalls[0].userVisibleOnly, true);
+    assert.deepStrictEqual(Array.from(env.subscribeCalls[0].applicationServerKey), KEY_BYTES, 'applicationServerKey = public_key');
+    const subscribe = posted.find(([p]) => p === '/api/push/subscribe');
+    assert.deepStrictEqual(subscribe[1], {subscription: {
+        endpoint: 'https://fcm.googleapis.com/fcm/send/fake-endpoint',
+        expirationTime: null,
+        keys: {p256dh: 'BPfake', auth: 'AUfake'},
+    }});
+    assert(page.shown('nt-test') && page.shown('nt-off'));
+    assert(!page.shown('nt-on'));
+    assert.strictEqual(page.el('nt-chip').textContent, 'ON');
+    assert.strictEqual(page.el('tile-notify-sub').textContent, 'On');
+
+    await page.run('sendTestNotification()');
+    assert.deepStrictEqual(posted[posted.length - 1], ['/api/push/test', {}]);
+    assert.strictEqual(page.el('operation-result').dataset.outcome, 'accepted');
+
+    await page.run('turnOffNotifications()');
+    assert(posted.some(([p]) => p === '/api/push/unsubscribe'));
+    assert.strictEqual(env.unsubscribed, 1, 'the browser lets go of it too');
+    assert(page.shown('nt-on'));
+    assert.strictEqual(page.el('nt-chip').textContent, 'OFF');
+
+    // The buttons are wired.
+    page.el('nt-on').click();
+    await settle();
+    assert.strictEqual(env.subscribeCalls.length, 2);
+});
+
+test('Notifications: blocked, another key, a refused subscription, no Push API', async () => {
+    const blocked = fakePush({answer: 'denied'});
+    const page = await signedInPage(stateWith({features: PUSH_FEATURES}), {secure: true, push: blocked});
+    page.serve = request => respond(200, request.path === '/api/push'
+        ? {public_key: PUBLIC_KEY, subscribed: false, first_joins: 2} : {ok: true});
+    page.run(`go('notify')`);
+    await settle();
+    await page.run('turnOnNotifications()');
+    assert.strictEqual(blocked.subscribeCalls.length, 0);
+    assert(!page.requests.some(r => r.path === '/api/push/subscribe'));
+    assert.match(page.el('operation-result').textContent, /blocked/);
+    assert.strictEqual(page.el('nt-chip').textContent, 'BLOCKED');
+
+    const oldKey = fakePush({permission: 'granted', subscribedWith: new Uint8Array(65).fill(9)});
+    const rekey = await signedInPage(stateWith({features: PUSH_FEATURES}), {secure: true, push: oldKey});
+    rekey.serve = request => respond(200, request.path === '/api/push'
+        ? {public_key: PUBLIC_KEY, subscribed: true, first_joins: 2} : {ok: true});
+    rekey.run(`go('notify')`);
+    await settle();
+    await rekey.run('turnOnNotifications()');
+    assert.strictEqual(oldKey.permissionAsked, 0, 'already allowed');
+    assert.strictEqual(oldKey.unsubscribed, 1, 'a subscription for another key is dropped');
+    assert.strictEqual(oldKey.subscribeCalls.length, 1);
+
+    const refused = fakePush({permission: 'granted'});
+    const bad = await signedInPage(stateWith({features: PUSH_FEATURES}), {secure: true, push: refused});
+    bad.serve = request => (request.path === '/api/push'
+        ? respond(200, {public_key: PUBLIC_KEY, subscribed: false, first_joins: 2})
+        : respond(400, {ok: false, error: 'Unknown push service'}));
+    bad.run(`go('notify')`);
+    await settle();
+    await bad.run('turnOnNotifications()');
+    assert.match(bad.el('operation-result').textContent, /Unknown push service/);
+    assert(bad.shown('nt-on'), 'still off');
+
+    const iphone = await signedInPage(stateWith({features: PUSH_FEATURES}), {secure: true, ua: IPHONE_UA});
+    iphone.serve = () => respond(200, {public_key: PUBLIC_KEY, subscribed: false, first_joins: 2});
+    iphone.run(`go('notify')`);
+    await settle();
+    assert(iphone.shown('nt-phone'));
+    assert(!iphone.shown('nt-on'));
+    assert.match(iphone.el('nt-status').textContent, /Home Screen/);
+    assert.strictEqual(iphone.el('nt-install-text').textContent, 'On iPhone: tap Share, then Add to Home Screen.');
+});
+
+test('the first-joins stepper posts /api/push/settings and stays within 0-5', async () => {
+    const page = await signedInPage(stateWith({features: PUSH_FEATURES}));
+    const posted = [];
+    let refuse = false;
+    page.serve = request => {
+        if (request.path === '/api/push') return respond(200, {public_key: PUBLIC_KEY, subscribed: false, first_joins: 2});
+        posted.push([request.path, request.body]);
+        if (refuse) return respond(200, {ok: false, error: 'Not saved'});
+        return respond(200, {ok: true, first_joins: request.body.first_joins});
+    };
+    page.run(`go('notify')`);
+    await settle();
+    assert.strictEqual(page.el('nt-count').textContent, '2');
+    page.el('nt-plus').click();
+    await settle();
+    assert.deepStrictEqual(posted, [['/api/push/settings', {first_joins: 3}]]);
+    assert.strictEqual(page.el('nt-count').textContent, '3');
+    await page.run('setFirstJoins(5)');
+    assert(page.el('nt-plus').disabled, 'five at most');
+    await page.run('setFirstJoins(9)');
+    assert.strictEqual(posted.length, 2, 'already at the top: nothing sent');
+    await page.run('setFirstJoins(0)');
+    assert.deepStrictEqual(posted[posted.length - 1], ['/api/push/settings', {first_joins: 0}]);
+    assert(page.el('nt-minus').disabled);
+    assert(!page.el('nt-plus').disabled);
+    refuse = true;
+    page.el('nt-plus').click();
+    await settle();
+    assert.strictEqual(page.el('nt-count').textContent, '0', 'a refusal puts the number back');
+    assert.match(page.el('operation-result').textContent, /Not saved/);
+});
+
+test('Install: the browser prompt becomes an Install app button; the app says it is installed', async () => {
+    const env = fakePush();
+    const page = await signedInPage(stateWith({features: PUSH_FEATURES}), {secure: true, push: env});
+    page.serve = () => respond(200, {public_key: PUBLIC_KEY, subscribed: false, first_joins: 2});
+    page.run(`go('notify')`);
+    await settle();
+    assert(!page.shown('nt-install'));
+    assert.match(page.el('nt-install-text').textContent, /browser's menu/);
+    let prevented = false;
+    let prompted = 0;
+    page.fire('beforeinstallprompt', {
+        preventDefault() { prevented = true; },
+        prompt: async () => { prompted += 1; },
+        userChoice: Promise.resolve({outcome: 'accepted'}),
+    });
+    assert(prevented, 'the page shows its own button instead of the browser bar');
+    assert(page.shown('nt-install'));
+    page.el('nt-install').click();
+    await settle();
+    assert.strictEqual(prompted, 1);
+    assert(!page.shown('nt-install'));
+    assert.match(page.el('nt-install-text').textContent, /^Installed/);
+
+    const app = await signedInPage(stateWith({features: PUSH_FEATURES}), {secure: true, push: fakePush(), standalone: true});
+    app.serve = () => respond(200, {public_key: PUBLIC_KEY, subscribed: false, first_joins: 2});
+    app.run(`go('notify')`);
+    await settle();
+    app.fire('beforeinstallprompt', {preventDefault() {}, prompt: async () => {}, userChoice: Promise.resolve({})});
+    assert(!app.shown('nt-install'));
+    assert.strictEqual(app.el('nt-install-text').textContent, 'Installed: you are using the app now.');
+});
+
+// ----------------------------------------------------- service worker
+function loadWorker() {
+    const handlers = {};
+    const worker = {handlers, shown: [], opened: [], windows: []};
+    const scope = {
+        location: {origin: 'https://wolfrat.example.com'},
+        addEventListener: (type, handler) => { handlers[type] = handler; },
+        registration: {
+            showNotification: (title, options) => {
+                worker.shown.push({title, options});
+                return Promise.resolve();
+            },
+        },
+        clients: {
+            matchAll: async options => {
+                worker.matchOptions = options;
+                return worker.windows;
+            },
+            openWindow: async url => {
+                worker.opened.push(url);
+                return {url};
+            },
+            claim: async () => {},
+        },
+        skipWaiting: async () => {},
+    };
+    const context = vm.createContext({
+        self: scope, URL, console,
+        caches: {open: async () => ({put: async () => {}, addAll: async () => {}}), match: async () => null, keys: async () => []},
+        fetch: async () => ({ok: false}),
+        Response: {error: () => ({})},
+    });
+    vm.runInContext(WORKER_SOURCE, context, {filename: workerPath});
+    worker.dispatch = async (type, event) => {
+        const waits = [];
+        handlers[type]({...event, waitUntil: p => waits.push(p), respondWith: p => waits.push(p)});
+        await Promise.all(waits);
+        return waits.length;
+    };
+    return worker;
+}
+
+const plain = value => JSON.parse(JSON.stringify(value));
+
+test('sw.js: a push shows WolfRAT\'s notification with the payload fields', async () => {
+    const worker = loadWorker();
+    await worker.dispatch('push', {data: {json: () => ({
+        title: '[UK] Mixed Maps LC', body: 'Kestrel joined (1 player on)', tag: 'join', url: '/#players',
+    })}});
+    assert.deepStrictEqual(plain(worker.shown[0]), {title: '[UK] Mixed Maps LC', options: {
+        body: 'Kestrel joined (1 player on)',
+        icon: '/static/icon-192.png',
+        badge: '/static/badge-96.png',
+        tag: 'join',
+        renotify: true,
+        data: {url: '/#players'},
+    }});
+    await worker.dispatch('push', {data: {json: () => { throw new Error('not JSON'); }, text: () => 'plain words'}});
+    assert.deepStrictEqual(plain(worker.shown[1]), {title: 'WolfRAT', options: {
+        body: 'plain words', icon: '/static/icon-192.png', badge: '/static/badge-96.png',
+        tag: 'wolfrat', renotify: true, data: {url: '/'},
+    }}, 'renotify always comes with a tag');
+    await worker.dispatch('push', {data: null});
+    assert.strictEqual(worker.shown[2].title, 'WolfRAT');
+});
+
+test('sw.js: a tap focuses an open page and moves it to the url, else opens one', async () => {
+    const worker = loadWorker();
+    const calls = [];
+    const page = {
+        url: 'https://wolfrat.example.com/#now',
+        focused: false,
+        async focus() { calls.push('focus'); return this; },
+        async navigate(url) { calls.push(['navigate', url]); this.url = url; return this; },
+    };
+    worker.windows = [page];
+    let closed = 0;
+    const tap = url => ({notification: {data: {url}, close: () => { closed += 1; }}});
+    await worker.dispatch('notificationclick', tap('/#players'));
+    assert.strictEqual(closed, 1);
+    assert.deepStrictEqual(calls, ['focus', ['navigate', 'https://wolfrat.example.com/#players']]);
+    assert.deepStrictEqual(worker.opened, []);
+    assert.strictEqual(worker.matchOptions.type, 'window');
+
+    calls.length = 0;
+    await worker.dispatch('notificationclick', tap('/#players'));
+    assert.deepStrictEqual(calls, ['focus'], 'already there: just brought forward');
+
+    worker.windows = [];
+    await worker.dispatch('notificationclick', tap('/#more'));
+    await worker.dispatch('notificationclick', tap('https://evil.example/steal'));
+    await worker.dispatch('notificationclick', tap('javascript:alert(1)'));
+    await worker.dispatch('notificationclick', {notification: {data: null, close() {}}});
+    assert.deepStrictEqual(worker.opened, [
+        'https://wolfrat.example.com/#more',
+        'https://wolfrat.example.com/',
+        'https://wolfrat.example.com/',
+        'https://wolfrat.example.com/',
+    ], 'only pages of this WolfRAT open');
+});
+
+test('sw.js still never answers /api or /ws, and keeps the app shell', async () => {
+    const worker = loadWorker();
+    for (const path of ['/api/status', '/api/events?after=3', '/ws']) {
+        const answered = await worker.dispatch('fetch', {request: {method: 'GET', url: `https://wolfrat.example.com${path}`}});
+        assert.strictEqual(answered, 0, `${path} goes straight to WolfRAT`);
+    }
+    assert.strictEqual(await worker.dispatch('fetch', {request: {method: 'POST', url: 'https://wolfrat.example.com/'}}), 0);
+    assert.strictEqual(await worker.dispatch('fetch', {request: {method: 'GET', url: 'https://wolfrat.example.com/'}}), 1);
 });
 
 // ------------------------------------------------------------------- run

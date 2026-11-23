@@ -15,6 +15,9 @@
 const STORE_KEY = 'wolfkey';
 const OLD_STORE_KEYS = ['wolfauth', 'wolftoken', 'wolfuser'];
 const QUICK_STORE_KEY = 'wolfquick';
+const SEEN_STORE_KEY = 'wolfseen';    // the newest alert id this phone has seen
+const EVENTS_KEEP = 100;
+const FIRST_JOINS_MAX = 5;
 const PAIR_ALPHABET = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
 const PAIR_LENGTH = 6;
 const DEFAULT_CHAT_MAX = 51;          // stock 59-character line less "[ADMIN] "
@@ -71,8 +74,13 @@ const COMMANDS = [
     ['!sky', '<scene> | off | list', 'Sky scene'],
 ];
 const TEAM_NAMES = {1: 'Joint Ops', 2: 'Rebels'};
-const SCREENS = ['now', 'players', 'chat', 'maps', 'more', 'weather', 'lagcomp', 'help'];
-const SUBPAGES = {weather: 'more', lagcomp: 'more', help: 'more'};
+const SCREENS = ['now', 'players', 'chat', 'maps', 'more', 'weather', 'lagcomp', 'notify', 'help'];
+const SUBPAGES = {weather: 'more', lagcomp: 'more', notify: 'more', help: 'more'};
+// Alert kind -> sprite icon. Other kinds get the info icon.
+const EVENT_ICON = {
+    join: 'join', leave: 'leave', map: 'map', vote: 'vote',
+    kick: 'kick', ban: 'ban', warn: 'alert', server: 'server',
+};
 const BAND_CLASS = ['g', 'o', 'r'];
 const ACTION_WORDS = {
     kick: 'Kick', ban: 'Ban', warn: 'Warn', kill: 'Kill',
@@ -134,6 +142,20 @@ let fogDragging = false;
 let devices = null;
 let typingTimer = null;
 let busyActions = new Set();
+let currentEvents = [];                // alerts, oldest first, one per id
+let eventsLastId = 0;                  // the newest alert id this page holds
+let eventsSupported = null;            // null until a state says (older WolfRATs send none)
+let eventsCatchingUp = false;
+let alertsBefore = 0;                  // the seen mark when the Alerts sheet opened
+let socketOpenedOnce = false;
+let pushInfo = null;                   // GET /api/push: {public_key, subscribed, first_joins}
+let pushLoading = false;
+let pushFailed = false;
+let pushBrowserSub = null;             // this browser's push subscription, when it has one
+let pushBusy = false;
+let stepBusy = false;
+let installPrompt = null;              // Android Chrome's beforeinstallprompt event
+let appInstalled = false;
 
 // ------------------------------------------------------------------- helpers
 function $(id) {
@@ -763,6 +785,8 @@ function signedOut(message, tone) {
     closeSheet(true);
     lastState = null;
     devices = null;
+    pushInfo = null;                      // "subscribed" belongs to the old key
+    pushBrowserSub = null;
     linkState = 'connecting';
     showSignin(message, tone);
 }
@@ -874,6 +898,9 @@ function connectWS() {
         reconnectDelay = RECONNECT_MIN_MS;
         setLinkState('open');
         showApp();
+        // Back after a drop: fetch the alerts missed meanwhile.
+        if (socketOpenedOnce && eventsSupported !== false) catchUpEvents();
+        socketOpenedOnce = true;
     };
     socket.onmessage = event => {
         if (ws !== socket) return;
@@ -913,6 +940,8 @@ function handleWebSocketMessage(data) {
     const type = String(data.type || '');
     if (type === 'state') {
         updateUI(data);
+    } else if (type === 'event') {
+        if (data.event && typeof data.event === 'object') mergeEvents([data.event], false);
     } else if (type === 'chat') {
         updateChat(Array.isArray(data.chat) ? data.chat : []);
     } else if (type === 'error' || type.endsWith('_result')) {
@@ -977,7 +1006,11 @@ function showScreen(name, force) {
     } else {
         try { window.scrollTo(0, 0); } catch (error) { /* ignore */ }
     }
-    if (name === 'more' && was !== 'more') loadDevices();
+    if (name === 'more' && was !== 'more') {
+        loadDevices();
+        loadPush();
+    }
+    if (name === 'notify' && was !== 'notify') loadPush();
 }
 
 function scrollToId(id) {
@@ -1119,12 +1152,15 @@ function updateUI(state) {
     currentPlayers = Array.isArray(state.players) ? state.players : [];
     currentMissions = Array.isArray(state.missions) ? state.missions : [];
     applyFeatures();
+    stateEvents(state);
     renderHeader();
     renderNow();
     renderPlayers(currentPlayers);
     if (Array.isArray(state.chat)) updateChat(state.chat);
     renderMaps(currentMissions);
     renderMore();
+    renderNotify();
+    if (currentScreen === 'notify' && !pushInfo && !pushFailed) loadPush();
     renderWeather();
     renderLagComp();
     refreshOpenSheet();
@@ -1324,6 +1360,148 @@ function renderHeader() {
         badge.textContent = String(count);
         show(badge, count > 0);
     }
+}
+
+// ------------------------------------------------- alerts (the bell)
+function eventId(e) {
+    if (!e || typeof e !== 'object') return null;
+    const id = num(e.id);
+    return id !== null && Number.isInteger(id) && id >= 0 ? id : null;
+}
+
+function seenEventId() {
+    const n = num(readStore(SEEN_STORE_KEY));
+    return n !== null && n > 0 ? Math.floor(n) : 0;
+}
+
+function newestEventId() {
+    return currentEvents.length ? eventId(currentEvents[currentEvents.length - 1]) : 0;
+}
+
+function sameEvent(a, b) {
+    return !!a && !!b && String(a.ts) === String(b.ts) && String(a.text) === String(b.text);
+}
+
+/**
+ * WolfRAT keeps its alerts in memory only, so after a restart the ids start
+ * again. A state with a lower last id is a restart, unless it still holds
+ * alerts this page has (a newer one came on the socket a moment earlier).
+ */
+function eventsRestarted(list, lastId) {
+    const last = num(lastId);
+    if (last === null || last >= eventsLastId) return false;
+    const held = new Map(currentEvents.map(e => [eventId(e), e]));
+    return !list.some(e => sameEvent(held.get(eventId(e)), e));
+}
+
+/** Add alerts (the state's, one from the socket, or a catch-up): one per id, oldest first. */
+function mergeEvents(list, restarted) {
+    const before = currentEvents.map(eventId).join(',');
+    if (restarted) {
+        currentEvents = [];
+        eventsLastId = 0;
+        dropStore(SEEN_STORE_KEY);
+    }
+    const byId = new Map(currentEvents.map(e => [eventId(e), e]));
+    (Array.isArray(list) ? list : []).forEach(e => {
+        const id = eventId(e);
+        if (id !== null) byId.set(id, e);
+    });
+    currentEvents = Array.from(byId.values())
+        .sort((a, b) => eventId(a) - eventId(b))
+        .slice(-EVENTS_KEEP);
+    eventsLastId = Math.max(eventsLastId, newestEventId());
+    if (restarted || currentEvents.map(eventId).join(',') !== before) eventsChanged();
+    else renderBell();
+}
+
+function stateEvents(state) {
+    eventsSupported = Array.isArray(state.events);
+    show('hdr-bell', eventsSupported);
+    if (!eventsSupported) return;
+    const lastId = num(state.events_last_id);
+    const restarted = eventsRestarted(state.events, lastId);
+    // First state of this visit: a seen mark above all WolfRAT has was set
+    // before WolfRAT restarted.
+    if (!restarted && !currentEvents.length && lastId !== null && seenEventId() > lastId) {
+        dropStore(SEEN_STORE_KEY);
+    }
+    mergeEvents(state.events, restarted);
+}
+
+/** After the socket comes back: the alerts missed meanwhile (the state holds the last 50). */
+async function catchUpEvents() {
+    if (!deviceKey || eventsCatchingUp) return;
+    eventsCatchingUp = true;
+    const after = eventsLastId;
+    try {
+        const res = await api(`/api/events?after=${after}`);
+        if (!res.ok || !Array.isArray(res.data.events)) return;
+        const last = num(res.data.last_id);
+        mergeEvents(res.data.events, last !== null && last < after && last < eventsLastId);
+    } finally {
+        eventsCatchingUp = false;
+    }
+}
+
+function renderBell() {
+    const unread = newestEventId() > seenEventId();
+    show('hdr-pip', unread);
+    const bell = $('hdr-bell');
+    if (bell) bell.setAttribute('aria-label', unread ? 'Alerts, new ones' : 'Alerts');
+}
+
+function markEventsSeen() {
+    const newest = newestEventId();
+    if (newest > seenEventId()) writeStore(SEEN_STORE_KEY, String(newest));
+    renderBell();
+}
+
+function eventsChanged() {
+    if (sheet && sheet.kind === 'alerts') {
+        const body = $('sheet-body');
+        if (body) body.innerHTML = alertsHtml(alertsBefore);
+        markEventsSeen();
+        return;
+    }
+    renderBell();
+}
+
+/** The alert's text with the player's name in bold. */
+function eventLine(e) {
+    const text = e.text === null || e.text === undefined ? '' : String(e.text);
+    const name = e.name === null || e.name === undefined ? '' : String(e.name);
+    if (!name) return esc(text);
+    const at = text.indexOf(name);
+    if (at < 0) return `<b>${esc(name)}</b>${text ? esc(DOT + text) : ''}`;
+    return `${esc(text.slice(0, at))}<b>${esc(name)}</b>${esc(text.slice(at + name.length))}`;
+}
+
+function eventAgo(e) {
+    const date = toDate(e.ts);
+    if (!date) return '';
+    const text = agoText(date);
+    return text === 'now' ? 'just now' : text;
+}
+
+function alertRowHtml(e, before) {
+    const kind = Object.prototype.hasOwnProperty.call(EVENT_ICON, e.kind) ? e.kind : '';
+    const fresh = eventId(e) > before ? ' new' : '';
+    return `<div class="al${fresh}"><span class="ic${kind ? ` k-${kind}` : ''}"><svg class="i sm"><use href="#${kind ? EVENT_ICON[kind] : 'info'}"/></svg></span>`
+        + `<div class="main"><div class="tx">${eventLine(e)}</div><small>${esc(eventAgo(e))}</small></div></div>`;
+}
+
+function alertsHtml(before) {
+    const rows = currentEvents.slice().reverse().map(e => alertRowHtml(e, before));
+    return '<p class="sh-title">Alerts</p>'
+        + (rows.length ? `<div class="alerts">${rows.join('')}</div>` : '<p class="empty">Nothing yet</p>');
+}
+
+/** The bell: the Alerts sheet, newest first; opening it marks them all read. */
+function openAlerts() {
+    alertsBefore = seenEventId();
+    openSheet('alerts', alertsHtml(alertsBefore), {});
+    markEventsSeen();
 }
 
 // ---------------------------------------------------------------- NOW
@@ -2374,6 +2552,300 @@ function setMode(mode) {
     return submitHttpOperation('/api/mode', {mode}, {label: mode === 'manual' ? 'Manual mode' : 'Full mode'});
 }
 
+// --------------------------------------------------------- NOTIFICATIONS
+function isIphone() {
+    const ua = String((typeof navigator !== 'undefined' && navigator.userAgent) || '');
+    return /iPhone|iPad|iPod/.test(ua);
+}
+
+function runningInstalled() {
+    try {
+        if (typeof window.matchMedia === 'function' && window.matchMedia('(display-mode: standalone)').matches) {
+            return true;
+        }
+    } catch (error) { /* ignore */ }
+    return typeof navigator !== 'undefined' && navigator.standalone === true;
+}
+
+/** 'insecure' (plain HTTP), 'unsupported' (no Push API in this browser) or 'ok'. */
+function pushSupport() {
+    if (typeof window === 'undefined' || window.isSecureContext !== true) return 'insecure';
+    if (typeof navigator === 'undefined' || !navigator.serviceWorker
+        || typeof window.PushManager === 'undefined' || typeof window.Notification === 'undefined') {
+        return 'unsupported';
+    }
+    return 'ok';
+}
+
+function notifyPermission() {
+    try {
+        return String(window.Notification.permission || 'default');
+    } catch (error) {
+        return 'default';
+    }
+}
+
+/** The server's secure (HTTPS) address for phones, when it sent one. */
+function secureAddress() {
+    const server = obj(lastState && lastState.server);
+    const raw = server.secure_address || features.secure_address;
+    const text = typeof raw === 'string' ? raw.trim() : '';
+    return /^https:\/\/[^\s"'<>\\]+$/i.test(text) ? text : '';
+}
+
+function base64UrlBytes(text) {
+    const clean = String(text || '').replace(/-/g, '+').replace(/_/g, '/').replace(/\s+/g, '');
+    const raw = atob(clean + '='.repeat((4 - (clean.length % 4)) % 4));
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i += 1) bytes[i] = raw.charCodeAt(i);
+    return bytes;
+}
+
+/** A subscription made with another WolfRAT key can't carry this one's messages. */
+function subscriptionKeyMatches(sub, bytes) {
+    try {
+        const key = sub && sub.options && sub.options.applicationServerKey;
+        if (!key) return true;
+        const have = new Uint8Array(key);
+        return have.length === bytes.length && have.every((value, i) => value === bytes[i]);
+    } catch (error) {
+        return true;
+    }
+}
+
+/** The service worker, once it runs (push needs it). Null if it never starts. */
+function swReady() {
+    try {
+        const ready = Promise.resolve(navigator.serviceWorker.ready).then(reg => reg || null, () => null);
+        const late = new Promise(resolve => setTimeout(() => resolve(null), 10000));
+        return Promise.race([ready, late]);
+    } catch (error) {
+        return Promise.resolve(null);
+    }
+}
+
+async function browserSubscription() {
+    try {
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (!reg || !reg.pushManager) return null;
+        return (await reg.pushManager.getSubscription()) || null;
+    } catch (error) {
+        return null;
+    }
+}
+
+async function loadPush() {
+    if (!features.push || pushLoading) return;
+    pushLoading = true;
+    try {
+        const res = await api('/api/push');
+        if (res.status === 401) {
+            signedOut(SIGNED_OUT_TEXT);
+            return;
+        }
+        pushFailed = !res.ok;
+        if (res.ok) pushInfo = obj(res.data);
+        if (pushSupport() === 'ok') pushBrowserSub = await browserSubscription();
+    } finally {
+        pushLoading = false;
+    }
+    renderNotify();
+}
+
+function pushIsOn() {
+    return !!(pushInfo && pushInfo.subscribed === true && pushBrowserSub);
+}
+
+function firstJoins() {
+    const n = num(pushInfo && pushInfo.first_joins);
+    return n === null ? null : Math.max(0, Math.round(n));
+}
+
+function phoneStatus(support) {
+    if (support === 'unsupported') {
+        return isIphone() && !runningInstalled()
+            ? ['On iPhone, add WolfRAT to the Home Screen first (Share, then Add to Home Screen) and turn them on in the app.', 'OFF', '']
+            : ["This browser can't show notifications from WolfRAT.", 'OFF', ''];
+    }
+    if (!pushInfo) {
+        return [pushFailed ? "Couldn't load the notification settings." : `Checking${ELLIPSIS}`, DASH, ''];
+    }
+    if (!pushInfo.public_key) return ['This WolfRAT sent no notification key.', 'OFF', ''];
+    if (pushIsOn()) return ['On: this phone gets the alerts below.', 'ON', 'g'];
+    if (notifyPermission() === 'denied') {
+        return ["Blocked: allow notifications for this site in the browser's settings.", 'BLOCKED', 'r'];
+    }
+    return ['Off: this phone gets no notifications.', 'OFF', ''];
+}
+
+function installText(support) {
+    if (runningInstalled()) return 'Installed: you are using the app now.';
+    if (appInstalled) return 'Installed: open WolfRAT from the home screen.';
+    if (installPrompt) return 'Put WolfRAT on the home screen; it opens like an app, without the browser bars.';
+    if (isIphone()) return 'On iPhone: tap Share, then Add to Home Screen.';
+    return support === 'ok' || support === 'unsupported'
+        ? "Use the browser's menu: Install app, or Add to Home screen."
+        : '';
+}
+
+function renderNotify() {
+    const support = pushSupport();
+    show('tile-notify', !!features.push);
+    setText('tile-notify-sub', !pushInfo ? 'Player joins' : pushIsOn() ? 'On' : 'Off');
+
+    // Plain HTTP: one line, and the secure address when WolfRAT knows it.
+    show('nt-insecure', support === 'insecure');
+    const address = secureAddress();
+    const link = $('nt-secure-link');
+    if (link) {
+        link.setAttribute('href', address || '/');
+        setText('nt-secure-text', address);
+        show(link, !!address);
+    }
+
+    show('nt-phone', support !== 'insecure');
+    const [status, chipText, tone] = phoneStatus(support);
+    setText('nt-status', status);
+    const chipEl = $('nt-chip');
+    if (chipEl) {
+        chipEl.textContent = chipText;
+        chipEl.className = 'chip' + (tone ? ` ${tone}` : '');
+    }
+    const ready = support === 'ok' && !!pushInfo && !!pushInfo.public_key;
+    const on = pushIsOn();
+    show('nt-on', ready && !on);
+    show('nt-test', ready && on);
+    show('nt-off', ready && on);
+    ['nt-on', 'nt-test', 'nt-off'].forEach(id => {
+        const button = $(id);
+        if (button) button.disabled = pushBusy;
+    });
+
+    const count = firstJoins();
+    setText('nt-count', count === null ? DASH : String(count));
+    const minus = $('nt-minus');
+    if (minus) minus.disabled = count === null || count <= 0 || stepBusy;
+    const plus = $('nt-plus');
+    if (plus) plus.disabled = count === null || count >= FIRST_JOINS_MAX || stepBusy;
+
+    const install = installText(support);
+    show('nt-install-head', !!install);
+    show('nt-install-card', !!install);
+    setText('nt-install-text', install);
+    show('nt-install', !!installPrompt && !runningInstalled());
+}
+
+async function runPush(work) {
+    if (pushBusy) return null;
+    pushBusy = true;
+    renderNotify();
+    try {
+        return await work();
+    } finally {
+        pushBusy = false;
+        renderNotify();
+    }
+}
+
+/** Asks for permission, subscribes with WolfRAT's key and gives WolfRAT the subscription. */
+function turnOnNotifications() {
+    if (pushSupport() !== 'ok') return Promise.resolve(null);
+    const key = pushInfo && typeof pushInfo.public_key === 'string' ? pushInfo.public_key : '';
+    if (!key) return Promise.resolve(null);
+    return runPush(async () => {
+        try {
+            let permission = notifyPermission();
+            if (permission !== 'granted') permission = await window.Notification.requestPermission();
+            if (permission !== 'granted') {
+                showToast(permission === 'denied'
+                    ? 'Notifications are blocked for this site. Allow them in the browser settings, then try again.'
+                    : 'Notifications were not allowed.', 'rejected');
+                return null;
+            }
+            const reg = await swReady();
+            if (!reg || !reg.pushManager) {
+                showToast("Couldn't start notifications here. Reload the page and try again.", 'error');
+                return null;
+            }
+            const bytes = base64UrlBytes(key);
+            let sub = await reg.pushManager.getSubscription();
+            if (sub && !subscriptionKeyMatches(sub, bytes)) {
+                try { await sub.unsubscribe(); } catch (error) { /* ignore */ }
+                sub = null;
+            }
+            if (!sub) sub = await reg.pushManager.subscribe({userVisibleOnly: true, applicationServerKey: bytes});
+            const subscription = typeof sub.toJSON === 'function' ? sub.toJSON() : sub;
+            const result = await submitHttpOperation('/api/push/subscribe', {subscription}, {label: 'Notifications on'});
+            if (isDone(result)) {
+                pushBrowserSub = sub;
+                pushInfo = {...pushInfo, subscribed: true};
+            }
+            return result;
+        } catch (error) {
+            showToast(`Couldn't turn on notifications ${DASH} ${error && error.message ? error.message : 'error'}`, 'error');
+            return null;
+        }
+    });
+}
+
+function sendTestNotification() {
+    return runPush(() => submitHttpOperation('/api/push/test', {}, {label: 'Test notification'}));
+}
+
+function turnOffNotifications() {
+    return runPush(async () => {
+        const result = await submitHttpOperation('/api/push/unsubscribe', {}, {label: 'Notifications off'});
+        const sub = pushBrowserSub || await browserSubscription();
+        if (sub && typeof sub.unsubscribe === 'function') {
+            try { await sub.unsubscribe(); } catch (error) { /* ignore */ }
+        }
+        pushBrowserSub = null;
+        if (pushInfo) pushInfo = {...pushInfo, subscribed: false};
+        return result;
+    });
+}
+
+/** The first N players who join an empty server (for every phone): 0-5. */
+async function setFirstJoins(value) {
+    const before = firstJoins();
+    if (before === null || stepBusy) return null;
+    const n = Math.max(0, Math.min(FIRST_JOINS_MAX, Math.round(Number(value))));
+    if (!Number.isFinite(n) || n === before) return null;
+    stepBusy = true;
+    pushInfo = {...pushInfo, first_joins: n};
+    renderNotify();
+    let result = null;
+    try {
+        result = await submitHttpOperation('/api/push/settings', {first_joins: n},
+            {label: n ? `Join notifications: first ${n}` : 'Join notifications off'});
+    } finally {
+        stepBusy = false;
+        const saved = num(result && result.first_joins);
+        if (pushInfo) pushInfo = {...pushInfo, first_joins: isDone(result) ? (saved === null ? n : saved) : before};
+        renderNotify();
+    }
+    return result;
+}
+
+function onInstallPrompt(event) {
+    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+    installPrompt = event;
+    renderNotify();
+}
+
+async function installApp() {
+    const prompt = installPrompt;
+    if (!prompt || typeof prompt.prompt !== 'function') return null;
+    installPrompt = null;                 // each prompt works once
+    try {
+        await prompt.prompt();
+        const choice = await prompt.userChoice;
+        if (choice && choice.outcome === 'accepted') appInstalled = true;
+    } catch (error) { /* the browser would not show it */ }
+    renderNotify();
+    return null;
+}
+
 // --------------------------------------------------------------- WEATHER
 function clampFog(value) {
     return Math.max(FOG_MIN, Math.min(FOG_MAX, Math.round(value)));
@@ -2595,9 +3067,20 @@ function bindEvents() {
         if (event.key === 'Escape' && sheet) closeSheet();
     });
     on(window, 'popstate', onPopState);
+    // A notification tap can point an open page at another screen (/#players).
+    on(window, 'hashchange', () => {
+        if (appShown && !sheet) routeFromHash();
+    });
     on(document, 'visibilitychange', onWake);
     on(window, 'online', onWake);
+    on(window, 'beforeinstallprompt', onInstallPrompt);
+    on(window, 'appinstalled', () => {
+        installPrompt = null;
+        appInstalled = true;
+        renderNotify();
+    });
 
+    on($('hdr-bell'), 'click', openAlerts);
     on($('hdr-refresh'), 'click', refreshNow);
     on($('hdr-manual'), 'click', () => {
         go('more');
@@ -2649,6 +3132,12 @@ function bindEvents() {
         setLagComp(!lc.enabled);
     });
     on($('dev-refresh'), 'click', loadDevices);
+    on($('nt-on'), 'click', () => turnOnNotifications());
+    on($('nt-test'), 'click', () => sendTestNotification());
+    on($('nt-off'), 'click', () => turnOffNotifications());
+    on($('nt-minus'), 'click', () => setFirstJoins((firstJoins() || 0) - 1));
+    on($('nt-plus'), 'click', () => setFirstJoins((firstJoins() || 0) + 1));
+    on($('nt-install'), 'click', () => installApp());
 
     on($('pair-code'), 'input', onPairInput);
     on($('pair-code'), 'focus', renderPairBoxes);

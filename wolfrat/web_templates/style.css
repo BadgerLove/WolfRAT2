@@ -53,6 +53,7 @@ svg.i.sm{width:18px;height:18px}
 .live.bad{background:var(--bad);box-shadow:0 0 0 3px var(--bad-soft)}
 .ibtn{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;background:var(--s2);border:1px solid var(--line);position:relative;flex:none;color:var(--muted)}
 .ibtn.spin svg{animation:spin .9s linear infinite}
+.ibtn .pip{position:absolute;top:8px;right:9px;width:11px;height:11px;border-radius:50%;background:var(--bad);border:2px solid var(--s2)}
 @keyframes spin{to{transform:rotate(360deg)}}
 .tag{font-size:10.5px;font-weight:800;letter-spacing:.08em;color:var(--warn);border:1px solid rgba(255,176,32,.5);border-radius:6px;padding:3px 7px;flex:none}
 .linkbar{position:sticky;top:calc(63px + var(--safe-t));z-index:19;margin:0;padding:8px 16px;font-size:13px;font-weight:700;
@@ -287,6 +288,31 @@ body.typing .composer{bottom:0;padding-bottom:calc(10px + var(--safe-b))}
 .seg button.on{background:var(--accent);color:var(--accent-ink)}
 .back{display:flex;align-items:center;gap:8px;margin:2px 2px 12px;color:var(--muted);padding:4px 0}
 .back b{font-size:18px;color:var(--text)}
+
+/* ---------- alerts (the bell's sheet) ---------- */
+.alerts{margin-top:4px}
+.al{display:flex;align-items:flex-start;gap:12px;padding:11px 2px;border-top:1px solid var(--line)}
+.al:first-child{border-top:0}
+.al .ic{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;background:var(--s3);color:var(--muted);flex:none}
+.al .ic.k-join{background:var(--ok-soft);color:var(--ok)}
+.al .ic.k-map{background:var(--accent-soft);color:var(--accent)}
+.al .ic.k-vote,.al .ic.k-server{background:var(--info-soft);color:var(--info)}
+.al .ic.k-kick,.al .ic.k-warn{background:var(--warn-soft);color:var(--warn)}
+.al .ic.k-ban{background:var(--bad-soft);color:var(--bad)}
+.al .main{flex:1;min-width:0;padding-top:1px}
+.al .tx{font-size:14.5px;overflow-wrap:anywhere}
+.al .tx b{font-weight:800}
+.al small{display:block;color:var(--faint);font-size:12px;margin-top:2px}
+.al.new .tx::before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--bad);margin-right:7px;vertical-align:1px}
+
+/* ---------- notifications ---------- */
+.note.first{margin-top:0;color:var(--muted);font-size:14px}
+.seclink{display:flex;align-items:center;gap:8px;margin-top:12px;padding:12px 14px;border-radius:14px;background:var(--accent-soft);color:var(--accent);font-weight:800;font-size:15px;text-decoration:none;overflow-wrap:anywhere}
+.stepper{display:flex;align-items:center;gap:2px;flex:none;background:var(--s2);border:1px solid var(--line);border-radius:14px;padding:3px}
+.stepper button{width:40px;height:40px;border-radius:11px;font-size:22px;font-weight:800;color:var(--accent);display:grid;place-items:center;text-align:center}
+.stepper button:disabled{color:var(--faint);opacity:1}
+.stepper b{min-width:26px;text-align:center;font-size:18px;font-weight:800}
+.ic2{width:40px;height:40px;border-radius:12px;display:grid;place-items:center;background:var(--s3);color:var(--accent);flex:none}
 
 /* ---------- weather ---------- */
 .wx{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px}
