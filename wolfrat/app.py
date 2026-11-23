@@ -10557,6 +10557,8 @@ class MainWindow(QMainWindow):
             ("web server", self.web_server.stop),
             ("stats database", self.stats_store.close),
             ("career database", self.career_panel.shutdown),
+            # what auto-tune per player has learned (saved at most once a minute)
+            ("lag comp auto-tune", self.lag_comp_panel.shutdown),
         ]
         if self.runtime.telemetry_enabled:
             from wolfrat import bstats

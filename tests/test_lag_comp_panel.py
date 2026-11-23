@@ -864,3 +864,369 @@ def test_values_an_admin_chose_are_not_moved_and_a_stock_server_is_not_switched_
     # Restarted server, "put it back" unticked: the level step must not switch it on.
     p.server_tick(_Mem(), writable=True)
     assert not p.on_cb.isChecked()
+
+
+# ------------------------------------------- auto-tune per player (2026-11-23)
+# tmp/autotune2/SPEC.md: each player's own Extra, learned by WolfRAT from the
+# version 6 helper's tune rows and written back into the server.
+import dataclasses  # noqa: E402
+import struct  # noqa: E402
+
+from wolfrat import player_tune as pt  # noqa: E402
+
+EZ, A99, NEW, LOCKY = lc.name_hash("ez"), lc.name_hash("A-99"), lc.name_hash("Newbie"), \
+    lc.name_hash("Locky")
+
+
+def _tune_row(slot, name, ping, center=70, **kw):
+    return lc.PlayerTuneRow(slot, name, ping, 0x100 + slot, center_ms=center, **kw)
+
+
+def _v6_state(rows, pt_apply=0):
+    state = _v5_state()
+    state.settings = lc.Settings(False, 70, 300, 0)      # the helper's own auto-tune: Off
+    s = state.stats
+    s.has_v6, s.pt_apply, s.pt_spread_ms = True, pt_apply, 40
+    s.players = [lc.PlayerStats(r.slot, r.name, r.ping, r.ping + 70, 900, 300, 250, 60, 10)
+                 for r in rows if r.present]
+    s.player_tune = list(rows)
+    return state
+
+
+def _four():
+    return [_tune_row(3, "ez", 45), _tune_row(9, "A-99", 120), _tune_row(5, "Newbie", 80),
+            _tune_row(7, "Locky", 60)]
+
+
+def _learned(p):
+    p._tuner.players["ez"] = pt.PlayerEntry("ez", offset=-20)
+    p._tuner.players["A-99"] = pt.PlayerEntry("A-99", offset=40)
+    p._tuner.players["Locky"] = pt.PlayerEntry("Locky", offset=20, locked=True)
+
+
+def _own(p):
+    t = p.players_table
+    return {t.item(r, 0).text(): t.item(r, panel_mod.OWN_COLUMN).text() for r in range(t.rowCount())}
+
+
+def _mode(p, mode):
+    p._settings = dataclasses.replace(p._settings, tune_mode=mode)
+
+
+def test_the_auto_tune_combo_and_help_say_it_is_per_player(qtbot, tmp_path, monkeypatch):
+    p = _panel(qtbot, tmp_path, monkeypatch, lc.State(lc.STOCK))
+    items = [(p.tune_combo.itemText(i), p.tune_combo.itemData(i)) for i in range(p.tune_combo.count())]
+    assert items == [
+        ("Off - every player uses the Extra above", lc.TUNE_OFF),
+        ("Watch - learn each player's best Extra and show it, change nothing", lc.TUNE_WATCH),
+        ("On - each player gets their own learned Extra (within limits)", lc.TUNE_APPLY)]
+    assert p.tune_combo.currentData() == lc.TUNE_WATCH                 # a new install watches
+    assert "<b>Auto-tune per player</b> learns each player's own Extra" in panel_mod._HELP
+    assert "at most once per 150 such shots" in panel_mod._HELP
+    assert "2 ms a minute" not in panel_mod._HELP                     # the retired one
+    # The combo does not size the column by its longest item (1024x768), and its
+    # list still shows every item in full.
+    longest = max(p.tune_combo.fontMetrics().horizontalAdvance(t) for t, _ in panel_mod.TUNE_ITEMS)
+    assert p.tune_combo.minimumSizeHint().width() < longest
+    assert p.tune_combo.sizeHint().width() < longest
+    assert p.tune_combo.view().minimumWidth() > longest
+    assert [p.tune_combo.itemData(i, panel_mod.Qt.ItemDataRole.ToolTipRole)
+            for i in range(3)] == [t for t, _ in panel_mod.TUNE_ITEMS]
+
+
+def test_settings_step_2_turns_the_old_on_into_watch_once(qtbot, tmp_path, monkeypatch):
+    level1 = {"on": True, "extra_ms": 70, "max_ms": 300, "min_ping_ms": 0, "reapply": True,
+              "auto_enabled_once": True, "defaults_level": 1}
+    out, moved = lc.apply_settings_steps(dict(level1, tune_mode=lc.TUNE_APPLY))
+    assert out["tune_mode"] == lc.TUNE_WATCH and out["defaults_level"] == 2 == lc.SETTINGS_LEVEL
+    assert moved == ["Auto-tune per player On -> Watch"]
+    for mode in (lc.TUNE_OFF, lc.TUNE_WATCH):                         # an admin's choice stays
+        out, moved = lc.apply_settings_steps(dict(level1, tune_mode=mode))
+        assert out["tune_mode"] == mode and moved == []
+    out, moved = lc.apply_settings_steps(dict(level1, tune_mode=lc.TUNE_APPLY, defaults_level=2))
+    assert out["tune_mode"] == lc.TUNE_APPLY and moved == []          # On again after it: stays
+    # On the page: once, said once, saved.
+    import json
+    (tmp_path / "lc.json").write_text(json.dumps(dict(level1, tune_mode=lc.TUNE_APPLY)),
+                                      encoding="utf-8")
+    monkeypatch.setattr(lc, "loaded_name", lambda data_dir: "wolfrat_lagcomp_test.dll")
+    logs = []
+    p = panel_mod.LagCompPanel(tmp_path / "lc.json", tmp_path / "lc_history.json", tmp_path,
+                               log=logs.append)
+    qtbot.addWidget(p)
+    assert p.tune_combo.currentData() == lc.TUNE_WATCH
+    assert _saved(tmp_path)["tune_mode"] == lc.TUNE_WATCH and _saved(tmp_path)["defaults_level"] == 2
+    assert [line for line in logs if "Recommended" in line] == [
+        "Lag compensation: Recommended settings applied once: Auto-tune per player On -> Watch. "
+        "Change them back on this page if you prefer."]
+
+
+def test_the_own_extra_column(qtbot, tmp_path, monkeypatch):
+    state = _v6_state(_four())
+    p = _panel(qtbot, tmp_path, monkeypatch, state)
+    _learned(p)
+    p._refresh_stats(force=True)
+    assert _header(p.players_table) == ["Player", "Ping", "Rewind", "Own Extra", "Checks", "Hits",
+                                        "Without", "Gain"]
+    assert p.players_table.horizontalHeaderItem(panel_mod.OWN_COLUMN).toolTip() == \
+        panel_mod.OWN_EXTRA_TIP
+    assert _own(p) == {"ez": "+50 (watch)", "A-99": "+110 (watch)", "Newbie": "server",
+                       "Locky": "locked"}
+    row = next(r for r in range(4) if p.players_table.item(r, 0).text() == "ez")
+    tip = p.players_table.item(row, panel_mod.OWN_COLUMN).toolTip()
+    assert tip.startswith("ez: learned +50 (-20 on the server's +70).")
+    assert "Since the last move: -40 disagreed with the current answer 0 times" in tip
+    # On: a value the helper has not taken on yet says so.
+    _mode(p, lc.TUNE_APPLY)
+    p._refresh_stats(force=True)
+    assert _own(p)["ez"] == "+50 (waiting)" and _own(p)["Newbie"] == "server (waiting)"
+    ez = state.stats.player_tune[0]
+    ez.want_hash, ez.want_extra_ms, ez.want_seq = EZ, 50, 2
+    ez.use_extra_ms, ez.use_seq, ez.use_on, ez.center_ms = 50, 2, 1, 50
+    p._refresh_stats(force=True)
+    assert _own(p)["ez"] == "+50"
+    _mode(p, lc.TUNE_OFF)
+    p._refresh_stats(force=True)
+    assert _own(p) == {"ez": "server", "A-99": "server", "Newbie": "server", "Locky": "locked"}
+
+
+def test_an_older_helper_gives_everyone_the_server_value_and_says_why(qtbot, tmp_path, monkeypatch):
+    state = _v6_state(_four())
+    state.stats.has_v6 = False                                  # a version 5 helper
+    state.stats.player_tune = []
+    p = _panel(qtbot, tmp_path, monkeypatch, state)
+    _learned(p)
+    p._refresh_stats(force=True)
+    assert set(_own(p).values()) == {"server"}
+    assert p.players_table.item(0, panel_mod.OWN_COLUMN).toolTip() == panel_mod.OLDER_HELPER_TIP
+    assert "needs lag compensation helper version 6" in p.autotune_lbl.text()
+
+
+def test_the_status_line(qtbot, tmp_path, monkeypatch):
+    p = _panel(qtbot, tmp_path, monkeypatch, _v6_state(_four()))
+    _learned(p)
+    p._tuner.players["A-99"].top_seconds = 31 * 60
+    p._tuner.players["Gone<b>"] = pt.PlayerEntry("Gone<b>", offset=-40)   # not on now
+    p._refresh_stats(force=True)
+    assert p.autotune_lbl.text().split("<br>") == [
+        "Auto-tune per player (watch): 3 players differ from the server value: A-99 +110, "
+        "ez +50, Gone&lt;b&gt; +30.",
+        "At the top limit for 30+ min: A-99 +110.",
+        "Locked to the server value: Locky."]
+    _mode(p, lc.TUNE_OFF)
+    p._refresh_stats(force=True)
+    assert p.autotune_lbl.text() == "Auto-tune per player: off - every player uses the Extra above."
+
+
+def test_the_right_click_menu_locks_learns_and_forgets(qtbot, tmp_path, monkeypatch):
+    import json
+    state = _v6_state(_four())
+    monkeypatch.setattr(lc, "loaded_name", lambda data_dir: "wolfrat_lagcomp_test.dll")
+    monkeypatch.setattr(lc, "server_state", lambda pid, name=None: state)
+    logs, polls = [], []
+    p = panel_mod.LagCompPanel(tmp_path / "lc.json", tmp_path / "lc_history.json", tmp_path,
+                               log=logs.append, poll_now=lambda: polls.append(1))
+    qtbot.addWidget(p)
+    p._pid = 1234
+    _learned(p)
+    p._refresh_stats(force=True)
+
+    def menu(name):
+        return [(a.text(), a.isEnabled()) for a in p.player_menu(name).actions()]
+
+    assert menu("ez") == [("Use the server value for ez", True), ("Let auto-tune learn ez", False),
+                          ("Forget ez's learned Extra", True)]
+    assert menu("Newbie") == [("Use the server value for Newbie", True),
+                              ("Let auto-tune learn Newbie", False),
+                              ("Forget Newbie's learned Extra", True)]   # seen: on the server value
+    assert menu("Never")[2] == ("Forget Never's learned Extra", False)
+    assert menu("A&B")[0][0] == "Use the server value for A&&B"     # not a shortcut key
+    p.player_menu("ez").actions()[0].trigger()
+    assert p._tuner.entry("ez").locked and _own(p)["ez"] == "locked"
+    saved = json.loads((tmp_path / pt.FILE_NAME).read_text(encoding="utf-8"))
+    assert saved["players"]["ez"]["locked"] is True                   # saved at once
+    assert ("Lag compensation: Auto-tune: ez uses the server value now, set by the admin "
+            "(learned -20 ms is kept).") in logs
+    assert "ez uses the server value now" in p.event_log_edit.toPlainText()
+    assert polls and p.wants_write()                                    # written on the poll it asks for
+    assert menu("ez")[:2] == [("Use the server value for ez", False), ("Let auto-tune learn ez", True)]
+    p.player_menu("ez").actions()[1].trigger()
+    assert not p._tuner.entry("ez").locked and _own(p)["ez"] == "+50 (watch)"
+    p.player_menu("ez").actions()[2].trigger()
+    assert p._tuner.entry("ez") is None and _own(p)["ez"] == "server"
+    assert any("forgot ez's learned Extra (-20 ms)" in line for line in logs)
+    rows = [json.loads(line) for line in (tmp_path / "wolfrat_lag_comp_events.jsonl").read_text(
+        encoding="utf-8").splitlines()]
+    assert [(r["kind"], r["action"]) for r in rows if r.get("action")] == [
+        ("player_tune", "lock"), ("player_tune", "learn"), ("player_tune", "forget")]
+
+
+def test_right_click_on_a_row_opens_the_menu_for_that_player(qtbot, tmp_path, monkeypatch):
+    p = _panel(qtbot, tmp_path, monkeypatch, _v6_state(_four()))
+    p.resize(1004, 700)
+    p.show()
+    p._refresh_stats(force=True)
+    shown = []
+    monkeypatch.setattr(panel_mod.QMenu, "exec",
+                        lambda menu, *a: shown.append(menu.actions()[0].text()))
+    t = p.players_table
+    row = next(r for r in range(t.rowCount()) if t.item(r, 0).text() == "A-99")
+    p._players_menu_requested(t.visualItemRect(t.item(row, 2)).center())
+    assert shown == ["Use the server value for A-99"]
+    p._players_menu_requested(t.viewport().rect().bottomRight())     # below the rows: nothing
+    assert len(shown) == 1
+
+
+def test_each_poll_writes_every_players_own_extra_into_the_server(qtbot, tmp_path, monkeypatch):
+    rows = _four()
+    rows[3].want_hash, rows[3].want_extra_ms, rows[3].want_seq = LOCKY, 90, 3   # locked since
+    left = lc.PlayerTuneRow(20, "", 0, 0, want_hash=777, want_extra_ms=30, want_seq=9)
+    state = _v6_state(rows + [left])
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch, {"on": True, "reapply": True},
+                                      state)
+    _learned(p)
+    mem = _Writes()
+    p.server_tick(mem, writable=True)
+    base = state.shared + 28980
+
+    def slot(n, extra, h, seq):
+        row = base + n * 88
+        return [(row + 4, struct.pack("<i", extra)), (row, struct.pack("<I", h)),
+                (row + 8, struct.pack("<I", seq))]
+
+    assert mem.writes == (slot(3, 50, EZ, 1) + slot(5, 70, NEW, 1) + slot(7, 90, 0, 4)
+                          + slot(9, 110, A99, 1) + slot(20, 30, 0, 10))
+    assert calls == [] and not p.wants_write()
+    p.server_tick(mem, writable=True)                                    # nothing new: no writes
+    assert len(mem.writes) == 15
+    _mode(p, lc.TUNE_APPLY)                                             # On: ptApply 1
+    p.server_tick(mem, writable=True)
+    assert mem.writes[15:] == [(state.shared + 28964, b"\x01\0\0\0")]
+    _mode(p, lc.TUNE_OFF)                                               # Off: nobody has one
+    p.server_tick(mem, writable=False)                                  # read-only: asks to write
+    assert len(mem.writes) == 16 and p.wants_write()
+    p.server_tick(mem, writable=True)
+    assert mem.writes[16] == (state.shared + 28964, b"\0\0\0\0")
+    assert sorted(a for a, d in mem.writes[17:] if (a - base) % 88 == 0) == [
+        base + n * 88 for n in (3, 5, 9)]
+    assert all(r.want_hash == 0 for r in state.stats.player_tune)
+    assert not p.wants_write()
+
+
+def test_a_move_goes_to_the_console_and_the_event_log_with_its_evidence(
+        qtbot, tmp_path, monkeypatch):
+    import json
+    ez = _tune_row(3, "ez", 45)
+    state = _v6_state([ez])
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch, {"on": True, "reapply": True},
+                                      state)
+    p.server_tick(_Writes(), writable=True)                             # ez arrives
+    ez.up_losses, ez.down_wins = 132, 18
+    p.server_tick(_Writes(), writable=True)
+    line = ("Auto-tune (watch): ez Extra +70 -> +50 - of 18 shots where -40 and the current "
+            "answer disagreed, -40 hit 18")
+    assert "Lag compensation: " + line in logs
+    assert line in p.event_log_edit.toPlainText()
+    rows = [json.loads(x) for x in (tmp_path / "wolfrat_lag_comp_events.jsonl").read_text(
+        encoding="utf-8").splitlines()]
+    move = next(r for r in rows if r["kind"] == "player_tune")
+    assert (move["message"], move["name"], move["why"], move["from"], move["to"]) == (
+        line, "ez", "down", 70, 50)
+    assert (move["shots"], move["wins"], move["ping"], move["pid"]) == (18, 18, 45, 5460)
+    assert p._tuner.entry("ez").offset == -20 and ez.want_extra_ms == 50       # written too
+    # The history row keeps the tuner's state.
+    p._last_record = 0
+    state.stats.tests = 10
+    p.server_tick(_Writes(), writable=True)
+    hist = json.loads((tmp_path / "lc_history.json").read_text(encoding="utf-8"))[-1]
+    assert hist["auto_tune"]["differ"] == {"ez": 50} and hist["auto_tune"]["mode"] == "watch"
+    assert [m["to"] for m in hist["auto_tune"]["moves"]] == [50]
+    assert hist["setting"] == "ping +70 ms (auto-tune per player: watch), none under 0, max 300"
+
+
+def test_a_helper_still_running_the_old_server_wide_auto_tune_gets_it_switched_off(
+        qtbot, tmp_path, monkeypatch):
+    state = _v6_state([])
+    s = state.stats
+    s.has_tuner, s.tune_mode, s.tune_value_ms, s.tune_median_ms = True, lc.TUNE_APPLY, 65, 68
+    p, now, calls, logs = _switchable(qtbot, tmp_path, monkeypatch, {"on": True, "reapply": True},
+                                      state)
+    resets = []
+    monkeypatch.setattr(lc, "reset_stats", lambda pid, name=None: resets.append(pid) or True)
+
+    def turn_on(pid, memory, data_dir, settings):
+        calls.append("on")
+        s.tune_mode = lc.TUNE_OFF                       # _write_settings writes it Off
+        return state
+    monkeypatch.setattr(lc, "turn_on", turn_on)
+    p._pid = _Mem.pid
+    p._refresh_stats(force=True)
+    assert "Server-wide auto-tune (retired, still on in this helper), applied live: Extra " \
+        "<b>+65 ms</b>" in p.autotune_lbl.text()
+    p.server_tick(_Mem(), writable=False)               # no write access: nothing, no hold-up
+    assert calls == []
+    assert "ping +65 ms (server-wide auto from +70) (auto-tune per player: watch)" in \
+        p.state_lbl.text()
+    p.server_tick(_Writes(), writable=True)
+    assert calls == ["on"] and resets == []             # the counters carry on
+    p.server_tick(_Writes(), writable=True)
+    assert calls == ["on"]
+    p._refresh_stats(force=True)
+    assert "Server-wide" not in p.autotune_lbl.text()
+
+
+def test_closing_wolfrat_saves_what_was_learned(qtbot, tmp_path, monkeypatch):
+    p = _panel(qtbot, tmp_path, monkeypatch, lc.State(lc.STOCK))
+    p._tuner.players["ez"] = pt.PlayerEntry("ez", offset=-20)
+    p._tuner._dirty = True
+    p.shutdown()
+    import json
+    saved = json.loads((tmp_path / pt.FILE_NAME).read_text(encoding="utf-8"))
+    assert saved["players"]["ez"]["offset"] == -20
+    # And the next start reads it back.
+    q = _panel(qtbot, tmp_path, monkeypatch, lc.State(lc.STOCK))
+    assert q._tuner.entry("ez").offset == -20
+
+
+def test_a_broken_tune_file_is_said_once_and_the_page_starts(qtbot, tmp_path, monkeypatch):
+    (tmp_path / pt.FILE_NAME).write_text("{oops", encoding="utf-8")
+    p = _panel(qtbot, tmp_path, monkeypatch, lc.State(lc.STOCK))
+    assert p._tuner.players == {} and (tmp_path / (pt.FILE_NAME + ".bad")).exists()
+    assert "could not be read" in p.event_log_edit.toPlainText()
+
+
+def test_page_with_the_own_extra_column_still_fits_1024x768(qtbot, tmp_path, monkeypatch):
+    from PyQt6.QtWidgets import QApplication, QGroupBox, QScrollArea, QTabWidget
+    names = ["MutantEnder", "AngelExalted", "OscarMike247", "elk road", "A-99", "ez",
+             "BadgerLove", "Somebody Long Name"]
+    rows = [_tune_row(i, n, 40 + 20 * i) for i, n in enumerate(names)]
+    state = _v6_state(rows)
+    state.stats.what_if = [dataclasses.replace(r, steps=400 + i, hits=[40, 30, 35, 50, 70, 60, 45, 20])
+                           for i, r in enumerate(state.stats.what_if)]
+    p = _panel(qtbot, tmp_path, monkeypatch, state)
+    for n, off in zip(names, (-40, -60, -20, 40, 40, -80)):
+        p._tuner.players[n] = pt.PlayerEntry(n, offset=off, top_seconds=4000 if n == "A-99" else 0)
+    tabs = QTabWidget()
+    qtbot.addWidget(tabs)
+    tabs.addTab(p, "Lag compensation")
+    tabs.resize(1004, 540)
+    tabs.show()
+    p._refresh_stats(force=True)
+    for _ in range(20):
+        QApplication.processEvents()
+    columns = [a for a in p.findChildren(QScrollArea) if a.widgetResizable()]
+    assert len(columns) == 2
+    for group in p.findChildren(QGroupBox):
+        assert group.height() >= group.minimumSizeHint().height(), group.title()
+    assert p.players_table.rowCount() == 8 and p.players_table.columnCount() == 8
+    # The new column and the status line ask for no more width than the boxes
+    # already in their columns.
+    players = p.players_table.parent()
+    right = [g.minimumSizeHint().width() for g in p.findChildren(QGroupBox)
+             if g.parent() is players.parent() and g is not players]
+    assert players.minimumSizeHint().width() <= max(right)
+    session = p.autotune_lbl.parent()
+    left = [g.minimumSizeHint().width() for g in p.findChildren(QGroupBox)
+            if g.parent() is session.parent() and g is not session]
+    assert session.minimumSizeHint().width() <= max(left)
+    tabs.hide()

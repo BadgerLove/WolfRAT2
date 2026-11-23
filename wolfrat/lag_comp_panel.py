@@ -12,6 +12,8 @@ is none.  The numbers refresh every second on their own while the page shows.
 
 from __future__ import annotations
 
+import dataclasses
+import html
 import json
 import time
 from pathlib import Path
@@ -20,11 +22,12 @@ from typing import Callable, Optional
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QPlainTextEdit, QPushButton, QSizePolicy,
+    QHBoxLayout, QHeaderView, QLabel, QMenu, QPlainTextEdit, QPushButton, QSizePolicy,
     QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from wolfrat import lag_comp as lc
+from wolfrat import player_tune as pt
 from wolfrat.weather_wildlife_page import scroll_column
 
 BANNER = (
@@ -75,18 +78,42 @@ _HELP = (
     "<br><br><b>Best rewind</b> looks at every shot that passed close to someone and finds "
     "the rewind that lines it up best. Its middle value, minus the ping, is the <b>Extra</b> "
     "that suits your players. <b>Use suggested</b> sets it (after 300 close shots)."
-    "<br><br><b>Auto-tune Extra</b> adjusts Extra on its own from the last 450 close shots "
-    "(up to 30 minutes of play), moving at most 2 ms a minute inside +50 to +85 ms, and "
-    "leaving differences of 8 ms or less alone. Choose <b>Watch</b> to log what it would pick "
-    "without changing hits, or <b>On (apply)</b> to let it tune live. Switching Auto-tune mode "
-    "does not restart the session counters."
+    "<br><br><b>Auto-tune per player</b> learns each player's own Extra from their own "
+    "bullets. Every close shot is also checked with that player's Extra 40 ms lower and "
+    "40 ms higher. When one of them keeps hitting where the current Extra misses, the "
+    "player's Extra moves 20 ms that way - only on clear evidence, and at most once per 150 "
+    "such shots. Limits: down to no rewind at all (that only affects the shooter); up at "
+    "most 40 ms over the Extra above, and never past 250 ms of ping + Extra. <b>Watch</b> "
+    "learns and shows it in the <i>Own Extra</i> column without changing a hit; <b>On</b> "
+    "uses it - a new value is taken on when the player dies, or after 2 minutes. Players "
+    "are remembered by name: one back after two weeks away, or whose ping moved 50 ms, "
+    "keeps half the difference. Right-click a player to give them the server value, let "
+    "auto-tune learn again, or forget what it learned. Switching the Auto-tune mode does "
+    "not restart the session counters."
     "<br><br><b>Watch only</b> counts everything but changes no hits - handy for a first "
     "night."
     "<br><br>Changing a manual setting starts the counting again, so each session row in "
     "<b>Past sessions</b> is one setting."
 )
 
-_PLAYER_COLUMNS = ["Player", "Ping", "Rewind", "Checks", "Hits", "Without", "Gain"]
+_PLAYER_COLUMNS = ["Player", "Ping", "Rewind", "Own Extra", "Checks", "Hits", "Without", "Gain"]
+OWN_COLUMN = _PLAYER_COLUMNS.index("Own Extra")
+OWN_EXTRA_TIP = (
+    "Own Extra: the Extra auto-tune per player has learned for this player.\n"
+    "server = the Extra above; +50 (watch) = learned, shown only; +50 (waiting) = On, taken "
+    "on when the player dies (or after 2 minutes); locked = the admin gave them the server "
+    "value.\nHover a player for the evidence; right-click to lock, learn again or forget.")
+OLDER_HELPER_TIP = ("This server's lag compensation helper is older than version 6: every "
+                    "player uses the Extra above. Tick the box again to load the new one.")
+# The combo's items: (text, mode).  Auto-tune is per player since 2026-11-23.
+TUNE_ITEMS = (
+    ("Off - every player uses the Extra above", lc.TUNE_OFF),
+    ("Watch - learn each player's best Extra and show it, change nothing", lc.TUNE_WATCH),
+    ("On - each player gets their own learned Extra (within limits)", lc.TUNE_APPLY),
+)
+MENU_LOCK = "Use the server value for {name}"
+MENU_LEARN = "Let auto-tune learn {name}"
+MENU_FORGET = "Forget {name}'s learned Extra"
 # Being shot at (helper version 2).  "Low" = shooters under the minimum ping
 # (never rewound), "Lag" = rewound shooters; % = hits / close shots.
 _BAND_COLUMNS = ["Target ping", "On", "Low shots", "Low hit %", "Lag shots", "Lag hit %",
@@ -162,6 +189,16 @@ class LagCompPanel(QWidget):
         self._poll_now = poll_now
         self._history = lc.HistoryBook(str(history_file))
         self._events = lc.EventLogger(str(Path(history_file).parent))
+        # Auto-tune per player (2026-11-23): WolfRAT learns each player's own
+        # Extra from the helper's tune rows and writes it back (player_tune.py).
+        # (The log callback must not hold the page: a cycle would keep a closed
+        # page's wrapper alive after Qt has deleted it.)
+        self._tuner = pt.PlayerTuner(Path(self._data_dir) / pt.FILE_NAME,
+                                     log=lambda text, out=log: out("Lag compensation: " + text))
+        if self._tuner.problem:
+            self._events.note("Auto-tune per player: " + self._tuner.problem, kind="player_tune")
+        self._tune_pending = False      # the server's per-player values wait for a write
+        self._tune_error = ""           # a failed write, logged once
         self._helper_name = lc.loaded_name(self._data_dir)
         on_file = self._load()
         # Recommended settings (lc.SETTINGS_STEPS): an install below the current
@@ -266,10 +303,23 @@ class LagCompPanel(QWidget):
         self.extra_spin.setSuffix(" ms")
         form.addRow("Extra (added to each player's ping):", self.extra_spin)
         self.tune_combo = QComboBox()
-        self.tune_combo.addItem("Off - keep the Extra set above", lc.TUNE_OFF)
-        self.tune_combo.addItem("Watch - calculate & log auto Extra, change nothing", lc.TUNE_WATCH)
-        self.tune_combo.addItem("On (apply) - smoothly auto-tune Extra (<=2 ms/min, 50-85 ms)", lc.TUNE_APPLY)
-        form.addRow("Auto-tune Extra (live):", self.tune_combo)
+        for text, mode in TUNE_ITEMS:
+            self.tune_combo.addItem(text, mode)
+            self.tune_combo.setItemData(self.tune_combo.count() - 1, text,
+                                        Qt.ItemDataRole.ToolTipRole)
+        self.tune_combo.setToolTip("Auto-tune per player: each player's own Extra, learned "
+                                   "from their own bullets (see How it works).")
+        # Sized by a short text, not by its longest item: the combo was the widest
+        # thing in the left column, and longer words would widen the whole page
+        # past a 1024x768 screen.  It grows with the window; the list shows every
+        # item in full.
+        self.tune_combo.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
+        self.tune_combo.setMinimumContentsLength(24)
+        metrics = self.tune_combo.fontMetrics()
+        self.tune_combo.view().setMinimumWidth(
+            max(metrics.horizontalAdvance(text) for text, _ in TUNE_ITEMS) + 32)
+        form.addRow("Auto-tune per player:", self.tune_combo)
         self.min_spin = QSpinBox()
         self.min_spin.setRange(0, 500)
         self.min_spin.setSingleStep(10)
@@ -344,7 +394,7 @@ class LagCompPanel(QWidget):
         log_group = QGroupBox("\U0001F4CB Live activity & auto-tune log")
         log_box = QVBoxLayout()
         log_note = QLabel(
-            "Timestamped log of every auto-tune step, setting change and 30 s snapshot "
+            "Timestamped log of every auto-tune move, setting change and 30 s snapshot "
             "(also saved to <code>wolfrat_lag_comp_events.log</code> &amp; <code>.jsonl</code>)."
         )
         log_note.setWordWrap(True)
@@ -371,6 +421,9 @@ class LagCompPanel(QWidget):
         players_group = QGroupBox("\U0001F465 Players")
         players_box = QVBoxLayout()
         self.players_table = self._table(_PLAYER_COLUMNS)
+        self.players_table.horizontalHeaderItem(OWN_COLUMN).setToolTip(OWN_EXTRA_TIP)
+        self.players_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.players_table.customContextMenuRequested.connect(self._players_menu_requested)
         players_box.addWidget(self.players_table)
         players_group.setLayout(players_box)
         right.addWidget(players_group)
@@ -554,7 +607,7 @@ class LagCompPanel(QWidget):
     def wants_write(self) -> bool:
         return self._dirty or self._retry_due() or (
             self._wish_on and self._reapply and self._state is not None and not self._state.on
-        ) or (self._state is not None and self._state.kind == lc.PARTIAL)
+        ) or (self._state is not None and self._state.kind == lc.PARTIAL) or self._tune_pending
 
     def no_server(self, text: str):
         self._pid = None
@@ -608,10 +661,17 @@ class LagCompPanel(QWidget):
         if self._push_level:
             # The one-time recommended settings also go into a server that is
             # already running it with the old ones (WolfRAT restarted, not the server).
+            # Auto-tune is WolfRAT's own now (per player), so only the rest counts.
             self._push_level = False
             if (self._wish_on and state.on and state.settings is not None
-                    and state.settings != self._settings):
+                    and not self._settings.same_core(state.settings)):
                 self._dirty = True
+        if (writable and self._wish_on and state.on and state.stats is not None
+                and state.stats.has_tuner and state.stats.tune_mode != lc.TUNE_OFF):
+            # The helper's own server-wide auto-tune is retired (2026-11-23): one
+            # still running it (started by an older WolfRAT, the server did not
+            # restart) gets it switched off.  The counters carry on.
+            self._dirty = True
         if state.kind != lc.PARTIAL:
             self._partial_logged = False
         elif not self._dirty and time.monotonic() >= self._retry_at:
@@ -645,6 +705,7 @@ class LagCompPanel(QWidget):
         if writable and self._wish_on:
             # Tell other WolfRATs this one is running it (version 4 helpers).
             lc.stamp_owner(memory, state)
+        self._tune_tick(state, memory if writable else None)
         self._record_background(state)
 
     def _run_elsewhere(self, state: lc.State) -> bool:
@@ -717,8 +778,8 @@ class LagCompPanel(QWidget):
                     "WolfRAT is putting it right.")
         elif st.on:
             mode = "WATCH ONLY - counting, no hits changed" if st.observe else "ON"
-            live_extra = st.stats.tune_value_ms if (st.stats and st.stats.has_tuner) else None
-            text = "\U0001F7E2 " + mode + " (" + lc.describe_setting(st.settings, live_extra) + ")."
+            text = ("\U0001F7E2 " + mode + " (" + lc.describe_setting(
+                self._shown_settings(st), self._server_wide_extra(st)) + ").")
             if not st.alive:
                 text += " Waiting for players - an empty server does not run it."
         elif st.kind == lc.OLD:
@@ -770,8 +831,9 @@ class LagCompPanel(QWidget):
             self.whatif_group.setVisible(False)
             return
         s = st.stats
+        self._tune_tick(st)                 # learn from this read; written on the next poll
         self._show_totals(st, s)
-        self._show_players(s)
+        self._show_players(s, st)
         self._show_targets(s)
         self._show_what_if(st, s)
         self._record_background(st)
@@ -782,20 +844,131 @@ class LagCompPanel(QWidget):
         s = st.stats
         now = time.time()
         snap_due = (now - self._last_record >= 30)
+        settings = self._shown_settings(st)
         added_lines = self._events.record_poll(
-            self._pid, s, st.settings, include_snapshot=snap_due, now=now)
+            self._pid, s, settings, include_snapshot=snap_due, now=now)
         if added_lines:
             for ln in added_lines:
                 if "Auto-tune min #" in ln and "->" in ln:
                     self._log("Lag compensation: " + ln.split("] ", 1)[-1])
             self._show_event_log()
-        if snap_due and self._history.record(self._pid, s, st.settings, now):
+        tuned = (self._tuner.summary(self._settings.tune_mode, lc.server_extra(st),
+                                     since=now - s.seconds) if s.has_v6 and st.on else None)
+        if snap_due and self._history.record(self._pid, s, settings, now, player_tune=tuned):
             self._last_record = now
             try:
                 self._history.save()
             except Exception:
                 pass
             self._show_history()
+
+    # ------------------------------------------------ auto-tune per player
+    def _shown_settings(self, st: lc.State) -> lc.Settings:
+        """The settings to show and log for a helper: the block's own, with this
+        WolfRAT's auto-tune per player when it runs that helper (the helper's
+        own tune_mode is the retired server-wide one, always written Off)."""
+        if st.settings is None:
+            return self._settings
+        if st.on:
+            return dataclasses.replace(st.settings, tune_mode=self._settings.tune_mode)
+        return st.settings
+
+    @staticmethod
+    def _server_wide_extra(st: lc.State) -> Optional[int]:
+        """The Extra the retired server-wide auto-tune of an older WolfRAT still
+        applies in this helper (None: it does not)."""
+        s = st.stats
+        if s is not None and s.has_tuner and s.tune_mode == lc.TUNE_APPLY:
+            return s.tune_value_ms
+        return None
+
+    def _tune_tick(self, st: Optional[lc.State], memory=None) -> None:
+        """Feed one read of the helper's tune rows to the tuner, log its moves,
+        and with a write handle (``memory``) bring the server's per-player values
+        to what it wants.  Only this WolfRAT's own helper, version 6, while on."""
+        if st is None or not st.on or st.stats is None or not st.stats.has_v6:
+            self._tune_pending = False
+            return
+        s = st.stats
+        mode = self._settings.tune_mode
+        g = lc.server_extra(st)
+        now = time.time()
+        moves = self._tuner.observe(s.player_tune, g, mode, now)
+        for move in moves:
+            self._log("Lag compensation: " + move["message"])
+            evidence = {k: v for k, v in move.items() if k not in ("message", "time")}
+            self._events.note(move["message"], kind="player_tune", now=now, pid=self._pid,
+                              **evidence)
+        if moves:
+            self._show_event_log()
+        wants = self._tuner.wants(s.player_tune, g, mode)
+        apply = mode == lc.TUNE_APPLY
+        if memory is not None:
+            try:
+                lc.sync_player_tune(memory, st, wants, apply)
+                self._tune_pending = False
+                self._tune_error = ""
+            except Exception as exc:          # never takes the page down; tried next poll
+                self._tune_pending = True
+                if str(exc) != self._tune_error:
+                    self._tune_error = str(exc)
+                    self._log(f"Lag compensation: could not write auto-tune per player ({exc}).")
+        else:
+            apply_differs, changes = lc.tune_changes(s, wants, apply)
+            self._tune_pending = bool(apply_differs or changes)
+        self._tuner.save_if_due(now)
+
+    def _players_menu_requested(self, pos) -> None:
+        item = self.players_table.itemAt(pos)
+        name_item = self.players_table.item(item.row(), 0) if item is not None else None
+        if name_item is None:
+            return
+        name = name_item.data(Qt.ItemDataRole.UserRole) or name_item.text()
+        menu = self.player_menu(name)
+        menu.exec(self.players_table.viewport().mapToGlobal(pos))
+        menu.deleteLater()
+
+    def player_menu(self, name: str) -> QMenu:
+        """The right-click menu for one player of the table."""
+        menu = QMenu(self)
+        entry = self._tuner.entry(name)
+        locked = bool(entry is not None and entry.locked)
+        shown = name.replace("&", "&&")            # '&' would mark a shortcut key
+        for text, action, enabled in (
+                (MENU_LOCK, "lock", not locked),
+                (MENU_LEARN, "learn", locked),
+                (MENU_FORGET, "forget", entry is not None)):
+            act = menu.addAction(text.format(name=shown))
+            act.setEnabled(enabled)
+            act.triggered.connect(lambda _checked=False, a=action: self._tune_admin(a, name))
+        return menu
+
+    def _tune_admin(self, action: str, name: str) -> None:
+        """Lock a player to the server value, let them learn again, or forget
+        what was learned.  Saved at once, and written into the server on the
+        next poll (asked for now)."""
+        if action == "lock":
+            text = self._tuner.lock(name)
+        elif action == "learn":
+            text = self._tuner.unlock(name)
+        else:
+            text = self._tuner.forget(name)
+        self._tuner.save()
+        self._log("Lag compensation: " + text + ".")
+        self._events.note(text, kind="player_tune", name=name, action=action)
+        self._show_event_log()
+        st = self._state
+        if st is not None and st.stats is not None:
+            self._show_totals(st, st.stats)
+            self._show_players(st.stats, st)
+            self._tune_pending = bool(st.on and st.stats.has_v6)
+        if self._poll_now:
+            self._poll_now()
+
+    def shutdown(self) -> None:
+        """WolfRAT is closing: keep what auto-tune per player has learned."""
+        if self._tuner.dirty:
+            self._tuner.save()
 
     def _show_totals(self, st: lc.State, s: lc.Stats):
         minutes = s.seconds // 60
@@ -835,40 +1008,59 @@ class LagCompPanel(QWidget):
             self.tune_lbl.setText(text)
         self.suggest_btn.setEnabled(suggestion is not None and bool(st.settings) and
                                     suggestion != st.settings.extra_ms)
-        if not s.has_tuner:
-            self.autotune_lbl.setText("")
+        self.autotune_lbl.setText(self._tune_status_html(st, s))
+
+    def _tune_status_html(self, st: lc.State, s: lc.Stats) -> str:
+        """Auto-tune per player: who differs from the server value, who sits at
+        the top limit, who is locked.  Plus the retired server-wide auto-tune's
+        line while an older WolfRAT's helper still runs it."""
+        if st.on or st.kind == lc.STOCK:
+            lines = self._tuner.status_lines(lc.server_extra(st), self._settings.tune_mode,
+                                             has_v6=s.has_v6, on_now=[p.name for p in s.players])
+            parts = [html.escape(line) for line in lines]
         else:
-            mode_name = lc.TUNE_MODE_NAMES.get(s.tune_mode, "off")
-            if s.tune_mode == lc.TUNE_OFF:
-                self.autotune_lbl.setText(
-                    f"Auto-tune: <b>off</b> (rolling window: {s.tune_samples:,} / 450 close shots "
-                    f"in last {max(1, s.tune_window_mins)} min)."
-                )
-            elif s.tune_median_ms is None:
-                self.autotune_lbl.setText(
-                    f"Auto-tune (<b>{mode_name}</b>): holding at <b>{_signed(s.tune_value_ms)}</b> "
-                    f"- waiting for 450 close shots in last 30 min (<b>{s.tune_samples:,} / 450</b> so far)."
-                )
+            parts = []                      # another WolfRAT's helper: not this tuner's
+        if s.has_tuner and s.tune_mode != lc.TUNE_OFF:
+            head = "Server-wide auto-tune (retired, still on in this helper)"
+            if s.tune_median_ms is None:
+                parts.append(
+                    f"{head}: holding at <b>{_signed(s.tune_value_ms)}</b> - waiting for 450 "
+                    f"close shots in last 30 min (<b>{s.tune_samples:,} / 450</b> so far).")
             else:
-                act = "applied live" if s.tune_mode == lc.TUNE_APPLY else "watched only (not applied)"
-                self.autotune_lbl.setText(
-                    f"Auto-tune (<b>{act}</b>): Extra <b>{_signed(s.tune_value_ms)}</b> · "
+                act = "applied live" if s.tune_mode == lc.TUNE_APPLY else "watched only"
+                parts.append(
+                    f"{head}, {act}: Extra <b>{_signed(s.tune_value_ms)}</b> · "
                     f"rolling best <b>{_signed(s.tune_median_ms)}</b> "
                     f"({s.tune_samples:,} shots over {s.tune_window_mins} min · "
-                    f"{s.tune_decisions} min decisions)."
-                )
+                    f"{s.tune_decisions} min decisions).")
+        return "<br>".join(parts)
 
-    def _show_players(self, s: lc.Stats):
+    def _show_players(self, s: lc.Stats, st: Optional[lc.State] = None):
         rows = sorted(s.players, key=lambda p: -p.ping)
+        tune = {r.slot: r for r in s.player_tune} if s.has_v6 else {}
+        mode = self._settings.tune_mode
+        g = lc.server_extra(st) if st is not None else self._settings.extra_ms
+        mine = st is None or st.on          # this WolfRAT's helper, running
         self.players_table.setRowCount(len(rows))
         for r, p in enumerate(rows):
             rewind = f"{p.rewind_ms} ms" if p.rewind_ms else "none"
-            cells = [p.name, str(p.ping), rewind, f"{p.tests:,}", f"{p.hits:,}",
+            row = tune.get(p.slot)
+            if row is not None and row.name == p.name and mine:
+                own, tip = self._tuner.own_text(row, g, mode), self._tuner.tooltip(row, g, mode)
+            elif s.has_v6 or not mine:
+                own, tip = "-", ""
+            else:
+                own, tip = "server", OLDER_HELPER_TIP
+            cells = [p.name, str(p.ping), rewind, own, f"{p.tests:,}", f"{p.hits:,}",
                      f"{p.plain_hits:,}", _gain_text(p.hits, p.plain_hits)]
             for c, text in enumerate(cells):
                 item = QTableWidgetItem(text)
                 if c:
                     item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+                else:
+                    item.setData(Qt.ItemDataRole.UserRole, p.name)
+                if c == OWN_COLUMN and tip:
+                    item.setToolTip(tip)
                 self.players_table.setItem(r, c, item)
 
     def _fill(self, table: QTableWidget, rows: list):

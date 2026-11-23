@@ -55,12 +55,11 @@ def test_version_4_block_layout_matches_the_spec():
 
 def test_version_5_block_layout_matches_the_spec():
     # tmp/lagcomp-v5/SPEC.md: 16 bytes appended to the version 4 block, which must not move.
-    assert lc.VERSION == 5
     assert [lc._OFF[k] for k in ("device_steps", "device_hits", "device_rule", "reserved5")] == [
         28948, 28952, 28956, 28960]
     assert lc._OFF["device_steps"] == lc._V4_SIZE == 28948
-    assert lc.SHARED_SIZE == lc._V5_SIZE == 28948 + 16 == 28964
-    assert lc.ctypes.sizeof(lc._Shared) == 28964
+    # What a version 5 helper's block measures, for good: version 6 comes after it.
+    assert lc._V5_SIZE == 28948 + 16 == 28964
 
 
 def test_bundled_helper_exports_its_block():
@@ -480,9 +479,13 @@ def test_a_version_3_snapshot_has_none_of_the_new_keys(tmp_path):
 CLAYMORE_KEYS = ("device_steps", "device_hits", "device_rule")
 
 
+# What a version 5 helper's block measures (its payload.c size assert).
+V5_BYTES = 28964
+
+
 def _v5(**kw):
     b = _v4(**kw)
-    b.version, b.size = 5, lc.SHARED_SIZE
+    b.version, b.size = 5, V5_BYTES
     return b
 
 
@@ -526,8 +529,9 @@ def test_a_version_4_helpers_block_still_parses_as_version_4():
 
 def test_reading_a_version_4_helpers_block_falls_back_to_its_own_size():
     """This WolfRAT with a version 4 helper in the server (another install's, or
-    its own older one before the takeover): 28,964 bytes cannot be read, so the
-    block's own 28,948 are, and it is still a version 4 block."""
+    its own older one before the takeover): the whole block (50,980 bytes since
+    version 6) cannot be read, so the block's own 28,948 are, and it is still a
+    version 4 block."""
     b = _v4(stats_since=1000, dead_hits=7, owner_pid=4242)
     _what_if(b, 5, 60, [5, 1, 2, 3, 9, 4, 4, 4])
     data = bytes(b)[:V4_BYTES]
@@ -541,8 +545,8 @@ def test_reading_a_version_4_helpers_block_falls_back_to_its_own_size():
             return data[address:address + size]
 
     raw = lc._read_block(Proc(), 0)
-    assert asked == [28964, 4, 28948]                  # all of it, its size, then that much
-    assert len(raw) == lc.SHARED_SIZE and raw[V4_BYTES:] == b"\0" * 16
+    assert asked == [50980, 4, 28948]                  # all of it, its size, then that much
+    assert len(raw) == lc.SHARED_SIZE and raw[V4_BYTES:] == b"\0" * (50980 - V4_BYTES)
     block, s = lc.parse_stats(raw, now_ticks=2000)
     assert s.has_v4 and not s.has_v5 and s.dead_hits == 7 and s.what_if[5].steps == 60
     assert block.owner_pid == 4242
@@ -721,3 +725,290 @@ def test_history_rows_from_before_this_still_update(tmp_path):
     book = lc.HistoryBook(str(tmp_path / "h.json"))
     book.record(1, _targets(A=14), settings, now=1_000_000)
     assert _row(book, "A")["close_low"] == 14 and _row(book, "Gone")["close_low"] == 7
+
+
+# ------------------------------------------------- helper version 6 (2026-11-23)
+# Auto-tune per player (tmp/autotune2/SPEC.md): one tune row of 88 bytes per
+# slot after the version 5 block, which must not move.  WolfRAT writes each
+# player's own Extra (want*), the helper takes it on (use*) and tests it.
+
+V6_BYTES = 50980
+TUNE_FIELDS = ("want_hash", "want_extra_ms", "want_seq", "use_extra_ms", "use_seq", "use_on",
+               "use_entity", "center_ms", "steps", "center_hits", "down_wins", "down_losses",
+               "up_wins", "up_losses", "what_if_hits")
+
+
+def _v6(**kw):
+    b = _v4(**kw)
+    b.version, b.size = 6, V6_BYTES
+    b.pt_spread_ms = 40
+    return b
+
+
+def _seat(b, slot, name, ping, entity=None, **tune):
+    p = b.players[slot]
+    p.entity, p.ping, p.name = entity or 0x100 + slot, ping, name
+    for k, v in tune.items():
+        if k == "what_if_hits":
+            for i, n in enumerate(v):
+                b.player_tune[slot].what_if_hits[i] = n
+        else:
+            setattr(b.player_tune[slot], k, v)
+
+
+def test_version_6_block_layout_matches_the_spec():
+    assert lc.VERSION == 6
+    assert [lc._OFF[k] for k in ("pt_apply", "pt_spread_ms", "reserved6", "player_tune")] == [
+        28964, 28968, 28972, 28980]
+    assert lc._OFF["pt_apply"] == lc._V5_SIZE == 28964             # nothing before it moves
+    assert lc.ctypes.sizeof(lc._PlayerTune) == 88
+    assert [getattr(lc._PlayerTune, k).offset for k in TUNE_FIELDS] == [
+        0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44, 48, 52, 56]
+    assert lc.SHARED_SIZE == lc._V6_SIZE == 28980 + 250 * 88 == V6_BYTES
+    assert lc.ctypes.sizeof(lc._Shared) == 50980
+    # Every older part where it was.
+    assert (lc._V2_SIZE, lc._V3_SIZE, lc._V4_SIZE) == (26344, 28420, 28948)
+
+
+def test_version_6_tune_rows_and_ptapply_are_read():
+    b = _v6(stats_since=1000, pt_apply=1)
+    _seat(b, 3, b"ez", 45, want_hash=lc.name_hash("ez"), want_extra_ms=50, want_seq=7,
+          use_extra_ms=50, use_seq=7, use_on=1, use_entity=0x103, center_ms=50, steps=900,
+          center_hits=300, down_wins=79, down_losses=39, up_wins=20, up_losses=31,
+          what_if_hits=[1, 2, 3, 4, 5, 6, 7, 8])
+    _seat(b, 9, b"A-99", 150, center_ms=70)
+    b.player_tune[20].want_hash, b.player_tune[20].want_seq = 1234, 3     # left: still held
+    b.player_tune[30].steps = 99                                         # empty, nothing held
+    _, s = lc.parse_stats(bytes(b), now_ticks=2000)
+    assert s.has_v6 and s.has_v5 and s.has_v4 and s.pt_apply == 1 and s.pt_spread_ms == 40
+    assert [r.slot for r in s.player_tune] == [3, 9, 20]
+    ez = s.player_tune[0]
+    assert (ez.name, ez.ping, ez.present, ez.want_extra_ms, ez.use_on, ez.center_ms) == (
+        "ez", 45, True, 50, 1, 50)
+    assert ez.counters() == (900, 300, 79, 39, 20, 31) and ez.adopted
+    assert ez.what_if_hits == [1, 2, 3, 4, 5, 6, 7, 8]
+    left = s.player_tune[2]
+    assert not left.present and left.name == "" and left.want_hash == 1234
+
+
+def test_older_blocks_have_no_tune_rows():
+    """Past the end of a version 5 helper's block is that helper's other memory,
+    never want / use fields or counters."""
+    b = _v6(stats_since=1000, pt_apply=1, device_steps=288, device_rule=1)
+    _seat(b, 3, b"ez", 45, want_hash=99, steps=900, down_wins=5)
+    b.version, b.size = 5, V5_BYTES
+    for raw in (bytes(b)[:V5_BYTES], bytes(b)):
+        _, s = lc.parse_stats(raw, now_ticks=2000)
+        assert s.has_v5 and not s.has_v6 and s.device_steps == 288
+        assert s.player_tune == [] and s.pt_apply == 0 and s.pt_spread_ms == 0
+    # Says 6 but is not that big (or a short read): version 5.
+    b.version, b.size = 6, V5_BYTES
+    _, s = lc.parse_stats(bytes(b), now_ticks=2000)
+    assert s.has_v5 and not s.has_v6 and s.player_tune == []
+    b.size = V6_BYTES
+    _, s = lc.parse_stats(bytes(b)[:V5_BYTES], now_ticks=2000)
+    assert s.has_v5 and not s.has_v6
+    # And a version 4 block is still version 4.
+    b.version, b.size = 4, V4_BYTES
+    _, s = lc.parse_stats(bytes(b), now_ticks=2000)
+    assert s.has_v4 and not s.has_v5 and not s.has_v6
+
+
+def test_a_pending_reset_clears_the_tune_counters_and_keeps_the_values():
+    b = _v6(reset_seq=2, seen_reset_seq=1, stats_since=1000)
+    _seat(b, 3, b"ez", 45, want_hash=5, want_extra_ms=50, want_seq=7, use_extra_ms=50,
+          use_seq=7, use_on=1, use_entity=0x103, center_ms=50, steps=900, center_hits=300,
+          down_wins=79, down_losses=39, up_wins=20, up_losses=31, what_if_hits=[9] * 8)
+    block, s = lc.parse_stats(bytes(b), now_ticks=5000)
+    ez = s.player_tune[0]
+    assert ez.counters() == (0, 0, 0, 0, 0, 0) and ez.what_if_hits == [0] * 8
+    assert (ez.want_hash, ez.want_extra_ms, ez.want_seq, ez.use_extra_ms, ez.use_seq, ez.use_on,
+            ez.use_entity, ez.center_ms) == (5, 50, 7, 50, 7, 1, 0x103, 50)
+
+
+def test_name_hash_is_fnv1a_of_the_name_bytes(monkeypatch):
+    # The FNV-1a 32 test vectors.
+    assert lc.fnv1a32(b"") == 0x811C9DC5
+    assert lc.fnv1a32(b"a") == 0xE40C292C
+    assert lc.fnv1a32(b"foobar") == 0xBF9CF968
+    assert lc.name_hash("foobar") == lc.name_hash(b"foobar") == 0xBF9CF968
+    # As the helper holds it: up to the first NUL, at most 31 bytes, latin-1.
+    assert lc.name_hash(b"foobar\0junk") == 0xBF9CF968
+    long = "x" * 40
+    assert lc.name_hash(long) == lc.fnv1a32(b"x" * 31)
+    assert lc.name_hash("René") == lc.fnv1a32(b"Ren\xe9")
+    # A name read from a block hashes to the same as the bytes the helper hashes.
+    b = _v6()
+    _seat(b, 0, b"\xc6sir 2", 50)
+    _, s = lc.parse_stats(bytes(b), now_ticks=1)
+    assert lc.name_hash(s.player_tune[0].name) == lc.fnv1a32(b"\xc6sir 2")
+    # 0 means "no own value": a name that hashes to 0 gets 1.
+    monkeypatch.setattr(lc, "fnv1a32", lambda data: 0)
+    assert lc.name_hash("anyone") == 1
+
+
+def test_personal_extra_is_the_helpers_rule():
+    g = 70
+    assert lc.personal_extra(50, g, 45) == 50                  # below the server Extra: as it is
+    assert lc.personal_extra(110, g, 60) == 110                # +40, 60 + 110 = 170
+    assert lc.personal_extra(130, g, 60) == 110                # at most the server Extra + 40
+    assert lc.personal_extra(110, g, 160) == 90                # 250 ms of ping + Extra
+    assert lc.personal_extra(110, g, 200) == 70                # past that already: no increase
+    assert lc.personal_extra(-20, g, 200) == -20               # decreases always allowed
+    assert lc.personal_extra(-50, g, 35) == -35                # down to no rewind at all
+    assert lc.personal_extra(-500, g, 0) == 0
+
+
+class _Recorder:
+    def __init__(self):
+        self.writes = []
+
+    def write(self, address, data):
+        self.writes.append((address, bytes(data)))
+
+
+def test_the_writer_puts_the_value_first_then_the_hash_then_the_number():
+    mem = _Recorder()
+    row = 0x5000 + 28980 + 7 * 88
+    lc.write_want(mem, 0x5000, 7, 0xDEADBEEF, -35, 12)
+    assert mem.writes == [(row + 4, struct.pack("<i", -35)),
+                          (row + 0, struct.pack("<I", 0xDEADBEEF)),
+                          (row + 8, struct.pack("<I", 12))]
+    assert mem.writes[0][1] == b"\xdd\xff\xff\xff"            # little-endian
+    lc.write_pt_apply(mem, 0x5000, True)
+    lc.write_pt_apply(mem, 0x5000, False)
+    assert mem.writes[3:] == [(0x5000 + 28964, b"\x01\0\0\0"), (0x5000 + 28964, b"\0\0\0\0")]
+    with pytest.raises(ValueError):
+        lc.write_want(mem, 0x5000, 250, 1, 2, 3)
+    assert lc.next_seq(0) == 1 and lc.next_seq(7) == 8 and lc.next_seq(0xFFFFFFFF) == 1
+
+
+def _on(b):
+    _, s = lc.parse_stats(bytes(b), now_ticks=2000)
+    return lc.State(lc.ON, shared=0x5000, ready=True, settings=lc.Settings(extra_ms=70), stats=s)
+
+
+def test_sync_writes_only_what_differs_and_bumps_the_number():
+    b = _v6()
+    h_ez, h_a = lc.name_hash("ez"), lc.name_hash("A-99")
+    _seat(b, 3, b"ez", 45, want_hash=h_ez, want_extra_ms=50, want_seq=7)     # as wanted
+    _seat(b, 9, b"A-99", 120, want_hash=h_a, want_extra_ms=90, want_seq=0xFFFFFFFF)
+    _seat(b, 12, b"New", 80)                                                   # nothing yet
+    b.player_tune[20].want_hash, b.player_tune[20].want_extra_ms = 555, 30     # left
+    b.player_tune[20].want_seq = 4
+    st = _on(b)
+    wants = {3: (h_ez, 50), 9: (h_a, 110), 12: (lc.name_hash("New"), 70)}
+    assert lc.tune_changes(st.stats, wants, True) == (True, [
+        (9, h_a, 110, 1), (12, lc.name_hash("New"), 70, 1), (20, 0, 30, 5)])
+    mem = _Recorder()
+    assert lc.sync_player_tune(mem, st, wants, True) == [9, 12, 20]
+    assert mem.writes[0] == (0x5000 + 28964, b"\x01\0\0\0")                 # ptApply first
+    row20 = 0x5000 + 28980 + 20 * 88
+    assert mem.writes[-3:] == [(row20 + 4, struct.pack("<i", 30)), (row20, b"\0\0\0\0"),
+                               (row20 + 8, struct.pack("<I", 5))]           # cleared: hash 0
+    assert len(mem.writes) == 1 + 3 * 3
+    # Written: nothing more to do (the rows were brought up to date as well).
+    assert lc.tune_changes(st.stats, wants, True) == (False, [])
+    assert lc.sync_player_tune(mem, st, wants, True) == [] and len(mem.writes) == 10
+
+
+def test_sync_leaves_older_blocks_and_other_helpers_alone():
+    mem = _Recorder()
+    b = _v6()
+    _seat(b, 3, b"ez", 45)
+    wants = {3: (lc.name_hash("ez"), 50)}
+    st = _on(b)
+    for kind in (lc.OLD, lc.STOCK, lc.PARTIAL):
+        assert lc.sync_player_tune(mem, lc.State(kind, shared=0x5000, stats=st.stats),
+                                   wants, True) == []
+    b.version, b.size = 5, V5_BYTES
+    assert lc.sync_player_tune(mem, _on(b), wants, True) == []
+    assert lc.sync_player_tune(mem, None, wants, True) == [] and mem.writes == []
+
+
+def test_the_old_server_wide_auto_tune_is_always_written_off():
+    """Retired (2026-11-23): whatever the page's Auto-tune says, the helper's
+    own tuneMode is 0.  The page's setting is the tuner per player now."""
+    class Proc:
+        def __init__(self, version, size):
+            self.head = struct.pack("<II", version, size)
+            self.writes = {}
+
+        def read(self, address, size):
+            assert (address, size) == (0x5000 + 4, 8)
+            return self.head
+
+        def write(self, address, data):
+            self.writes[address - 0x5000] = bytes(data)
+
+    for mode in (lc.TUNE_OFF, lc.TUNE_WATCH, lc.TUNE_APPLY):
+        proc = Proc(5, V5_BYTES)
+        lc._write_settings(proc, 0x5000, lc.Settings(False, 70, 300, 0, mode), True)
+        assert proc.writes[lc._OFF["tune_mode"]] == b"\0\0\0\0"
+        assert proc.writes[lc._OFF["enabled"]] == b"\x01\0\0\0"
+        assert struct.unpack("<iiii", proc.writes[lc._OFF["observe"]]) == (0, 70, 300, 0)
+    proc = Proc(2, lc._V2_SIZE)                                  # no tuner in it: never written
+    lc._write_settings(proc, 0x5000, lc.Settings(tune_mode=lc.TUNE_APPLY), True)
+    assert lc._OFF["tune_mode"] not in proc.writes
+
+
+def test_describe_setting_says_the_auto_tune_per_player():
+    assert lc.describe_setting(lc.Settings(False, 70, 300, 0, lc.TUNE_WATCH)) == \
+        "ping +70 ms (auto-tune per player: watch), none under 0, max 300"
+    assert lc.describe_setting(lc.Settings(False, 70, 300, 0, lc.TUNE_APPLY)) == \
+        "ping +70 ms (auto-tune per player: on), none under 0, max 300"
+    assert lc.describe_setting(lc.Settings(True, 70, 300, 0, lc.TUNE_OFF)) == \
+        "watch only, ping +70 ms, none under 0, max 300"
+    # An older WolfRAT's server-wide auto-tune still holding its own value.
+    assert lc.describe_setting(lc.Settings(False, 70, 300, 0), 65) == \
+        "ping +65 ms (server-wide auto from +70), none under 0, max 300"
+    assert lc.describe_setting(lc.Settings(False, 70, 300, 0), 70) == \
+        "ping +70 ms, none under 0, max 300"
+
+
+def test_history_row_and_snapshot_keep_the_tune_rows_and_the_tuner(tmp_path):
+    b = _v6(tests=900, hits=200, plain_hits=150, stats_since=1000, pt_apply=0)
+    _seat(b, 3, b"ez", 45, want_hash=lc.name_hash("ez"), want_extra_ms=50, want_seq=2,
+          center_ms=50, steps=900, center_hits=300, down_wins=79, down_losses=39,
+          up_wins=20, up_losses=31, what_if_hits=[1, 2, 3, 4, 5, 6, 7, 8])
+    s = lc.parse_stats(bytes(b), now_ticks=61000)[1]
+    settings = lc.Settings(False, 70, 300, 0, lc.TUNE_WATCH)
+    tuned = {"mode": "watch", "server_extra": 70, "differ": {"ez": 50}, "locked": [],
+             "top_limit": [], "moves": []}
+    book = lc.HistoryBook(str(tmp_path / "h.json"))
+    assert book.record(77, s, settings, now=1_700_000_000, player_tune=tuned)
+    book.save()
+    row = json.loads((tmp_path / "h.json").read_text(encoding="utf-8"))[0]
+    assert row["setting"] == "ping +70 ms (auto-tune per player: watch), none under 0, max 300"
+    assert row["auto_tune"] == tuned and row["pt_apply"] == 0
+    assert row["player_tune"] == [{"slot": 3, "name": "ez", "ping": 45, "want": 50, "use": None,
+                                   "center": 50, "steps": 900, "center_hits": 300,
+                                   "down": [79, 39], "up": [20, 31],
+                                   "what_if": [1, 2, 3, 4, 5, 6, 7, 8]}]
+    logger = lc.EventLogger(str(tmp_path))
+    line = logger.record_poll(77, s, settings, include_snapshot=True, now=1_700_000_000)[-1]
+    assert "active Extra +70 ms [per player: watch]" in line
+    snap = json.loads((tmp_path / "wolfrat_lag_comp_events.jsonl").read_text(
+        encoding="utf-8").splitlines()[-1])
+    assert snap["player_tune"][0]["down"] == [79, 39] and snap["player_tune_mode"] == "watch"
+    # A version 5 helper: none of the new keys.
+    b.version, b.size = 5, V5_BYTES
+    s5 = lc.parse_stats(bytes(b), now_ticks=61000)[1]
+    book5 = lc.HistoryBook(str(tmp_path / "h5.json"))
+    book5.record(5, s5, settings, now=1_700_000_000)
+    assert "player_tune" not in book5.rows[0] and "pt_apply" not in book5.rows[0]
+    assert "auto_tune" not in book5.rows[0]
+
+
+def test_the_helpers_minutes_with_its_own_auto_tune_off_are_not_logged(tmp_path):
+    """The helper notes a minute even with its server-wide auto-tune off, and
+    WolfRAT keeps that off now: those minutes decided nothing."""
+    logger = lc.EventLogger(str(tmp_path))
+    off = _tuner_stats([1, 2, 3])
+    off.tune_mode = lc.TUNE_OFF
+    assert logger.record_poll(999, off, TUNED) == []
+    # An older WolfRAT's helper with it still on is logged as before - from its
+    # next minute, not again for the ones already passed.
+    on = _tuner_stats([1, 2, 3, 4])
+    added = logger.record_poll(999, on, TUNED)
+    assert len(added) == 1 and "Auto-tune min #4 [apply]" in added[0]

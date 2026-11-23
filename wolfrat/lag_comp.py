@@ -39,8 +39,10 @@ DLL_NAME = "wolfrat_lagcomp.dll"
 LOADED_PREFIX = "wolfrat_lagcomp_"
 EXPORT_NAME = b"WolfRatLagComp"
 MAGIC = 0x31434C57
-VERSION = 5              # 5 = claymore shrapnel never rewound, counted apart
-                         # (4 = bots, dead bodies apart, what-if table, owner; 3 = auto-tune)
+VERSION = 6              # 6 = auto-tune per player: each player's own Extra, tested
+                         # at +-40 by the helper, decided by WolfRAT (player_tune.py)
+                         # (5 = claymore shrapnel never rewound, counted apart;
+                         # 4 = bots, dead bodies apart, what-if table, owner; 3 = auto-tune)
 
 SLOTS = 250
 LEGACY_SLOTS = 64
@@ -53,7 +55,9 @@ TUNE_LOG = 64
 TUNE_OFF = 0
 TUNE_WATCH = 1
 TUNE_APPLY = 2
-TUNE_MODE_NAMES = {TUNE_OFF: "off", TUNE_WATCH: "watch", TUNE_APPLY: "apply"}
+TUNE_MODE_NAMES = {TUNE_OFF: "off", TUNE_WATCH: "watch", TUNE_APPLY: "apply"}   # the old
+                         # server-wide auto-tune's words, as its decision log has them
+PT_MODE_NAMES = {TUNE_OFF: "off", TUNE_WATCH: "watch", TUNE_APPLY: "on"}         # per player
 BOTS_LABEL = "Bots (AI)"
 WHATIF_BANDS = 6         # SHOOTER ping bands: under 50, 50-79, 80-99, 100-149, 150-199, 200+
 WHATIF_COLS = 8          # column 0 = plain JO; 1..7 = a rewind of ping + offset
@@ -61,6 +65,17 @@ WHATIF_PLAIN = 0x7FFFFFFF                      # the offset that means "plain JO
 WHATIF_OFFSETS = (WHATIF_PLAIN, -80, -40, 0, 40, 80, 120, 160)   # as the helper writes them
 WHATIF_BAND_MIN_PING = (0, 50, 80, 100, 150, 200)
 WHATIF_MIN_BULLETS = 300                       # fewer than this: "not enough yet"
+
+# Auto-tune per player (helper version 6; tmp/autotune2/SPEC.md, 2026-11-23).
+# One Extra for the whole server scored flat (+2% at best, in hindsight), but
+# players differ, so each player gets their own Extra, learned from their own
+# bullets.  The helper tests each shooter's own Extra (the centre) and 40 ms
+# either side; WolfRAT decides (player_tune.py) and writes the value back.
+# The helper uses the same names and values.
+PT_SPREAD_MS = 40        # the helper tests centre - 40, centre and centre + 40
+PT_UP_LIMIT_MS = 40      # a player's Extra is at most the server Extra + 40
+PT_UP_TOTAL_MS = 250     # above the server Extra, ping + Extra never goes past 250 ms
+PT_ADOPT_WAIT_S = 120    # On: a new value is taken on at death, or after 120 s alive
 
 # Retail 1.7.5.7 / TAC / FMJ call sites, so WolfRAT can spot onHook's own
 # lag compensation before loading its helper DLL.
@@ -89,9 +104,15 @@ SETTINGS_STEPS = (
     (1, {"tune_mode": (TUNE_APPLY, TUNE_WATCH),
          "max_ms": (400, 300),
          "min_ping_ms": (80, 0)}),
+    # 2026-11-23 (auto-tune per player): "Auto-tune" now means the per-player
+    # tuner (player_tune.py), not the retired server-wide one.  An install that
+    # had the old one On would switch the new one straight on, changing hits
+    # from evidence nobody has looked at yet: it starts by watching, once.
+    # Off stays off and Watch stays Watch (an admin's choice either way).
+    (2, {"tune_mode": (TUNE_APPLY, TUNE_WATCH)}),
 )
 SETTINGS_LEVEL = SETTINGS_STEPS[-1][0]
-_TUNE_TEXT = {TUNE_OFF: "Off", TUNE_WATCH: "Watch", TUNE_APPLY: "On (apply)"}
+_TUNE_TEXT = {TUNE_OFF: "Off", TUNE_WATCH: "Watch", TUNE_APPLY: "On"}
 
 
 def _setting_text(key: str, value: int) -> str:
@@ -102,7 +123,7 @@ def _setting_text(key: str, value: int) -> str:
     return f"{value} ms"
 
 
-_SETTING_NAMES = {"tune_mode": "Auto-tune Extra", "max_ms": "Maximum rewind",
+_SETTING_NAMES = {"tune_mode": "Auto-tune per player", "max_ms": "Maximum rewind",
                   "min_ping_ms": "Minimum ping"}
 
 
@@ -177,6 +198,30 @@ class _WhatIf(ctypes.LittleEndianStructure):
                 ("hits_human", ctypes.c_uint32 * WHATIF_COLS)]
 
 
+class _PlayerTune(ctypes.LittleEndianStructure):
+    """One slot's own Extra (version 6), the same slot as ``players``: what
+    WolfRAT wants for the player (want_*), what the helper has taken on (use_*),
+    and the helper's three tune tests of this shooter's close bullet steps: at
+    their Extra (the centre), centre - 40 and centre + 40.  "Hit" = on a live
+    person.  88 bytes (SPEC.md)."""
+    _pack_ = 4
+    _fields_ = [("want_hash", ctypes.c_uint32),     # WolfRAT: name_hash(name); 0 = no own value
+                ("want_extra_ms", ctypes.c_int32),  # WolfRAT: the player's own Extra, ms
+                ("want_seq", ctypes.c_uint32),      # WolfRAT: bumped (never 0) on every change
+                ("use_extra_ms", ctypes.c_int32),   # helper: the own value in effect (adopted)
+                ("use_seq", ctypes.c_uint32),       # helper: the want_seq it adopted; 0 = none yet
+                ("use_on", ctypes.c_uint32),        # helper: 1 = the player's rewind uses it now
+                ("use_entity", ctypes.c_uint32),    # helper: the entity use_on was set for
+                ("center_ms", ctypes.c_int32),      # helper: the Extra the three tests are centred on
+                ("steps", ctypes.c_uint32),         # helper: close steps tested
+                ("center_hits", ctypes.c_uint32),   # of those, the centre hit
+                ("down_wins", ctypes.c_uint32),     # centre - 40 hit, the centre did not
+                ("down_losses", ctypes.c_uint32),   # the centre hit, centre - 40 did not
+                ("up_wins", ctypes.c_uint32),       # centre + 40 hit, the centre did not
+                ("up_losses", ctypes.c_uint32),     # the centre hit, centre + 40 did not
+                ("what_if_hits", ctypes.c_uint32 * WHATIF_COLS)]   # the what-if columns, this shooter
+
+
 class _Shared(ctypes.LittleEndianStructure):
     _pack_ = 4
     _fields_ = [("magic", ctypes.c_uint32), ("version", ctypes.c_uint32),
@@ -234,7 +279,16 @@ class _Shared(ctypes.LittleEndianStructure):
                 ("device_hits", ctypes.c_uint32),   # of those, the game's answer hit a live person
                 ("device_rule", ctypes.c_uint32),   # 1 = this exe's ray layout recognised, rule on;
                                                     # 0 = not: claymores are rewound as before
-                ("reserved5", ctypes.c_uint32)]
+                ("reserved5", ctypes.c_uint32),
+                # version 6, appended (tmp/autotune2/SPEC.md, 2026-11-23): auto-tune
+                # per player.  WolfRAT writes each player's own Extra; the helper
+                # takes it on (at death, or after 120 s) and tests it.  A WolfRAT
+                # that never writes here (wantHash 0 everywhere) = version 5.
+                ("pt_apply", ctypes.c_int32),       # WolfRAT: 1 = On, a player's own Extra is used;
+                                                    # 0 = Off / Watch: the server Extra is
+                ("pt_spread_ms", ctypes.c_int32),   # helper: 40 (the test spread)
+                ("reserved6", ctypes.c_uint32 * 2),
+                ("player_tune", _PlayerTune * SLOTS)]
 
 
 class _TuneStep(ctypes.LittleEndianStructure):
@@ -256,12 +310,18 @@ _V3_SIZE = _OFF["bot_totals"]              # 28,420: a block this big has the au
 # row, no what-if table, and no owner stamp, so two WolfRATs would fight over
 # the calls again.
 _V4_SIZE = _OFF["device_steps"]            # 28,948: bots, what-if table, owner
-_V5_SIZE = SHARED_SIZE                     # 28,964: claymore shrapnel counted apart
+# Pinned the same way: a version 5 helper's block is 28,964 bytes for good.
+_V5_SIZE = _OFF["pt_apply"]                # 28,964: claymore shrapnel counted apart
+_V6_SIZE = SHARED_SIZE                     # 50,980: auto-tune per player
+_TUNE_ROW = ctypes.sizeof(_PlayerTune)
 # The helper checks the same numbers when it is built (SPEC.md).
 assert ctypes.sizeof(_WhatIf) == 68
 assert _V3_SIZE == 28420, "the version 3 part of the block must not move"
 assert _V4_SIZE == 28948, "the version 4 part of the block must not move"
-assert ctypes.sizeof(_Shared) == 28964, "version 5 block is 28,964 bytes"
+assert _V5_SIZE == 28964, "the version 5 part of the block must not move"
+assert _TUNE_ROW == 88
+assert _OFF["player_tune"] == 28980
+assert ctypes.sizeof(_Shared) == 50980, "version 6 block is 50,980 bytes"
 assert _OFF["owner_heartbeat"] == _OFF["owner_pid"] + 4
 
 
@@ -381,6 +441,45 @@ def what_if_column_label(offset_ms: int) -> str:
 
 
 @dataclass
+class PlayerTuneRow:
+    """One slot of the version 6 per-player tune rows (see _PlayerTune).  name /
+    ping / entity are the slot's player row (empty: no player now)."""
+    slot: int
+    name: str
+    ping: int
+    entity: int
+    want_hash: int = 0
+    want_extra_ms: int = 0
+    want_seq: int = 0
+    use_extra_ms: int = 0
+    use_seq: int = 0
+    use_on: int = 0
+    use_entity: int = 0
+    center_ms: int = 0
+    steps: int = 0
+    center_hits: int = 0
+    down_wins: int = 0
+    down_losses: int = 0
+    up_wins: int = 0
+    up_losses: int = 0
+    what_if_hits: list = field(default_factory=list)
+
+    @property
+    def present(self) -> bool:
+        return bool(self.entity)
+
+    def counters(self) -> tuple:
+        """(steps, centre hits, down wins, down losses, up wins, up losses)."""
+        return (self.steps, self.center_hits, self.down_wins, self.down_losses,
+                self.up_wins, self.up_losses)
+
+    @property
+    def adopted(self) -> bool:
+        """The helper has taken on the value WolfRAT wrote last."""
+        return bool(self.want_seq) and self.use_seq == self.want_seq
+
+
+@dataclass
 class TuneStep:
     minute: int
     tick_count: int
@@ -437,6 +536,11 @@ class Stats:
     device_hits: int = 0                   #   rewound, counted apart (not in tests / hits)
     device_rule: int = 0                   # 1 = the helper can tell a claymore's rounds apart on
                                            # this exe; 0 = it cannot, they are rewound as before
+    has_v6: bool = False                   # helper version 6 or later: auto-tune per player
+    pt_apply: int = 0                      # 1 = the players' own Extras are used (On)
+    pt_spread_ms: int = 0                  # the helper's test spread (40)
+    player_tune: list = field(default_factory=list)   # PlayerTuneRow: every slot with a
+                                           # player, and any empty slot WolfRAT still holds a value in
 
     @property
     def gain_percent(self) -> Optional[float]:
@@ -513,6 +617,7 @@ def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, S
     has_tuner = len(raw) >= _V3_SIZE and ver >= 3 and sz >= _V3_SIZE
     has_v4 = len(raw) >= _V4_SIZE and ver >= 4 and sz >= _V4_SIZE
     has_v5 = len(raw) >= _V5_SIZE and ver >= 5 and sz >= _V5_SIZE
+    has_v6 = len(raw) >= _V6_SIZE and ver >= 6 and sz >= _V6_SIZE
     if len(raw) < SHARED_SIZE:
         raw = raw + b"\0" * (SHARED_SIZE - len(raw))
     shared = _Shared.from_buffer_copy(raw[:SHARED_SIZE])
@@ -542,6 +647,14 @@ def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, S
         # Version 5: the two claymore counters go; device_rule is what the
         # helper found in this exe, not a count, and stays.
         shared.device_steps = shared.device_hits = 0
+        # Version 6: each slot's tune counters go (steps .. whatIfHits); the want
+        # and use fields, the centre and the entity stay (SPEC.md, rule 6).
+        if has_v6:
+            for t in shared.player_tune:
+                t.steps = t.center_hits = 0
+                t.down_wins = t.down_losses = t.up_wins = t.up_losses = 0
+                for c in range(WHATIF_COLS):
+                    t.what_if_hits[c] = 0
     cal = list(shared.cal)
     low, mid, high = histogram_quantiles(cal)
     stats = Stats(shared.tests, shared.hits, shared.plain_hits, shared.gained,
@@ -619,7 +732,147 @@ def parse_stats(raw: bytes, now_ticks: Optional[int] = None) -> tuple[_Shared, S
         stats.device_steps = int(shared.device_steps)
         stats.device_hits = int(shared.device_hits)
         stats.device_rule = int(shared.device_rule)
+    # The same for version 6: past the end of a version 5 block is that helper's
+    # other memory, never want / use fields or counters.
+    stats.has_v6 = has_v6
+    if has_v6:
+        stats.pt_apply = int(shared.pt_apply)
+        stats.pt_spread_ms = int(shared.pt_spread_ms)
+        stats.player_tune = player_tune_rows(shared)
     return shared, stats
+
+
+def player_tune_rows(shared: _Shared) -> list:
+    """The version 6 tune rows worth looking at: every slot with a player, and
+    every empty slot that still holds a value from WolfRAT (to be cleared)."""
+    rows = []
+    for i in range(SLOTS):
+        p = shared.players[i]
+        t = shared.player_tune[i]
+        if not p.entity and not t.want_hash and not t.want_seq:
+            continue
+        name = p.name.split(b"\0")[0].decode("latin-1", "replace") if p.entity else ""
+        rows.append(PlayerTuneRow(
+            i, name, int(p.ping) if p.entity else 0, int(p.entity),
+            int(t.want_hash), int(t.want_extra_ms), int(t.want_seq),
+            int(t.use_extra_ms), int(t.use_seq), int(t.use_on), int(t.use_entity),
+            int(t.center_ms), int(t.steps), int(t.center_hits),
+            int(t.down_wins), int(t.down_losses), int(t.up_wins), int(t.up_losses),
+            [int(n) for n in t.what_if_hits]))
+    return rows
+
+
+# ------------------------------------------------- auto-tune per player (v6)
+def name_hash(name) -> int:
+    """FNV-1a 32 of a player's name as the helper holds it in ``players[].name``:
+    the bytes up to the first NUL, at most 31; a hash of 0 becomes 1 (0 means
+    "no own value").  A str is the latin-1 text parse_stats made of those bytes."""
+    data = name if isinstance(name, (bytes, bytearray)) else str(name).encode("latin-1", "replace")
+    return fnv1a32(bytes(data).split(b"\0", 1)[0][:31]) or 1
+
+
+def fnv1a32(data: bytes) -> int:
+    h = 0x811C9DC5
+    for b in data:
+        h = ((h ^ b) * 0x01000193) & 0xFFFFFFFF
+    return h
+
+
+def personal_extra(value_ms: int, server_extra_ms: int, ping_ms: int) -> int:
+    """The helper's PersonalExtra (SPEC.md, rule 1): a player's own Extra as the
+    helper uses it.  Above the server Extra at most +40 and at most 250 ms of
+    ping + Extra (if ping + server Extra is past that already, no increase);
+    down to no rewind at all (Extra = -ping).  The maximum rewind still applies
+    afterwards, as for everyone."""
+    g, value, rtt = int(server_extra_ms), int(value_ms), int(ping_ms)
+    if value > g:
+        value = min(value, g + PT_UP_LIMIT_MS, max(g, PT_UP_TOTAL_MS - rtt))
+    if value < -rtt:
+        value = -rtt
+    return value
+
+
+def server_extra(state: Optional["State"]) -> int:
+    """The helper's EffectiveExtraMs: the Extra of everyone without an own
+    value.  The block's Extra - unless the server-wide auto-tune of an older
+    WolfRAT is still applying a value of its own there."""
+    stats = state.stats if state is not None else None
+    if stats is not None and stats.has_tuner and stats.tune_mode == TUNE_APPLY:
+        return int(stats.tune_value_ms)
+    if state is not None and state.settings is not None:
+        return int(state.settings.extra_ms)
+    return DEFAULT_EXTRA_MS
+
+
+def write_pt_apply(memory, shared: int, apply: bool) -> None:
+    """ptApply: 1 = On (the players' own Extras are used), 0 = Off / Watch."""
+    memory.write(shared + _OFF["pt_apply"], struct.pack("<i", 1 if apply else 0))
+
+
+def write_want(memory, shared: int, slot: int, want_hash: int, want_extra_ms: int,
+               want_seq: int) -> None:
+    """One slot's want fields, in the order the helper relies on: the value
+    first, then whose it is, then the number that says it is new.  The hash
+    before the value could let the helper take the slot's previous player's
+    value on for the new one (a new player's first value is taken at once)."""
+    if not 0 <= slot < SLOTS:
+        raise ValueError("slot out of range")
+    row = shared + _OFF["player_tune"] + slot * _TUNE_ROW
+    memory.write(row + _PlayerTune.want_extra_ms.offset, struct.pack("<i", int(want_extra_ms)))
+    memory.write(row + _PlayerTune.want_hash.offset, struct.pack("<I", int(want_hash) & 0xFFFFFFFF))
+    memory.write(row + _PlayerTune.want_seq.offset, struct.pack("<I", int(want_seq) & 0xFFFFFFFF))
+
+
+def next_seq(seq: int) -> int:
+    """The next wantSeq: one more, never 0."""
+    return ((int(seq) + 1) & 0xFFFFFFFF) or 1
+
+
+def tune_changes(stats: Optional[Stats], wants: dict, apply: bool) -> tuple:
+    """What it takes to bring a version 6 block to what WolfRAT wants:
+    (ptApply differs, [(slot, hash, Extra ms, next wantSeq), ...]).
+
+    ``wants`` = {slot: (hash, Extra ms)} for the players who get an own value
+    now; every other slot is cleared (hash 0 = the server Extra).  A slot is
+    written only when it differs from the block, with the next wantSeq taken
+    from the block itself (a restarted WolfRAT carries on the numbering)."""
+    if stats is None or not stats.has_v6:
+        return False, []
+    rows = {r.slot: r for r in stats.player_tune}
+    out = []
+    for slot in sorted(set(rows) | set(wants)):
+        want_hash, want_extra = wants.get(slot, (0, 0))
+        r = rows.get(slot)
+        have_hash = r.want_hash if r else 0
+        have_extra = r.want_extra_ms if r else 0
+        if not want_hash:
+            if not have_hash:
+                continue                      # no own value, and none held
+            want_extra = have_extra           # cleared: only the hash says so
+        elif have_hash == want_hash and have_extra == want_extra:
+            continue
+        out.append((slot, want_hash, want_extra, next_seq(r.want_seq if r else 0)))
+    return bool(stats.pt_apply) != bool(apply), out
+
+
+def sync_player_tune(memory, state: Optional["State"], wants: dict, apply: bool) -> list:
+    """Write what tune_changes found into this WolfRAT's own running helper
+    (ptApply first, then each slot).  Returns the slots written.  Nothing for an
+    older block, or a helper this WolfRAT does not run."""
+    if state is None or not state.on or not state.shared or not state.stats:
+        return []
+    s = state.stats
+    apply_differs, changes = tune_changes(s, wants, apply)
+    if apply_differs:
+        write_pt_apply(memory, state.shared, apply)
+        s.pt_apply = 1 if apply else 0
+    rows = {r.slot: r for r in s.player_tune}
+    for slot, want_hash, want_extra, seq in changes:
+        write_want(memory, state.shared, slot, want_hash, want_extra, seq)
+        r = rows.get(slot)
+        if r is not None:
+            r.want_hash, r.want_extra_ms, r.want_seq = want_hash, want_extra, seq
+    return [slot for slot, *_ in changes]
 
 
 def _tick_count() -> int:
@@ -1109,7 +1362,11 @@ def _write_settings(proc: ServerProcess, shared: int, settings: Settings, enable
     try:
         ver, sz = struct.unpack("<II", proc.read(shared + 4, 8))
         if ver >= 3 and sz >= _V3_SIZE:
-            proc.write(shared + _OFF["tune_mode"], struct.pack("<i", int(s.tune_mode)))
+            # The helper's own server-wide auto-tune is retired (2026-11-23): one
+            # Extra for everyone scored flat from +40 to +80, so it could only
+            # wander.  Always Off.  Settings.tune_mode is now WolfRAT's tuner per
+            # player (player_tune.py), which writes the version 6 fields.
+            proc.write(shared + _OFF["tune_mode"], struct.pack("<i", TUNE_OFF))
     except LagCompError:
         pass
     proc.write(shared + _OFF["enabled"], struct.pack("<i", 1 if enabled else 0))
@@ -1208,22 +1465,23 @@ def server_state(pid: int, wanted_name: Optional[str] = None) -> State:
         return read_state(proc, wanted_name)
 
 
+TUNE_MODE_WORDS = {TUNE_WATCH: "auto-tune per player: watch",
+                   TUNE_APPLY: "auto-tune per player: on"}
+
+
 def describe_setting(s: Settings, live_extra_ms: Optional[int] = None) -> str:
+    """One line for a setting.  ``s.tune_mode`` is the auto-tune per player
+    (WolfRAT's).  ``live_extra_ms`` is the Extra the helper really uses for
+    everyone without an own value: it differs from ``s.extra_ms`` only while the
+    retired server-wide auto-tune of an older WolfRAT still holds a value."""
     sign = "+" if s.extra_ms >= 0 else ""
-    if s.tune_mode == TUNE_APPLY:
-        if live_extra_ms is not None:
-            lsign = "+" if live_extra_ms >= 0 else ""
-            extra_part = f"ping {lsign}{live_extra_ms} ms (auto from {sign}{s.extra_ms})"
-        else:
-            extra_part = f"ping {sign}{s.extra_ms} ms (auto-tune)"
-    elif s.tune_mode == TUNE_WATCH:
-        if live_extra_ms is not None:
-            lsign = "+" if live_extra_ms >= 0 else ""
-            extra_part = f"ping {sign}{s.extra_ms} ms (auto-watch: {lsign}{live_extra_ms})"
-        else:
-            extra_part = f"ping {sign}{s.extra_ms} ms (auto-watch)"
+    if live_extra_ms is not None and live_extra_ms != s.extra_ms:
+        lsign = "+" if live_extra_ms >= 0 else ""
+        extra_part = f"ping {lsign}{live_extra_ms} ms (server-wide auto from {sign}{s.extra_ms})"
     else:
         extra_part = f"ping {sign}{s.extra_ms} ms"
+    if s.tune_mode in TUNE_MODE_WORDS:
+        extra_part += f" ({TUNE_MODE_WORDS[s.tune_mode]})"
     text = f"{extra_part}, none under {s.min_ping_ms}, max {s.max_ms}"
     return ("watch only, " + text) if s.observe else text
 
@@ -1343,6 +1601,24 @@ def v5_record(stats: Stats) -> dict:
             "device_rule": stats.device_rule}
 
 
+def v6_record(stats: Stats) -> dict:
+    """What a version 6 helper adds, for a history row or a snapshot line: each
+    player's own Extra as the helper holds it and their tune counters (so a rule
+    can be replayed on them later).  Players on now only.  Older rows and lines
+    simply do not have these keys."""
+    rows = []
+    for r in stats.player_tune:
+        if not r.present:
+            continue
+        rows.append({"slot": r.slot, "name": r.name, "ping": r.ping,
+                     "want": r.want_extra_ms if r.want_hash else None,
+                     "use": r.use_extra_ms if r.use_on else None,
+                     "center": r.center_ms, "steps": r.steps, "center_hits": r.center_hits,
+                     "down": [r.down_wins, r.down_losses], "up": [r.up_wins, r.up_losses],
+                     "what_if": list(r.what_if_hits)})
+    return {"pt_apply": stats.pt_apply, "player_tune": rows}
+
+
 class HistoryBook:
     """One row per counting session (a server run, or since the last restart
     of the counters), kept in a small JSON file.  A row is updated in place
@@ -1361,14 +1637,17 @@ class HistoryBook:
         except Exception:
             self.rows = []
 
-    def record(self, pid: int, stats: Stats, settings: Settings, now: Optional[float] = None) -> bool:
-        """Note the session's latest numbers.  False when there is nothing yet."""
+    def record(self, pid: int, stats: Stats, settings: Settings, now: Optional[float] = None,
+               player_tune: Optional[dict] = None) -> bool:
+        """Note the session's latest numbers.  False when there is nothing yet.
+        ``player_tune`` = the auto-tune per player's state (PlayerTuner.summary)."""
         import time
         if not stats.tests:
             return False
         now = time.time() if now is None else now
         key = f"{pid}-{stats.since:08x}"
-        live_extra = stats.tune_value_ms if stats.has_tuner else None
+        live_extra = stats.tune_value_ms if (stats.has_tuner
+                                             and stats.tune_mode == TUNE_APPLY) else None
         row = {"key": key,
                "started": time.strftime("%Y-%m-%d %H:%M", time.localtime(now - stats.seconds)),
                "minutes": round(stats.seconds / 60.0),
@@ -1387,6 +1666,10 @@ class HistoryBook:
             row.update(v4_record(stats))
         if stats.has_v5:
             row.update(v5_record(stats))
+        if stats.has_v6:
+            row.update(v6_record(stats))
+        if player_tune is not None:
+            row["auto_tune"] = player_tune
         if stats.has_targets:
             row["bands"] = [b.as_dict() for b in stats.bands]
             # Players who left keep their last numbers (the helper drops their row).
@@ -1524,7 +1807,13 @@ class EventLogger:
             self._last_tune_minute = 0
             self._logged = self._logged_steps(pid)
         mode_name = TUNE_MODE_NAMES.get(stats.tune_mode if stats.has_tuner else settings.tune_mode, "off")
-        if stats.has_tuner and stats.tune_log:
+        if stats.has_tuner and stats.tune_log and stats.tune_mode == TUNE_OFF:
+            # The helper notes a minute even with its server-wide auto-tune off,
+            # and WolfRAT keeps that off for good now (the tuner is per player):
+            # those minutes decide nothing and are not logged.
+            self._last_tune_minute = max([self._last_tune_minute]
+                                         + [st.minute for st in stats.tune_log])
+        elif stats.has_tuner and stats.tune_log:
             for st in stats.tune_log:
                 if st.minute <= self._last_tune_minute:
                     continue
@@ -1546,7 +1835,11 @@ class EventLogger:
             gain = stats.gain_percent
             gain_str = "-" if gain is None else f"{gain:+.0f}%"
             best_str = "-" if stats.cal_median is None else f"{stats.cal_median:+d} ms"
-            live_extra = stats.tune_value_ms if (stats.has_tuner and settings.tune_mode == TUNE_APPLY) else settings.extra_ms
+            # The Extra of everyone without an own value: the setting, unless an
+            # older helper's server-wide auto-tune still applies its own.
+            live_extra = (stats.tune_value_ms if (stats.has_tuner and stats.tune_mode == TUNE_APPLY)
+                          else settings.extra_ms)
+            pt_mode = PT_MODE_NAMES.get(settings.tune_mode, "off")
             band_parts = []
             for b in stats.bands:
                 lag_pct = b.percent(b.hits_lag, b.close_lag)
@@ -1565,10 +1858,10 @@ class EventLogger:
                                   + "/plain " + ("-" if plain_pct is None else f"{plain_pct:.0f}%"))
             msg = (f"Snapshot ({stats.seconds // 60}m): {stats.hits} hits vs {stats.plain_hits} plain ({gain_str}), "
                    f"saved {stats.gained} / cost {stats.lost}, best {best_str} ({stats.cal_total} shots), "
-                   f"active Extra {live_extra:+d} ms [{mode_name}]{bands_summary}")
+                   f"active Extra {live_extra:+d} ms [per player: {pt_mode}]{bands_summary}")
             added.append(self.note(
                 msg, kind="snapshot", now=now, pid=pid,
-                setting=describe_setting(settings, stats.tune_value_ms if stats.has_tuner else None),
+                setting=describe_setting(settings, live_extra),
                 tick_ms=round(stats.tick_us / 1000.0, 2),
                 seconds=stats.seconds, tests=stats.tests,
                 hits=stats.hits, plain_hits=stats.plain_hits,
@@ -1576,6 +1869,7 @@ class EventLogger:
                 cal_total=stats.cal_total, cal_median=stats.cal_median,
                 cal_low=stats.cal_low, cal_high=stats.cal_high,
                 tune_mode=mode_name,
+                player_tune_mode=pt_mode,
                 tune_value_ms=stats.tune_value_ms if stats.has_tuner else settings.extra_ms,
                 tune_median_ms=stats.tune_median_ms if stats.has_tuner else None,
                 tune_samples=stats.tune_samples if stats.has_tuner else 0,
@@ -1585,6 +1879,7 @@ class EventLogger:
                 targets=[t.__dict__ for t in stats.targets] if stats.has_targets else [],
                 **(v4_record(stats) if stats.has_v4 else {}),
                 **(v5_record(stats) if stats.has_v5 else {}),
+                **(v6_record(stats) if stats.has_v6 else {}),
             ))
         return added
 
