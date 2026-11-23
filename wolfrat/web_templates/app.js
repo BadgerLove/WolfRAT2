@@ -44,7 +44,7 @@ const REASONS = ['Team killing', 'Bad language', 'Spawn camping', 'Cheating'];
 const COMMANDS = [
     ['!next', '', 'Skip to the next map'],
     ['!map', '<name>', 'Run a map from the rotation now'],
-    ['!setnext', '<name>', 'Set the next map'],
+    ['!setnext', '<name>', 'Choose the next map'],
     ['!list', '', 'Show the rotation in game chat'],
     ['!add', '<name>', 'Add a map to the rotation'],
     ['!remove', '<name>', 'Take a map out of the rotation'],
@@ -664,6 +664,12 @@ async function pairWithCode(raw) {
     });
     setBusy('pair-go', false, 'Pair this phone');
     return acceptSignin(res, 'pair');
+}
+
+/** The access-token form (username + token from the Web Admin tab). */
+function doLogin(event) {
+    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+    return signInWithToken();
 }
 
 async function signInWithToken(username, token) {
@@ -2656,10 +2662,7 @@ function bindEvents() {
     on($('pair-go'), 'click', () => pairWithCode());
     on($('show-token'), 'click', () => showTokenForm(true));
     on($('show-pair'), 'click', () => showTokenForm(false));
-    on($('token-form'), 'submit', event => {
-        event.preventDefault();
-        signInWithToken();
-    });
+    on($('token-form'), 'submit', doLogin);
     on($('connecting-out'), 'click', () => logout());
 }
 
