@@ -3,7 +3,9 @@
 The behaviour test runs tests/web_client_result_test.js (a fake browser) on
 app.js. The static checks hold the page to its Content-Security-Policy (no
 inline scripts, no inline event handlers, nothing loaded from elsewhere) and
-check the install files: manifest, icons and service worker.
+check the install files: manifest, icons, the notification badge and the
+service worker. (The service worker's push and notification-tap handlers run
+in node too, in the same behaviour test.)
 """
 from pathlib import Path
 import json
@@ -28,14 +30,21 @@ STATIC_FILES = (
     "icon-192.png",
     "icon-512.png",
     "icon-maskable-512.png",
+    "badge-96.png",
 )
 
 
-def png_size(path):
-    data = path.read_bytes()[:24]
+def png_header(path):
+    """(width, height, bit depth, colour type) from the PNG's IHDR."""
+    data = path.read_bytes()[:26]
     if data[:8] != b"\x89PNG\r\n\x1a\n" or data[12:16] != b"IHDR":
         raise AssertionError(f"{path.name} is not a PNG")
-    return struct.unpack(">II", data[16:24])
+    width, height, depth, colour = struct.unpack(">IIBB", data[16:26])
+    return width, height, depth, colour
+
+
+def png_size(path):
+    return png_header(path)[:2]
 
 
 class WebClientResultTests(unittest.TestCase):
@@ -117,6 +126,14 @@ class WebClientStaticTests(unittest.TestCase):
             self.assertEqual("image/png", icons[src]["type"])
             self.assertEqual(purpose, icons[src]["purpose"])
             self.assertEqual(size, png_size(TEMPLATES / src.rsplit("/", 1)[1]))
+
+    def test_notification_badge(self):
+        # Android draws the status-bar badge from the alpha channel only:
+        # 96 x 96, 8-bit RGBA (colour type 6).
+        self.assertEqual((96, 96, 8, 6), png_header(TEMPLATES / "badge-96.png"))
+        worker = (TEMPLATES / "sw.js").read_text(encoding="utf-8")
+        self.assertIn("'/static/badge-96.png'", worker)
+        self.assertIn("'/static/icon-192.png'", worker)
 
     def test_service_worker_keeps_the_app_shell_only(self):
         worker = (TEMPLATES / "sw.js").read_text(encoding="utf-8")
