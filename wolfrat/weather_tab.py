@@ -150,6 +150,7 @@ class WeatherTab(QWidget):
         self._looked = False           # tried to find the server at least once
         self._server_missing = False   # last attempt: no jointops.exe at all
         self._script_answer = None     # the add-on's last answer (None = not asked)
+        self._last_reading = None      # the last poll's weather.Reading (the phone page reads it)
 
         self._settings_file = self.runtime.path("wolfrat_weather.json")
         self._settings = {
@@ -475,6 +476,7 @@ class WeatherTab(QWidget):
         self._controller = self._memory = None
         self._writable = False
         self._script_answer = None
+        self._last_reading = None
 
     def _ensure(self, writable: bool) -> Optional[weather.WeatherController]:
         """Status polling only ever holds a read-only handle; the first real
@@ -562,6 +564,7 @@ class WeatherTab(QWidget):
         except weather.WeatherError as exc:
             self._problem(str(exc))
             return
+        self._last_reading = reading
         if outcome == "ended" and held is not None and held.dry:
             self.log("Dry spell finished - the map's own weather is back.")
             self._announce("The map's own weather is back.")

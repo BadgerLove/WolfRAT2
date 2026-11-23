@@ -214,6 +214,14 @@ class CareerStore:
         self._db.commit()
         self._dirty.clear()
 
+    def peek(self, name: str) -> Optional[Career]:
+        """Exact name (any case) only: the live totals if held, else the saved row.
+        Reads only (find() writes first and also takes a part of a name)."""
+        key = self.key(name)
+        if not key:
+            return None
+        return self._held.get(key) or self._row("name_lower = ?", (key,))
+
     def find(self, name: str) -> Optional[Career]:
         """Exact name first (any case), then the one player whose name holds the text."""
         self.flush()

@@ -31,6 +31,8 @@ from collections.abc import Mapping
 from aiohttp import web
 from aiohttp.web_exceptions import HTTPException
 
+from wolfrat import manual_mode
+from wolfrat import web_state
 from wolfrat.admin_commands import chat_limit
 from wolfrat.protocol import split_chat, wire_log
 
@@ -69,6 +71,18 @@ class BadRequestBody(ValueError):
 PHONE_PREFIX = "[ADMIN] "
 # How long a typed phone command may wait for the WolfRAT window to take it.
 PHONE_COMMAND_TIMEOUT = 10.0
+# How long a desktop action from the phone (on_desktop) may take.  Switching
+# lag comp on can wait up to 15 s for the helper to load into the server.
+DESKTOP_TIMEOUT = 10.0
+DESKTOP_TIMEOUTS = {'lagcomp': 25.0}
+BUSY_TEXT = 'WolfRAT is busy and has not answered (it may still do it)'
+# Longest free text the phone may send with an action (the desktop checks
+# the real limits: a warning must fit chat, a private line 118 characters).
+ACTION_TEXT_MAX = 200
+# Player actions the WolfRAT window runs (ban list, announcements, private
+# lines); the others go straight to the server as before.
+DESKTOP_PLAYER_ACTIONS = frozenset({'kick', 'ban', 'warn', 'message'})
+PLAYER_ACTIONS = DESKTOP_PLAYER_ACTIONS | {'kill', 'swap', 'zero'}
 
 # --- Devices (one key per phone) ---
 DEVICE_KEY_BYTES = 32
@@ -307,6 +321,14 @@ class WolfWebServer:
         self.on_devices_changed = None
         # callback(device_id, name) after a pairing code was used.
         self.on_paired = None
+        # callback(action, payload) -> concurrent Future of a result dict: runs
+        # a phone action (ban, kick, weather, lag comp, Manual mode...) on the
+        # WolfRAT window's thread.  Set by the main window; None = refused.
+        self.on_desktop = None
+        # What only the WolfRAT window knows (game type, vote, weather, lag
+        # comp, ranks, features...), published whole by its thread as
+        # {'top': {...}, 'players': {name.casefold(): {...}}}; never changed in place.
+        self.desktop_state = None
 
     def _create_application(self):
         """Build one aiohttp application for one event-loop lifecycle."""
@@ -346,6 +368,10 @@ class WolfWebServer:
         router.add_post('/api/chat/send', protect(self._handle_send_chat))
         router.add_post('/api/player/action', protect(self._handle_player_action))
         router.add_post('/api/map/switch', protect(self._handle_map_switch))
+        router.add_post('/api/map/setnext', protect(self._handle_map_setnext))
+        router.add_post('/api/weather', protect(self._handle_weather))
+        router.add_post('/api/lagcomp', protect(self._handle_lagcomp))
+        router.add_post('/api/mode', protect(self._handle_mode))
         router.add_get('/ws', protect(self._handle_websocket, query_key=True))
         return application
 
@@ -1103,11 +1129,14 @@ class WolfWebServer:
                 self._remove_socket(ws)
 
     def _chat_rows(self, count):
-        return self._json_safe((self.sm.chat_messages or [])[-count:])
+        """The last chat lines, each with "kind" (player / wolfrat / console)
+        and "name" (the sender of a player's line, else None)."""
+        return web_state.chat_rows(
+            self._json_safe((self.sm.chat_messages or [])[-count:])
+        )
 
-    def _resolve_missions(self):
-        """Render identity-bearing rows from the authoritative queue snapshot."""
-        missions = tuple(self.sm.mission_entries)
+    def _map_titles(self):
+        """{FILENAME.BMS: title} from the server's list of available maps."""
         avail_raw = self.sm.available_maps_data or ''
         name_map = {}
         for line in avail_raw.split('\n'):
@@ -1128,6 +1157,12 @@ class WolfWebServer:
                 if desc.endswith(')'):
                     desc = desc[:-1].strip()
                 name_map[filename.upper()] = desc if desc else filename
+        return name_map
+
+    def _resolve_missions(self):
+        """Render identity-bearing rows from the authoritative queue snapshot."""
+        missions = tuple(self.sm.mission_entries)
+        name_map = self._map_titles()
         return [
             {
                 'queue_index': mission.queue_index,
@@ -1146,8 +1181,15 @@ class WolfWebServer:
             for mission in missions
         ]
 
-    def _resolve_players(self):
-        """Render players with the identity required for safe mutations."""
+    def _resolve_players(self, extras=None):
+        """Render players with the identity required for safe mutations.
+
+        ``extras`` ({name.casefold(): {rank, xp, country, time_on_min}}) comes
+        from the desktop snapshot; without it those fields are None.
+        """
+        if extras is None:
+            desktop = self.desktop_state
+            extras = (desktop or {}).get('players') or {}
         legacy_by_id = {}
         for raw in self.sm.players or []:
             if not isinstance(raw, Mapping):
@@ -1185,14 +1227,54 @@ class WolfWebServer:
                 ),
                 'revision': player.revision,
             })
+            extra = extras.get(str(player.name).casefold()) or {}
+            rendered.update({
+                'rank': extra.get('rank'),
+                'xp': extra.get('xp'),
+                'country': extra.get('country'),
+                'time_on_min': extra.get('time_on_min'),
+                'ping_band': web_state.ping_band(player.ping),
+            })
             players.append(rendered)
         return players
 
+    def _features(self, desktop_features):
+        """What this WolfRAT can do, so the page hides the rest."""
+        features = {
+            'pairing': True,
+            'bans': False,
+            'warn': False,
+            'private_message': False,
+            'weather': False,
+            'weather_presets': [],
+            'lag_comp': False,
+            'manual_switch': False,
+            'set_next': False,
+            'ban_expiry': [],
+        }
+        if self.on_desktop is not None:
+            features.update(desktop_features or {})
+            features['manual_switch'] = bool(manual_mode.state.key)
+        features['pairing'] = True
+        features['set_next'] = bool(
+            self.sm.is_connected and tuple(self.sm.mission_entries or ())
+        )
+        return features
+
+    def _desktop_feature(self, name):
+        top = (self.desktop_state or {}).get('top') or {}
+        return bool((top.get('features') or {}).get(name)) and self.on_desktop is not None
+
     def _build_state(self):
-        """Build a JSON-safe state snapshot from ServerManager."""
-        players = self._json_safe(self._resolve_players())
+        """Build a JSON-safe state snapshot from ServerManager (plus what the
+        WolfRAT window published, when it did)."""
+        desktop = self.desktop_state or {}        # one read: published whole
+        top = desktop.get('top') or {}
+        players = self._json_safe(self._resolve_players(desktop.get('players') or {}))
         chat = self._chat_rows(50)
         game_state = self._json_safe(self.sm.game_state or {})
+        titles = self._map_titles()
+        mode = top.get('manual_mode') or manual_mode.state.mode
         return {
             'type': 'state',
             'timestamp': time.time(),
@@ -1206,6 +1288,19 @@ class WolfWebServer:
             'game_mode': self.sm.game_state.get('mode', 'Unknown') if self.sm.game_state else 'Unknown',
             # Longest phone chat line: the server's limit less "[ADMIN] ".
             'chat_max': max(1, chat_limit() - len(PHONE_PREFIX)),
+            'server': self._json_safe(
+                top.get('server') or web_state.server_block(self.sm, titles)
+            ),
+            'next_map': self._json_safe(
+                top['next_map'] if 'next_map' in top
+                else web_state.next_map_block(self.sm, titles)
+            ),
+            'teams': web_state.team_rows(tuple(self.sm.player_entries or ())),
+            'manual_mode': mode,
+            'vote': self._json_safe(top.get('vote')),
+            'weather': self._json_safe(top.get('weather')),
+            'lag_comp': self._json_safe(top.get('lag_comp')),
+            'features': self._json_safe(self._features(top.get('features'))),
         }
 
     @classmethod
@@ -1687,7 +1782,7 @@ class WolfWebServer:
                 return web.json_response(
                     {'error': f'Player id {pid_num} out of range (1-250)'}, status=400)
 
-            if action not in {'kick', 'ban', 'kill', 'swap', 'zero'}:
+            if action not in PLAYER_ACTIONS:
                 return web.json_response({'error': f'Unknown action: {action}'}, status=400)
             swaps_blocked = getattr(self.sm, 'swaps_blocked', None)
             if action == 'swap' and swaps_blocked and swaps_blocked():
@@ -1699,9 +1794,9 @@ class WolfWebServer:
             player = self._find_player_entry(
                 pid_num, player_name, revision
             )
+            if action in DESKTOP_PLAYER_ACTIONS:
+                return await self._desktop_player_action(request, action, body, player)
             actions = {
-                'kick': lambda: self.sm.punt_player(player),
-                'ban': lambda: self.sm.ban_player(player),
                 'kill': lambda: self.sm.kill_player(player),
                 # SWAPTEAM flips the player where they stand, alive among their
                 # old team. Kill straight after, as !swap and !switch do.
@@ -1724,6 +1819,155 @@ class WolfWebServer:
                 )
             )
         except StalePlayerTarget as error:
+            return web.json_response({'error': str(error)}, status=409)
+        except ValueError as e:
+            return web.json_response({'error': str(e)}, status=400)
+        except HTTPException:
+            raise
+        except Exception as e:
+            return web.json_response({'error': str(e)}, status=502)
+
+    # --- Actions the WolfRAT window runs (on_desktop) ---
+
+    async def _desktop(self, action, payload):
+        """Run one action on the WolfRAT window's thread and wait for its answer.
+
+        Returns (result dict, HTTP status).  The window may add 'status' to
+        its answer (400 bad input, 409 not possible right now).
+        """
+        runner = self.on_desktop
+        if runner is None:
+            return ({'ok': False, 'accepted': False, 'replies': [],
+                     'error': 'This needs the WolfRAT window'}, 503)
+        timeout = DESKTOP_TIMEOUTS.get(action, DESKTOP_TIMEOUT)
+        try:
+            outcome = await asyncio.wait_for(
+                asyncio.wrap_future(runner(action, payload)), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            return ({'ok': False, 'accepted': False, 'replies': [], 'error': BUSY_TEXT}, 200)
+        outcome = dict(outcome or {})
+        status = outcome.pop('status', None)
+        ok = bool(outcome.get('ok'))
+        outcome['ok'] = ok
+        outcome.setdefault('accepted', ok)
+        outcome['replies'] = [str(line) for line in outcome.get('replies') or ()]
+        if not ok:
+            outcome.setdefault('error', 'Not done')
+        if not isinstance(status, int) or not 200 <= status <= 599:
+            status = 200
+        return outcome, status
+
+    def _device_label(self, request):
+        """The signed-in device's name, for WolfRAT's logs ("Web Admin (Pixel)")."""
+        device_id = request.get(_DEVICE_ID) if hasattr(request, 'get') else None
+        with self._auth_lock:
+            record = self._devices.get(device_id) if device_id else None
+            return record['name'] if record else ''
+
+    @staticmethod
+    def _action_text(body, field):
+        """Optional free text sent with an action: one line, or ValueError."""
+        value = body.get(field)
+        if value is None:
+            return ''
+        if not isinstance(value, str):
+            raise ValueError(f'{field} must be text')
+        text = ' '.join(value.split())
+        if len(text) > ACTION_TEXT_MAX:
+            raise ValueError(f'{field} is too long')
+        return text
+
+    async def _desktop_player_action(self, request, action, body, player):
+        """kick / ban / warn / message: the WolfRAT window does these, the way
+        its own buttons and the mods' !kick / !ban / !warn do."""
+        context = {
+            'action': action,
+            'pid': player.server_id,
+            'name': player.name,
+            'revision': player.revision,
+        }
+        payload = {
+            'entry': player,
+            'reason': self._action_text(body, 'reason'),
+            'message': self._action_text(body, 'message'),
+            'expiry': body.get('expiry', '') if body.get('expiry') is not None else '',
+            'device_name': self._device_label(request),
+        }
+        if not isinstance(payload['expiry'], str):
+            raise ValueError('expiry must be one of features.ban_expiry')
+        if action == 'message' and self.on_desktop is None:
+            return web.json_response({
+                **context, 'ok': False, 'accepted': False, 'replies': [],
+                'error': 'Private messages need WolfRAT on the server PC',
+            }, status=409)
+        wire_log(f"WEB PLAYER ACTION: {action} on {player.server_id}/{player.name}")
+        outcome, status = await self._desktop(action, payload)
+        return web.json_response({**outcome, **context}, status=status)
+
+    async def _desktop_route(self, request, action, fields):
+        """A body of known fields handed to on_desktop(action, ...)."""
+        try:
+            body = await self._json_object(request)
+        except BadRequestBody as error:
+            return web.json_response({'error': str(error)}, status=400)
+        payload = {field: body[field] for field in fields if field in body}
+        payload['device_name'] = self._device_label(request)
+        wire_log(f"WEB {action.upper()}: {_log_text(json.dumps({k: v for k, v in payload.items() if k != 'device_name'}), 120)}")
+        try:
+            outcome, status = await self._desktop(action, payload)
+        except HTTPException:
+            raise
+        except Exception as error:
+            return web.json_response(
+                {'ok': False, 'accepted': False, 'replies': [], 'error': str(error)},
+                status=502,
+            )
+        return web.json_response(outcome, status=status)
+
+    async def _handle_weather(self, request):
+        """POST /api/weather {preset?, fog_m?, minutes?, dynamic?, lightning?}."""
+        return await self._desktop_route(
+            request, 'weather', ('preset', 'fog_m', 'minutes', 'dynamic', 'lightning')
+        )
+
+    async def _handle_lagcomp(self, request):
+        """POST /api/lagcomp {enabled?, tune_mode?: off|watch|on}."""
+        return await self._desktop_route(request, 'lagcomp', ('enabled', 'tune_mode'))
+
+    async def _handle_mode(self, request):
+        """POST /api/mode {mode: full|manual}: Manual mode for this server."""
+        return await self._desktop_route(request, 'mode', ('mode',))
+
+    async def _handle_map_setnext(self, request):
+        """POST /api/map/setnext {filename, index} - the desktop's Queue Next."""
+        try:
+            body = await self._json_object(request)
+            filename = str(body.get('filename', body.get('map', '')) or '').strip()
+            queue_index = body.get('index')
+            if not filename:
+                return web.json_response({'error': 'No mission identity provided'}, status=400)
+            if not self.sm.is_connected:
+                return web.json_response({'error': 'Not connected to server'}, status=503)
+            mission = self._find_mission_entry(filename, queue_index=queue_index)
+            wire_log(
+                f"WEB SET NEXT: {mission.filename} at queue index {mission.queue_index}"
+            )
+            result = await self._await_result(
+                self.sm.set_next_mission(mission, add_if_missing=False)
+            )
+            if getattr(result, 'accepted', False):
+                self.sm._log(
+                    f"Next mission set to: {mission.filename} "
+                    f"(server index {mission.queue_index}) from the phone"
+                )
+            return web.json_response(self._result_payload(
+                result,
+                map=mission.filename,
+                index=mission.queue_index,
+                revision=mission.revision,
+            ))
+        except (AmbiguousMissionTarget, StaleMissionTarget) as error:
             return web.json_response({'error': str(error)}, status=409)
         except ValueError as e:
             return web.json_response({'error': str(e)}, status=400)

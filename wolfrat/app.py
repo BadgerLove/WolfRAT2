@@ -59,6 +59,7 @@ LONG_CHAT_URL = ("https://github.com/BadgerLove/jo-server-patches/blob/main/"
                  "docs/patches/15-long-chat-server.md")
 from wolfrat.sounds import generate_all_sounds
 from wolfrat.web_server import WolfWebServer, generate_token
+from wolfrat.web_bridge import PhoneBridge
 from wolfrat.runtime import DesktopRuntime, parse_launch_args
 from wolfrat.qt_dispatcher import CompletionPolicy, QtAdminDispatcher
 from wolfrat.bans_tab import BansTab
@@ -9914,6 +9915,19 @@ class MainWindow(QMainWindow):
         # Build UI
         self._build_ui()
 
+        # The phone page's way into this window (web_bridge.py): its actions
+        # (ban list, kick/ban/warn, private lines, weather, lag comp, Manual
+        # mode) run on this thread through one queued signal, and what only
+        # this window knows is published to the web server as one snapshot.
+        self.phone_bridge = PhoneBridge(self, self.web_server, parent=self)
+        self.phone_bridge.attach()
+        for signal in (
+            self.signals.missions_signal,
+            self.signals.manual_mode_signal,
+            self.weather_tab.link_changed,        # after every Weather/lag comp poll
+        ):
+            signal.connect(self.phone_bridge.schedule_publish)
+
         # Connect signals
         # Not to server_tab.log: ServerManager already wrote these lines to
         # the wire log, and that second write doubled every line.
@@ -9921,7 +9935,7 @@ class MainWindow(QMainWindow):
         self.signals.players_signal.connect(self.players_tab.update_players)
         self.signals.players_signal.connect(lambda p: self.server_tab.update_player_count(p))
         self.signals.players_signal.connect(lambda p: self.status_players_label.setText(f"Players: {len(p)}"))
-        self.signals.players_signal.connect(lambda p: self.web_server.broadcast_state())
+        self.signals.players_signal.connect(self.phone_bridge.schedule_publish)
         self.signals.players_signal.connect(self.mods_tab.update_players)
         self.signals.players_signal.connect(self.messages_tab.check_new_players)
         self.signals.players_signal.connect(self.spree_tab.check_sprees)
@@ -9936,7 +9950,7 @@ class MainWindow(QMainWindow):
         )
         self.web_server.on_command = self._queue_web_command
         self.signals.gamestate_signal.connect(self.server_tab.update_gamestate)
-        self.signals.gamestate_signal.connect(lambda g: self.web_server.broadcast_state())
+        self.signals.gamestate_signal.connect(self.phone_bridge.schedule_publish)
         self.signals.missions_signal.connect(self.missions_tab.update_missions)
         self.signals.missions_signal.connect(self.missions_store.update_rotation)
         self.signals.missions_signal.connect(lambda m: self.mods_tab._update_maps_info())
@@ -9952,18 +9966,18 @@ class MainWindow(QMainWindow):
         self.signals.settings_signal.connect(lambda s: self._update_title(s.get('servername', '')))
         self.signals.settings_signal.connect(lambda s: print(f"[WolfRAT] settings_signal received: {len(s)} keys"))
         self.signals.settings_signal.connect(lambda s: self.flash_sync_led())
-        self.signals.settings_signal.connect(lambda s: self.web_server.broadcast_state())
+        self.signals.settings_signal.connect(self.phone_bridge.schedule_publish)
         self.signals.settings_signal.connect(self.update_status_time)
         self.signals.gamestate_signal.connect(lambda s: self.flash_sync_led())
         self.signals.players_signal.connect(lambda s: self.flash_sync_led())
         self.signals.connected_signal.connect(lambda: self.set_connected(True))
         self.signals.connected_signal.connect(self.chatbot_tab.reset_chat)
         self.signals.connected_signal.connect(self.mods_tab.on_connect)
-        self.signals.connected_signal.connect(lambda: self.web_server.broadcast_state())
+        self.signals.connected_signal.connect(self.phone_bridge.schedule_publish)
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
         self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.10.27 - Joint Operations Server Admin"))
-        self.signals.disconnected_signal.connect(lambda: self.web_server.broadcast_state())
+        self.signals.disconnected_signal.connect(self.phone_bridge.schedule_publish)
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
         self.signals.disconnected_signal.connect(lambda: self.update_status_time({}))

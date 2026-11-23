@@ -125,6 +125,13 @@ class WebStateTests(unittest.TestCase):
                 "deaths": "-",
                 "ping": "-",
                 "revision": 6,
+                # 2026-11-23: added for the phone page; unknown without the
+                # WolfRAT window's snapshot and without a ping.
+                "rank": None,
+                "xp": None,
+                "country": None,
+                "time_on_min": None,
+                "ping_band": None,
             },
             state["players"][0],
         )
