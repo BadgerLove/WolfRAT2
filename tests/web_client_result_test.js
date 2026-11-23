@@ -372,7 +372,15 @@ test('the access token gets a device key and only the key is stored', async () =
         );
         return respond(200, {ok: true, key: 'dev-key-3', device_id: '0a0b0c0d'});
     };
-    assert.strictEqual(await page.run(`signInWithToken('admin', 'master-token')`), true);
+    // The form's own submit listener (added by app.js, no inline handler).
+    page.el('login-user').value = ' admin ';
+    page.el('login-pass').value = 'master-token';
+    let prevented = false;
+    const submit = page.el('token-form').listeners.submit;
+    assert.strictEqual(submit.length, 1, 'the token form has one submit listener');
+    assert.strictEqual(await submit[0]({preventDefault: () => { prevented = true; }}), true);
+    assert(prevented, 'the form does not navigate');
+    assert.strictEqual(page.el('login-pass').value, '', 'the token leaves the field once used');
     assert.deepStrictEqual(page.local.keys(), ['wolfkey']);
     assert.strictEqual(page.local.getItem('wolfkey'), 'dev-key-3');
     assert.match(page.sockets[0].url, /key=dev-key-3$/);
