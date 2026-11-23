@@ -12,6 +12,8 @@ license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
     "aiohttp>=3.13,<4",
+    # Web Admin phone notifications (wolfrat/web_push.py: VAPID keys, encryption)
+    "cryptography>=42",
     "PyQt6>=6.7,<7",
 ]
 

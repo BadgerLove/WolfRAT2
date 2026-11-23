@@ -215,6 +215,104 @@ def test_pair_window_text_stays_short(qtbot, tmp_path, monkeypatch):
     tab._pair_dialog.close()
 
 
+# --- contract v2: the address for phones, notification settings ---------------------
+
+
+def type_phone_address(tab, text):
+    tab.phone_address_input.setText(text)
+    tab.phone_address_input.editingFinished.emit()
+
+
+def test_the_address_for_phones_is_saved_and_used_by_the_pair_window(qtbot, tmp_path,
+                                                                      monkeypatch):
+    import wolfrat.app as app_module
+    monkeypatch.setattr(app_module, "_lan_ips", lambda: ["192.168.1.20"])
+    tab, server = make_tab(qtbot, tmp_path, {"web_token": "t", "web_allow_internet": True})
+    assert tab.phone_address_input.text() == ""
+    assert "web_phone_address" not in saved(tmp_path)
+
+    type_phone_address(tab, "wolfrat.example.com")
+    assert tab.phone_address_input.text() == "https://wolfrat.example.com"
+    assert server.phone_address == "https://wolfrat.example.com"
+    assert saved(tmp_path)["web_phone_address"] == "https://wolfrat.example.com"
+
+    tab.pair_btn.click()
+    dialog = tab._pair_dialog
+    code = dialog.code
+    assert dialog.main_url() == f"https://wolfrat.example.com/#pair={code}"
+    assert dialog.url_label.text() == dialog.main_url()
+    assert dialog.lan_url() == f"http://192.168.1.20:8070/#pair={code}"
+    assert not dialog.qr_label.pixmap().isNull()
+    assert dialog.qr_label.heading.text() == "Scan with the phone"
+    assert dialog.away_label.text() == ""
+    dialog.close()
+
+    again, server_again = make_tab(qtbot, tmp_path)
+    assert again.phone_address_input.text() == "https://wolfrat.example.com"
+    assert server_again.phone_address == "https://wolfrat.example.com"
+
+
+def test_a_wrong_address_for_phones_is_not_used(qtbot, tmp_path):
+    tab, server = make_tab(qtbot, tmp_path, {"web_token": "t",
+                                             "web_phone_address": "https://old.example.com"})
+    messages = []
+    tab._show_msg = messages.append
+    type_phone_address(tab, "https://wolfrat.example.com/admin")
+    assert messages and "doesn't look right" in messages[0]
+    assert server.phone_address == "https://old.example.com"
+    tab.internet_cb.setChecked(True)                   # a later save keeps the good one
+    assert saved(tmp_path)["web_phone_address"] == "https://old.example.com"
+    type_phone_address(tab, "")
+    assert server.phone_address is None
+    assert "web_phone_address" not in saved(tmp_path)
+
+
+def test_an_https_internet_address_reaches_the_pair_window_with_its_scheme(qtbot, tmp_path,
+                                                                           monkeypatch):
+    import wolfrat.app as app_module
+    monkeypatch.setattr(app_module, "_lan_ips", lambda: ["192.168.1.20"])
+    tab, _server = make_tab(qtbot, tmp_path, {
+        "web_token": "t", "web_allow_internet": True,
+        "web_internet_address": "https://wolfrat.example.com"})
+    tab.pair_btn.click()
+    dialog = tab._pair_dialog
+    assert dialog.internet_url() == f"https://wolfrat.example.com/#pair={dialog.code}"
+    assert dialog.main_url() == dialog.lan_url()
+    dialog.close()
+    # The same address typed in the box: one QR code, not two.
+    type_phone_address(tab, "https://wolfrat.example.com")
+    tab.pair_btn.click()
+    dialog = tab._pair_dialog
+    assert dialog.main_url() == f"https://wolfrat.example.com/#pair={dialog.code}"
+    assert dialog.internet_url() is None
+    assert dialog.internet_qr_label.isHidden()
+    dialog.close()
+    assert saved(tmp_path)["web_internet_address"] == "https://wolfrat.example.com"
+
+
+def test_notification_settings_and_subscriptions_stay_in_wolfrat_web_json(qtbot, tmp_path):
+    push = {"endpoint": "https://fcm.googleapis.com/fcm/send/abc", "p256dh": "p", "auth": "a"}
+    tab, server = make_tab(qtbot, tmp_path, {
+        "web_token": "t", "notify_first_joins": 4, "web_push_vapid": "v" * 43,
+        "devices": [{"id": "abcdef01", "name": "Pixel", "key_sha256": "0" * 64,
+                     "created": 1, "last_seen": 2, "last_ip": None, "push": push}],
+    })
+    assert server.notify_first_joins == 4
+    assert server.push_config()["web_push_vapid"] == "v" * 43
+    tab.internet_cb.setChecked(True)                   # any save writes them all back
+    config = saved(tmp_path)
+    assert config["notify_first_joins"] == 4
+    assert config["web_push_vapid"] == "v" * 43
+    assert config["devices"][0]["push"] == push
+
+
+def test_a_new_install_saves_the_default_first_joins(qtbot, tmp_path):
+    _tab, _server = make_tab(qtbot, tmp_path)
+    config = saved(tmp_path)
+    assert config["notify_first_joins"] == 2
+    assert "web_push_vapid" not in config                # made on first need, not here
+
+
 @pytest.mark.parametrize("seconds, text", [
     (None, "never"), (10, "just now"), (300, "5m ago"), (7200, "2h ago"), (172800, "2d ago"),
 ])

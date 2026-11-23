@@ -95,6 +95,7 @@ async def test_state_has_every_new_field_without_the_window(rig):
         "name": "FMJ Squad", "game_type": "AAS", "game_type_name": "Advance & Secure",
         "map_title": "Doslin Oblast", "map_file": "AAS_Doslin.bms",
         "time_left_min": 12, "time_limit_min": 30,
+        "secure_address": None,         # contract v2: no https:// address known
     }
     # Same display name as the Maps list (a map with no title keeps its file name).
     assert state["next_map"] == {"filename": "TDM_X.bms", "display_name": "TDM_X.bms",

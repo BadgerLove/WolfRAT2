@@ -23,6 +23,9 @@ WEB_RUNTIME_CALLERS = (
     REPOSITORY_ROOT / "wolfrat" / "web_templates" / "app.js",
     REPOSITORY_ROOT / "wolfrat" / "web_templates" / "index.html",
 )
+# Calls named send that are not retail admin traffic: web_push.send delivers a
+# phone notification to the phone's push service over https.
+NOT_ADMIN_SENDS = frozenset({("web_push", "send")})
 
 COMMAND_LITERAL = re.compile(
     r"^\s*(?:"
@@ -126,7 +129,8 @@ class MandatoryAdminSessionTests(unittest.TestCase):
                 if not isinstance(node, ast.Call):
                     continue
                 chain = _attribute_chain(node.func)
-                if chain and chain[-1] in {"send", "send_command"}:
+                if (chain and chain[-1] in {"send", "send_command"}
+                        and chain not in NOT_ADMIN_SENDS):
                     violations.append(
                         f"{_location(path, node)} calls {chain[-1]!r}"
                     )

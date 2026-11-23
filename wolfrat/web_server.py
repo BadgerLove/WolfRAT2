@@ -9,6 +9,15 @@ access token (POST /api/auth) or from a code shown on the PC (POST /api/pair).
 The access token itself is only taken by /api/auth; every other route wants a
 device key. Keys are kept as SHA-256 hashes; signing a device out (or a new
 access token) ends its key and closes its open connections.
+
+Alerts and notifications: the server keeps the last 100 events (joins,
+leaves, maps, votes, admin actions, the game server link) for the page's
+bell, and sends a phone notification for the first players who join a server
+that has been empty (web_events.py has the rules, web_push.py sends).
+
+Behind a proxy on this PC (nginx for an https:// address), the phone's
+address is the last X-Forwarded-For entry; the header is read from loopback
+peers only.
 """
 
 import asyncio
@@ -28,10 +37,12 @@ import time
 import logging
 from collections.abc import Mapping
 
+import aiohttp
 from aiohttp import web
 from aiohttp.web_exceptions import HTTPException
 
 from wolfrat import manual_mode
+from wolfrat import web_events
 from wolfrat import web_state
 from wolfrat.admin_commands import chat_limit
 from wolfrat.protocol import split_chat, wire_log
@@ -103,6 +114,14 @@ WS_SEND_TIMEOUT = 5.0
 # WebSocket close code when a key stops working (signed out, new token).
 WS_CLOSE_SIGNED_OUT = 4001
 
+# --- Alerts and notifications ---
+WATCH_SECONDS = 5.0              # players, link, map and vote are checked this often
+NOTIFY_FIRST_JOINS = 2           # "the first couple that join" an empty server
+NOTIFY_FIRST_JOINS_MAX = 10
+PUSH_TTL = 3600
+PUSH_ENDPOINT_MAX = 2048
+PUSH_UNAVAILABLE = 'Notifications are not available in this WolfRAT'
+
 SECURITY_HEADERS = {
     'X-Frame-Options': 'DENY',
     'X-Content-Type-Options': 'nosniff',
@@ -155,6 +174,7 @@ STATIC_FILES = {
     '/static/icon-192.png': ('icon-192.png', 'image/png', None),
     '/static/icon-512.png': ('icon-512.png', 'image/png', None),
     '/static/icon-maskable-512.png': ('icon-maskable-512.png', 'image/png', None),
+    '/static/badge-96.png': ('badge-96.png', 'image/png', None),
 }
 
 # Where a checked request keeps the id of the device whose key it carried.
@@ -163,6 +183,31 @@ _DEVICE_ID = (
 )
 
 _HOST_HEADER = re.compile(r'[A-Za-z0-9.\-]{1,253}(?::\d{1,5})?|\[[0-9A-Fa-f:.]{2,45}\](?::\d{1,5})?')
+
+
+def _web_push():
+    """wolfrat/web_push.py, imported when first needed (it needs cryptography)."""
+    from wolfrat import web_push
+    return web_push
+
+
+def _push_ssl_context():
+    """The system's certificates, plus certifi's bundle when it is there (a
+    fresh Windows may not hold every root yet: Windows fetches them on demand
+    and Python never asks)."""
+    import ssl
+    context = ssl.create_default_context()
+    try:
+        import certifi
+        context.load_verify_locations(certifi.where())
+    except Exception:
+        pass
+    return context
+
+
+def _new_push_session():
+    """The ClientSession notifications go out on (one per web server loop)."""
+    return aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=_push_ssl_context()))
 
 
 def _log_text(value, limit=40):
@@ -197,6 +242,115 @@ def is_local_address(address):
     if ip.version == 6 and ip.ipv4_mapped is not None:
         ip = ip.ipv4_mapped
     return any(ip in network for network in _LOCAL_NETWORKS)
+
+
+def _ip_or_none(text):
+    """ipaddress object for text (brackets and IPv6 zone ids allowed), or None."""
+    value = str(text or '').strip()
+    if value.startswith('[') and value.endswith(']'):
+        value = value[1:-1]
+    value = value.split('%', 1)[0]
+    try:
+        ip = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return ip
+
+
+def _is_loopback(address):
+    ip = _ip_or_none(address)
+    return ip is not None and ip.is_loopback
+
+
+def _header_address(entry):
+    """An IP address from one X-Forwarded-For entry ("1.2.3.4", "1.2.3.4:5678",
+    "[2001:db8::1]:443"), or None."""
+    value = str(entry or '').strip().strip('"')
+    if value.startswith('['):
+        value = value[1:].split(']', 1)[0]
+    elif value.count(':') == 1:
+        value = value.split(':', 1)[0]          # IPv4 with a port
+    ip = _ip_or_none(value)
+    return str(ip) if ip is not None else None
+
+
+def client_address(request):
+    """The phone's address.
+
+    The TCP peer, except when the peer is this PC itself and sends
+    X-Forwarded-For (a proxy on this PC, e.g. nginx for an https:// address):
+    then the last entry of that header, the address the proxy saw. The
+    header is never read from any other peer. A header that holds no
+    address gives "unknown" (not this network).
+    """
+    peer = request.remote or ''
+    if not _is_loopback(peer):
+        return peer
+    values = request.headers.getall('X-Forwarded-For', [])
+    if not values:
+        return peer
+    return _header_address(values[-1].split(',')[-1]) or 'unknown'
+
+
+def forwarded_https(request):
+    """True when a proxy on this PC says the phone used https."""
+    if not _is_loopback(request.remote):
+        return False
+    values = request.headers.getall('X-Forwarded-Proto', [])
+    return bool(values) and values[-1].split(',')[-1].strip().lower() == 'https'
+
+
+def _host_part(host):
+    """host[:port] or [v6]:port without the port."""
+    text = str(host or '')
+    if text.startswith('['):
+        return text[1:].split(']', 1)[0]
+    return text.split(':', 1)[0]
+
+
+def _is_ip_host(host):
+    return _ip_or_none(_host_part(host)) is not None
+
+
+def clean_internet_address(address):
+    """A saved internet address: "host[:port]" (plain http) or
+    "https://host[:port]"; None when it is not one."""
+    text = str(address or '').strip()
+    lowered = text.lower()
+    secure = lowered.startswith('https://')
+    if secure:
+        text = text[len('https://'):]
+    elif lowered.startswith('http://'):
+        text = text[len('http://'):]
+    text = text.rstrip('/')
+    if not _HOST_HEADER.fullmatch(text):
+        return None
+    return f'https://{text}' if secure else text
+
+
+def phone_address_url(text):
+    """The Web Admin tab's "Address for phones" as a URL without a trailing
+    slash ("https://wolfrat.example.com"), or None when empty or not an address.
+    A name without a scheme gets https://, an IP address http://. No paths:
+    the page lives at the root of its address."""
+    value = str(text or '').strip()
+    if not value:
+        return None
+    scheme = None
+    for prefix in ('https://', 'http://'):
+        if value.lower().startswith(prefix):
+            scheme = prefix[:-3]
+            value = value[len(prefix):]
+            break
+    if value.endswith('/'):
+        value = value[:-1]
+    if not _HOST_HEADER.fullmatch(value):
+        return None
+    if scheme is None:
+        scheme = 'http' if _is_ip_host(value) else 'https'
+    return f'{scheme}://{value}'
 
 
 def normalize_pair_code(code):
@@ -315,8 +469,27 @@ class WolfWebServer:
         self._devices = {}
         self._allow_internet = False
         self._pair = None                # (code, expires_at) while a code is shown
-        self._internet_address = None    # host[:port] a signed-in phone used from outside
-        # callback() after the device list (or the internet address) changed.
+        # host[:port] (or https://host) a signed-in phone used from outside
+        self._internet_address = None
+        # The Web Admin tab's "Address for phones" (a URL), or None.
+        self._phone_address = None
+        # Notifications: WolfRAT's own key (base64url, saved in wolfrat_web.json;
+        # made on first need) and how many joins after an empty spell notify.
+        self._vapid_private = None
+        self._vapid = None
+        self._notify_first_joins = NOTIFY_FIRST_JOINS
+        self._push_ok = None             # web_push could be imported (None = not tried)
+        self._push_session = None        # one aiohttp.ClientSession on the web thread's loop
+        self._push_session_loop = None
+        self._push_failing = set()       # device ids whose last push failed (logged once)
+        self._tasks = set()              # notification sends in flight
+        self._watch_task = None
+        self._watch_error_logged = False
+        # The bell: the last 100 events, in memory only.
+        self._events = web_events.EventFeed()
+        self._reset_watch()
+        # callback() after the device list, the internet address or the
+        # notification settings changed (the desktop saves wolfrat_web.json).
         # Called on the web thread or the caller's; the desktop queues it to Qt.
         self.on_devices_changed = None
         # callback(device_id, name) after a pairing code was used.
@@ -335,7 +508,7 @@ class WolfWebServer:
 
         @web.middleware
         async def network_gate(request, handler):
-            if not self.allow_internet and not is_local_address(request.remote):
+            if not self.allow_internet and not is_local_address(client_address(request)):
                 return self._network_refusal(request)
             return await handler(request)
 
@@ -344,6 +517,8 @@ class WolfWebServer:
             client_max_size=CLIENT_MAX_SIZE,
         )
         application.on_response_prepare.append(_add_security_headers)
+        application.on_startup.append(self._start_watching)
+        application.on_cleanup.append(self._stop_watching)
         router = application.router
 
         # Public: the page's own files, signing in and pairing.
@@ -372,6 +547,13 @@ class WolfWebServer:
         router.add_post('/api/weather', protect(self._handle_weather))
         router.add_post('/api/lagcomp', protect(self._handle_lagcomp))
         router.add_post('/api/mode', protect(self._handle_mode))
+        # The bell and phone notifications.
+        router.add_get('/api/events', protect(self._handle_events))
+        router.add_get('/api/push', protect(self._handle_push))
+        router.add_post('/api/push/subscribe', protect(self._handle_push_subscribe))
+        router.add_post('/api/push/unsubscribe', protect(self._handle_push_unsubscribe))
+        router.add_post('/api/push/test', protect(self._handle_push_test))
+        router.add_post('/api/push/settings', protect(self._handle_push_settings))
         router.add_get('/ws', protect(self._handle_websocket, query_key=True))
         return application
 
@@ -407,14 +589,65 @@ class WolfWebServer:
 
     @property
     def internet_address(self):
-        """host[:port] a signed-in phone last used from the internet, or None."""
+        """host[:port] (plain http) or https://host[:port] a signed-in phone last
+        used from the internet, or None."""
         with self._auth_lock:
             return self._internet_address
 
     def load_internet_address(self, address):
         with self._auth_lock:
-            text = str(address or '').strip()
-            self._internet_address = text if _HOST_HEADER.fullmatch(text) else None
+            self._internet_address = clean_internet_address(address)
+
+    @property
+    def phone_address(self):
+        """The Web Admin tab's "Address for phones" as a URL, or None."""
+        with self._auth_lock:
+            return self._phone_address
+
+    @phone_address.setter
+    def phone_address(self, text):
+        with self._auth_lock:
+            self._phone_address = phone_address_url(text)
+
+    def secure_address(self):
+        """The https:// address phones can use (the tab's box first, else the one
+        a phone used), or None."""
+        with self._auth_lock:
+            candidates = (self._phone_address, self._internet_address)
+        for address in candidates:
+            if address and address.lower().startswith('https://'):
+                return address
+        return None
+
+    # --- Notification settings (saved by the desktop in wolfrat_web.json) ---
+
+    @property
+    def notify_first_joins(self):
+        with self._auth_lock:
+            return self._notify_first_joins
+
+    def push_config(self):
+        """What wolfrat_web.json keeps for notifications."""
+        with self._auth_lock:
+            config = {'notify_first_joins': self._notify_first_joins}
+            if self._vapid_private:
+                config['web_push_vapid'] = self._vapid_private
+        return config
+
+    def load_push_config(self, config):
+        """The notification settings from wolfrat_web.json."""
+        config = config if isinstance(config, Mapping) else {}
+        private = config.get('web_push_vapid')
+        first = config.get('notify_first_joins', NOTIFY_FIRST_JOINS)
+        if isinstance(first, bool) or not isinstance(first, int) or not (
+                0 <= first <= NOTIFY_FIRST_JOINS_MAX):
+            first = NOTIFY_FIRST_JOINS
+        with self._auth_lock:
+            if isinstance(private, str) and re.fullmatch(r'[A-Za-z0-9_\-]{40,60}', private):
+                if private != self._vapid_private:
+                    self._vapid = None
+                self._vapid_private = private
+            self._notify_first_joins = first
 
     def set_auth(self, username, token):
         """Set the web admin credentials (called from WebAdminTab).
@@ -495,8 +728,25 @@ class WolfWebServer:
                 'last_ip': (str(record.get('last_ip'))[:64]
                             if record.get('last_ip') else None),
             }
+            push = self._push_record(record.get('push'))
+            if push is not None:
+                loaded[device_id]['push'] = push
         with self._auth_lock:
             self._devices = loaded
+
+    @staticmethod
+    def _push_record(value):
+        """A saved notification subscription {endpoint, p256dh, auth}, or None."""
+        if not isinstance(value, Mapping):
+            return None
+        endpoint, p256dh, auth = (value.get(name) for name in ('endpoint', 'p256dh', 'auth'))
+        if not all(isinstance(item, str) and item for item in (endpoint, p256dh, auth)):
+            return None
+        if not endpoint.startswith('https://') or len(endpoint) > PUSH_ENDPOINT_MAX:
+            return None
+        if len(p256dh) > 200 or len(auth) > 100:
+            return None
+        return {'endpoint': endpoint, 'p256dh': p256dh, 'auth': auth}
 
     @staticmethod
     def _int_or_none(value):
@@ -580,16 +830,33 @@ class WolfWebServer:
 
     def _note_internet_address(self, request):
         """Remember the address a signed-in phone reached WolfRAT on from outside,
-        so the desktop can offer it when pairing the next phone."""
-        if is_local_address(request.remote):
+        so the desktop can offer it when pairing the next phone.
+
+        Over https (a proxy on this PC says so) with a name, not an IP address,
+        it is kept as "https://host"; a known https address is not replaced by
+        a plain one."""
+        if is_local_address(client_address(request)):
             return
         host = str(request.headers.get('Host', '') or '').strip()
         if not _HOST_HEADER.fullmatch(host):
             return
-        with self._auth_lock:
-            if self._internet_address == host:
+        name = _host_part(host)
+        if name.lower() == 'localhost' or is_local_address(name):
+            return                       # the proxy's own address, not the phone's
+        if forwarded_https(request):
+            if _is_ip_host(host):
                 return
-            self._internet_address = host
+            address = f'https://{host}'
+        else:
+            address = host
+        with self._auth_lock:
+            current = self._internet_address
+            if current == address:
+                return
+            if (current and current.startswith('https://')
+                    and not address.startswith('https://')):
+                return
+            self._internet_address = address
         self._devices_changed()
 
     # --- Pairing ---
@@ -1000,7 +1267,7 @@ class WolfWebServer:
 
     def _authenticate(self, request, query_key=False):
         """(device record, None) for a valid key, else (None, the refusal)."""
-        ip = request.remote or 'unknown'
+        ip = client_address(request) or 'unknown'
         presented = self._presented_key(request, query_key)
         if not presented:
             return None, self._refusal(request, 401, 'Unauthorized')
@@ -1127,6 +1394,394 @@ class WolfWebServer:
                 await asyncio.wait_for(ws.send_str(message), timeout=WS_SEND_TIMEOUT)
             except Exception:
                 self._remove_socket(ws)
+
+    def _spawn(self, coroutine):
+        """Web thread: run coroutine as a task that is kept until it ends."""
+        task = asyncio.get_running_loop().create_task(coroutine)
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return task
+
+    def _push_to_pages(self, message):
+        """Send one message to every open page now (any thread)."""
+        sockets = self._open_sockets()
+        if not sockets:
+            return
+        loop = self._loop or sockets[0][1].loop
+        if loop is None or loop.is_closed():
+            return
+        try:
+            text = json.dumps(message)
+        except Exception as error:
+            wire_log(f"WEB: building a page message failed: {error}")
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        coroutine = self._broadcast(text)
+        if loop is running:
+            self._spawn(coroutine)
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(coroutine, loop)
+        except RuntimeError:
+            coroutine.close()
+
+    # --- The bell: events ---
+
+    def add_event(self, kind, text, name=None, ts=None):
+        """Keep one event for the bell and push it to every open page (any thread)."""
+        event = self._events.add(kind, text, name, ts)
+        self._push_to_pages({'type': 'event', 'event': event})
+        return event
+
+    def admin_event(self, kind, name, who=None):
+        """A kick, ban or warning the game server took (the Mods tab calls this
+        for its chat commands and for the phone's buttons)."""
+        verb = {'kick': 'kicked', 'ban': 'banned', 'warn': 'warned'}.get(kind)
+        if verb is None or not name:
+            return None
+        text = f"{name} was {verb}" + (f" by {who}" if who else "")
+        return self.add_event(kind, text, name)
+
+    def _reset_watch(self):
+        """A fresh baseline for the alerts (the web server starts)."""
+        self._players_watch = web_events.PlayerWatch()
+        self._link_watch = web_events.LinkWatch()
+        self._map_watch = web_events.MapWatch()
+        self._vote_watch = web_events.VoteWatch()
+
+    def watch_now(self):
+        """Check the player list for the alerts now (any thread; the desktop
+        calls it after each players update)."""
+        loop = self._loop
+        if not self.is_running or loop is None:
+            return
+        try:
+            loop.call_soon_threadsafe(self._watch_tick_safely)
+        except RuntimeError:
+            pass
+
+    async def _start_watching(self, _application):
+        """Web thread, as the server starts: a new baseline, then a check every
+        few seconds (the timers: gone 2 minutes, empty 10, link down 2)."""
+        self._reset_watch()
+        self._watch_task = asyncio.get_running_loop().create_task(self._watch_loop())
+
+    async def _watch_loop(self):
+        while True:
+            self._watch_tick_safely()
+            await asyncio.sleep(WATCH_SECONDS)
+
+    async def _stop_watching(self, _application):
+        """Web thread, as the server stops: end the checks and sends, close the
+        notification session."""
+        loop = asyncio.get_running_loop()
+        task, self._watch_task = self._watch_task, None
+        pending = [item for item in (task, *self._tasks)
+                   if item is not None and not item.done() and item.get_loop() is loop]
+        for item in pending:
+            item.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await self._close_push_session()
+
+    def _watch_tick_safely(self):
+        try:
+            self._watch_tick()
+        except Exception as error:
+            if not self._watch_error_logged:
+                self._watch_error_logged = True
+                wire_log(f"WEB: checking the server for the alerts failed: {error}")
+
+    def _watch_tick(self, now=None):
+        """Web thread: one look at the players, the link, the map and the vote."""
+        now = time.time() if now is None else now
+        connected = bool(self.sm.is_connected)
+        names = [
+            player.name for player in tuple(self.sm.player_entries or ())
+            if player.server_id != 0               # the host slot is not a player
+        ]
+        events = list(self._link_watch.update(connected, now))
+        player_events, joins = self._players_watch.update(
+            connected, names, now, self.notify_first_joins
+        )
+        events.extend(player_events)
+        top = (self.desktop_state or {}).get('top') or {}
+        if connected:
+            server = top.get('server') or web_state.server_block(self.sm, self._map_titles())
+            events.extend(self._map_watch.update(
+                server.get('map_file'), server.get('map_title'), now
+            ))
+        events.extend(self._vote_watch.update(top.get('vote'), now))
+        for event in events:
+            self.add_event(event.kind, event.text, event.name, event.ts)
+        if joins:
+            self._notify_joins(joins)
+
+    # --- Phone notifications (Web Push) ---
+
+    def _push_available(self):
+        """True when this WolfRAT can send notifications (web_push imports)."""
+        if self._push_ok is None:
+            try:
+                _web_push()
+                self._push_ok = True
+            except Exception as error:
+                self._push_ok = False
+                wire_log(f"WEB PUSH: phone notifications are off: {error}")
+        return self._push_ok
+
+    def _vapid_keys(self):
+        """WolfRAT's own notification key pair, made (and saved) on first need."""
+        with self._auth_lock:
+            if self._vapid is not None:
+                return self._vapid
+            private = self._vapid_private
+        push = _web_push()
+        keys = None
+        if private:
+            try:
+                keys = push.VapidKeys.from_private(private)
+            except Exception as error:
+                wire_log(f"WEB PUSH: the saved notification key is unusable ({error}); "
+                         "made a new one (phones turn notifications on again)")
+        made = keys is None
+        if made:
+            keys = push.VapidKeys.generate()
+        with self._auth_lock:
+            self._vapid = keys
+            self._vapid_private = keys.private_b64
+        if made:
+            self._devices_changed()          # saves wolfrat_web.json
+        return keys
+
+    def _push_client(self):
+        """Web thread: the one ClientSession for notifications, made on first need."""
+        loop = asyncio.get_running_loop()
+        session = self._push_session
+        if session is None or session.closed or self._push_session_loop is not loop:
+            session = _new_push_session()
+            self._push_session = session
+            self._push_session_loop = loop
+        return session
+
+    async def _close_push_session(self):
+        session = self._push_session
+        if session is None or self._push_session_loop is not asyncio.get_running_loop():
+            return
+        self._push_session = None
+        self._push_session_loop = None
+        if not session.closed:
+            try:
+                await session.close()
+            except Exception:
+                pass
+
+    def _device_push(self, device_id):
+        """This device's subscription {endpoint, p256dh, auth}, or None."""
+        with self._auth_lock:
+            record = self._devices.get(device_id) if device_id else None
+            return dict(record['push']) if record and record.get('push') else None
+
+    def _drop_subscription(self, device_id, endpoint):
+        """The push service says this phone unsubscribed: forget it."""
+        with self._auth_lock:
+            record = self._devices.get(device_id)
+            if record is None or (record.get('push') or {}).get('endpoint') != endpoint:
+                return
+            record.pop('push', None)
+        self._push_failing.discard(device_id)
+        wire_log(f"WEB PUSH: device {device_id} no longer takes notifications; "
+                 "its subscription is removed")
+        self._devices_changed()
+
+    def _push_title(self):
+        """The notification title: the server's name, else WolfRAT."""
+        top = (self.desktop_state or {}).get('top') or {}
+        name = (top.get('server') or {}).get('name')
+        if not name:
+            name = str((self.sm.game_settings or {}).get('servername') or '').strip()
+        return str(name or 'WolfRAT')[:60]
+
+    async def _send_to_phones(self, payload, only=None):
+        """Send one notification to every subscribed phone (or only to device
+        ``only``). Returns {device id: (ok, gone, error)}."""
+        web_push = _web_push()
+        with self._auth_lock:
+            targets = [
+                (device_id, dict(record['push']))
+                for device_id, record in self._devices.items()
+                if record.get('push') and (only is None or device_id == only)
+            ]
+        if not targets:
+            return {}
+        keys = self._vapid_keys()
+        session = self._push_client()
+        results = await asyncio.gather(*(
+            web_push.send(                     # to the phone's push service, over https
+                session,
+                {'endpoint': sub['endpoint'],
+                 'keys': {'p256dh': sub['p256dh'], 'auth': sub['auth']}},
+                payload, keys, ttl=PUSH_TTL, urgency='high',
+            )
+            for _device_id, sub in targets
+        ), return_exceptions=True)
+        outcome = {}
+        for (device_id, sub), result in zip(targets, results):
+            if isinstance(result, BaseException):
+                ok, gone, error = False, False, f"{type(result).__name__}: {result}"
+            else:
+                ok, gone, error = bool(result.ok), bool(result.gone), result.error
+            if gone:
+                self._drop_subscription(device_id, sub['endpoint'])
+            elif ok:
+                self._push_failing.discard(device_id)
+            elif device_id not in self._push_failing:
+                self._push_failing.add(device_id)
+                wire_log(f"WEB PUSH: a notification to device {device_id} failed: "
+                         f"{_log_text(error, 160)}")
+            outcome[device_id] = (ok, gone, error)
+        return outcome
+
+    def _notify_joins(self, joins):
+        """Web thread: one notification per join to every subscribed phone."""
+        with self._auth_lock:
+            anyone = any(record.get('push') for record in self._devices.values())
+        if not anyone or not self._push_available():
+            return
+        title = self._push_title()
+        for join in joins:
+            self._spawn(self._send_notice({
+                'title': title,
+                'body': web_events.join_body(join),
+                'tag': 'join',
+                'url': '/#players',
+            }))
+
+    async def _send_notice(self, payload):
+        try:
+            await self._send_to_phones(payload)
+        except Exception as error:
+            wire_log(f"WEB PUSH: sending a notification failed: {error}")
+
+    async def _handle_events(self, request):
+        """GET /api/events?after=<id> - the events newer than the last one seen."""
+        raw = str(request.query.get('after', '') or '').strip()
+        try:
+            after = int(raw) if raw else 0
+        except ValueError:
+            return web.json_response({'error': 'after must be an event id'}, status=400)
+        return web.json_response({
+            'events': self._events.after(after),
+            'last_id': self._events.last_id,
+        })
+
+    async def _handle_push(self, request):
+        """GET /api/push - the key the page subscribes with, and this phone's state."""
+        if not self._push_available():
+            return web.json_response({'error': PUSH_UNAVAILABLE}, status=503)
+        keys = self._vapid_keys()
+        return web.json_response({
+            'public_key': keys.public_b64,
+            'subscribed': self._device_push(request.get(_DEVICE_ID)) is not None,
+            'first_joins': self.notify_first_joins,
+        })
+
+    async def _handle_push_subscribe(self, request):
+        """POST /api/push/subscribe {subscription} - notifications for this phone
+        (one subscription per phone; a new one replaces the old)."""
+        if not self._push_available():
+            return web.json_response({'ok': False, 'error': PUSH_UNAVAILABLE}, status=503)
+        try:
+            body = await self._json_object(request)
+        except BadRequestBody as error:
+            return web.json_response({'ok': False, 'error': str(error)}, status=400)
+        subscription = body.get('subscription')
+        reason = _web_push().valid_subscription(subscription)
+        if reason:
+            return web.json_response({'ok': False, 'error': reason}, status=400)
+        record = self._push_record({
+            'endpoint': subscription['endpoint'],
+            'p256dh': str(subscription['keys']['p256dh']).strip(),
+            'auth': str(subscription['keys']['auth']).strip(),
+        })
+        if record is None:
+            return web.json_response(
+                {'ok': False, 'error': 'subscription is not usable'}, status=400
+            )
+        device_id = request.get(_DEVICE_ID)
+        with self._auth_lock:
+            device = self._devices.get(device_id)
+            if device is None:
+                return web.json_response({'ok': False, 'error': 'Unauthorized'}, status=401)
+            # The same browser signed in under another key gets it only once.
+            for other in self._devices.values():
+                if other is not device and (other.get('push') or {}).get('endpoint') == \
+                        record['endpoint']:
+                    other.pop('push', None)
+            device['push'] = record
+        self._push_failing.discard(device_id)
+        wire_log(f"WEB PUSH: device {device_id} turned notifications on")
+        self._devices_changed()
+        return web.json_response({'ok': True})
+
+    async def _handle_push_unsubscribe(self, request):
+        """POST /api/push/unsubscribe - no more notifications for this phone."""
+        device_id = request.get(_DEVICE_ID)
+        with self._auth_lock:
+            device = self._devices.get(device_id)
+            removed = device is not None and device.pop('push', None) is not None
+        if removed:
+            wire_log(f"WEB PUSH: device {device_id} turned notifications off")
+            self._devices_changed()
+        return web.json_response({'ok': True})
+
+    async def _handle_push_test(self, request):
+        """POST /api/push/test - "Notifications are on", to this phone only."""
+        if not self._push_available():
+            return web.json_response({'ok': False, 'error': PUSH_UNAVAILABLE}, status=503)
+        device_id = request.get(_DEVICE_ID)
+        if self._device_push(device_id) is None:
+            return web.json_response(
+                {'ok': False, 'error': 'Notifications are not on for this phone'}
+            )
+        payload = {'title': self._push_title(), 'body': 'Notifications are on',
+                   'tag': 'test', 'url': '/#more'}
+        try:
+            outcome = await self._send_to_phones(payload, only=device_id)
+        except Exception as error:
+            wire_log(f"WEB PUSH: test notification failed: {error}")
+            return web.json_response({'ok': False, 'error': f'Not sent: {error}'})
+        ok, gone, error = outcome.get(device_id, (False, False, 'Not sent'))
+        if ok:
+            return web.json_response({'ok': True})
+        if gone:
+            return web.json_response({'ok': False, 'error': (
+                'This phone no longer takes notifications from WolfRAT: turn them on again')})
+        return web.json_response({'ok': False, 'error': error or 'Not sent'})
+
+    async def _handle_push_settings(self, request):
+        """POST /api/push/settings {first_joins: 0-10} - how many joins after an
+        empty spell notify (for every phone; 0 = none)."""
+        try:
+            body = await self._json_object(request)
+        except BadRequestBody as error:
+            return web.json_response({'ok': False, 'error': str(error)}, status=400)
+        first = body.get('first_joins')
+        if isinstance(first, bool) or not isinstance(first, int) or not (
+                0 <= first <= NOTIFY_FIRST_JOINS_MAX):
+            return web.json_response({'ok': False, 'error': (
+                f'first_joins must be a whole number from 0 to {NOTIFY_FIRST_JOINS_MAX}')},
+                status=400)
+        with self._auth_lock:
+            changed = first != self._notify_first_joins
+            self._notify_first_joins = first
+        if changed:
+            wire_log(f"WEB PUSH: notify the first {first} players who join an empty server")
+            self._devices_changed()
+        return web.json_response({'ok': True, 'first_joins': first})
 
     def _chat_rows(self, count):
         """The last chat lines, each with "kind" (player / wolfrat / console)
@@ -1259,6 +1914,8 @@ class WolfWebServer:
         features['set_next'] = bool(
             self.sm.is_connected and tuple(self.sm.mission_entries or ())
         )
+        # Phone notifications: this WolfRAT can send them (the page also needs https).
+        features['push'] = self._push_available()
         return features
 
     def _desktop_feature(self, name):
@@ -1275,6 +1932,10 @@ class WolfWebServer:
         game_state = self._json_safe(self.sm.game_state or {})
         titles = self._map_titles()
         mode = top.get('manual_mode') or manual_mode.state.mode
+        server = dict(self._json_safe(
+            top.get('server') or web_state.server_block(self.sm, titles)
+        ))
+        server['secure_address'] = self.secure_address()
         return {
             'type': 'state',
             'timestamp': time.time(),
@@ -1288,9 +1949,7 @@ class WolfWebServer:
             'game_mode': self.sm.game_state.get('mode', 'Unknown') if self.sm.game_state else 'Unknown',
             # Longest phone chat line: the server's limit less "[ADMIN] ".
             'chat_max': max(1, chat_limit() - len(PHONE_PREFIX)),
-            'server': self._json_safe(
-                top.get('server') or web_state.server_block(self.sm, titles)
-            ),
+            'server': server,
             'next_map': self._json_safe(
                 top['next_map'] if 'next_map' in top
                 else web_state.next_map_block(self.sm, titles)
@@ -1301,6 +1960,9 @@ class WolfWebServer:
             'weather': self._json_safe(top.get('weather')),
             'lag_comp': self._json_safe(top.get('lag_comp')),
             'features': self._json_safe(self._features(top.get('features'))),
+            # The bell: the newest events (oldest first) and the newest id.
+            'events': self._events.recent(web_events.STATE_EVENTS),
+            'events_last_id': self._events.last_id,
         }
 
     @classmethod
@@ -1537,7 +2199,7 @@ class WolfWebServer:
             if not valid_token:
                 return web.json_response({'error': 'Web admin is not enabled'}, status=403)
 
-            ip = request.remote or 'unknown'
+            ip = client_address(request) or 'unknown'
             if _same_text(username, valid_user) and _same_text(token, valid_token):
                 # The right token always gets in, even while this address is
                 # locked; it does not lift the lock for anyone else.
@@ -1586,7 +2248,7 @@ class WolfWebServer:
                     {'error': 'Type the code shown on the PC'}, status=400
                 )
             code = normalize_pair_code(code)
-            ip = request.remote or 'unknown'
+            ip = client_address(request) or 'unknown'
             if self._take_pair_code(code):
                 name = self._device_name(request, body.get('device_name'))
                 key, device_id = self.create_device(name, ip)
@@ -2020,7 +2682,7 @@ class WolfWebServer:
         device_id = request.get(_DEVICE_ID)
         if len(self._ws_clients) >= MAX_WS_CLIENTS:
             return web.Response(status=503, text='Too many open connections')
-        ip = request.remote or ''
+        ip = client_address(request) or ''
         ws = web.WebSocketResponse(heartbeat=WS_HEARTBEAT)
         await ws.prepare(request)
         self._add_socket(ws, device_id, ip, asyncio.get_running_loop())

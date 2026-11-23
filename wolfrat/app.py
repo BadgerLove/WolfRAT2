@@ -6042,6 +6042,9 @@ class ModsTab(QWidget):
         # commands this server answers.  None = nothing private can be sent.
         self.private_line = None
         self.player_commands = None
+        # (kind, name, who) after the server took a kick, ban or warning: the
+        # phone page's alerts (MainWindow points it at the web server).
+        self.on_admin_event = None
         self.roster = ModRoster()  # who is a mod, at which rank
         self._seen_chat_ids = set()  # for dedup
         self._chat_initialized = False
@@ -6165,7 +6168,10 @@ class ModsTab(QWidget):
         on_success=None,
         on_failure=None,
         policy=CompletionPolicy.VERIFIED,
+        event=None,
     ):
+        """``event`` = (kind, name, who) for a kick / ban / warn: told to
+        ``on_admin_event`` once the server took it."""
         def accepted(result):
             if log_message:
                 self.mod_log.addItem(log_message)
@@ -6175,6 +6181,12 @@ class ModsTab(QWidget):
                 self._send_mod_chat(
                     announcement, f"{context} announcement"
                 )
+            hook = self.on_admin_event
+            if event is not None and hook is not None:
+                try:
+                    hook(*event)
+                except Exception as error:      # never break the action for the alerts
+                    wire_log(f"[MODS] alert for {context} failed: {error}")
 
         return submit_admin(
             self,
@@ -7083,6 +7095,7 @@ class ModsTab(QWidget):
                     log_message=(
                         f"[{now}] {sender} warned {target['name']}: {reason}"
                     ),
+                    event=("warn", target['name'], display_name),
                 )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to warn but player not found")
@@ -7101,6 +7114,7 @@ class ModsTab(QWidget):
                     log_message=(
                         f"[{now}] {sender} kicked {target['name']}: {reason}"
                     ),
+                    event=("kick", target['name'], display_name),
                 )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to kick but player not found")
@@ -7123,6 +7137,7 @@ class ModsTab(QWidget):
                     log_message=(
                         f"[{now}] {sender} banned {target['name']}: {reason}"
                     ),
+                    event=("ban", target['name'], display_name),
                 )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to ban but player not found")
@@ -9383,13 +9398,18 @@ class WebAdminTab(QWidget):
                 'web_username': self.user_input.text().strip() or 'admin',
                 'web_token': self._config.get('web_token', ''),
                 'web_allow_internet': self.internet_cb.isChecked(),
-                # One record per phone: its name, last use and the SHA-256 of
-                # its key (never the key).
+                # One record per phone: its name, last use, the SHA-256 of its
+                # key (never the key) and its notification subscription.
                 'devices': self.ws.devices_for_config(),
             }
             address = self.ws.internet_address
             if address:
                 cfg['web_internet_address'] = address
+            phone_address = self.ws.phone_address    # the box's text once it checked out
+            if phone_address:
+                cfg['web_phone_address'] = phone_address
+            # notify_first_joins, and web_push_vapid once it is made.
+            cfg.update(self.ws.push_config())
             temporary = self._config_path + '.tmp'
             with open(temporary, 'w', encoding='utf-8') as f:
                 json.dump(cfg, f, indent=2)
@@ -9406,6 +9426,9 @@ class WebAdminTab(QWidget):
         self.user_input.setText(self._config.get('web_username', 'admin'))
         allow_internet = bool(self._config.get('web_allow_internet', False))
         self.internet_cb.setChecked(allow_internet)
+        phone_address = self._config.get('web_phone_address', '')
+        phone_address = phone_address.strip() if isinstance(phone_address, str) else ''
+        self.phone_address_input.setText(phone_address)
         token = self._config.get('web_token', '')
         self.token_display.setText(token)
         self._loading = False
@@ -9413,6 +9436,8 @@ class WebAdminTab(QWidget):
         self.ws.set_auth(self._config.get('web_username', 'admin'), token or None)
         self.ws.load_devices(self._config.get('devices', []))
         self.ws.load_internet_address(self._config.get('web_internet_address'))
+        self.ws.load_push_config(self._config)
+        self.ws.phone_address = phone_address
         self.ws.allow_internet = allow_internet
         # The web server calls these on its own thread; the signals bring
         # them here (saving and the device list are Qt-thread work).
@@ -9520,6 +9545,14 @@ class WebAdminTab(QWidget):
         self.internet_hint.setStyleSheet("color: #888; font-size: 9pt;")
         self.internet_hint.setWordWrap(True)
         settings_layout.addWidget(self.internet_hint, 3, 0, 1, 2)
+
+        # The address phones should use, when it is not this PC's own (an
+        # https:// name in front of WolfRAT): Pair a phone's QR code uses it.
+        settings_layout.addWidget(QLabel("Address for phones (optional):"), 4, 0)
+        self.phone_address_input = QLineEdit()
+        self.phone_address_input.setPlaceholderText("e.g. https://wolfrat.example.com")
+        self.phone_address_input.editingFinished.connect(self._on_phone_address_change)
+        settings_layout.addWidget(self.phone_address_input, 4, 1)
 
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
@@ -9725,6 +9758,23 @@ class WebAdminTab(QWidget):
         self.ws.allow_internet = checked
         self._save_config()
 
+    def _on_phone_address_change(self):
+        from wolfrat.web_server import phone_address_url
+
+        if self._loading:
+            return
+        text = self.phone_address_input.text().strip()
+        address = phone_address_url(text)
+        if text and address is None:
+            self._show_msg("That address doesn't look right: use e.g. "
+                           "https://wolfrat.example.com")
+            return
+        if (address or '') != self.phone_address_input.text():
+            self.phone_address_input.setText(address or '')
+        self.ws.phone_address = address
+        if (address or '') != (self._config.get('web_phone_address') or ''):
+            self._save_config()
+
     def _update_internet_hint(self):
         self.internet_hint.setText(
             f"Open port {self.port_spin.value()} on your router to use it away from home."
@@ -9751,6 +9801,7 @@ class WebAdminTab(QWidget):
             lan_address=lan[0] if lan else None,
             port=self.port_spin.value(),
             internet_address=internet,
+            phone_address=self.ws.phone_address,
             web_running=self.ws.is_running,
             parent=self,
         )
@@ -9921,6 +9972,11 @@ class MainWindow(QMainWindow):
         # this window knows is published to the web server as one snapshot.
         self.phone_bridge = PhoneBridge(self, self.web_server, parent=self)
         self.phone_bridge.attach()
+        # The page's alerts: kicks, bans and warnings the server took (chat
+        # commands and the phone's buttons), and a look at the player list
+        # after every update (joins, leaves, notifications).
+        self.mods_tab.on_admin_event = self.web_server.admin_event
+        self.signals.players_signal.connect(lambda _players: self.web_server.watch_now())
         for signal in (
             self.signals.missions_signal,
             self.signals.manual_mode_signal,

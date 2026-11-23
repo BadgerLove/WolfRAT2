@@ -2,7 +2,9 @@
 
 Shows a one-use code from the web server (valid 5 minutes) in big letters, and
 a QR code of this PC's address with the code in it: a phone camera opens the
-page and the page signs in with the code by itself.
+page and the page signs in with the code by itself.  When the Web Admin tab
+has an "Address for phones" (e.g. https://wolfrat.example.com), the main QR
+code uses that address instead.
 """
 
 import time
@@ -21,8 +23,16 @@ def lan_pair_url(address, port, code):
 
 
 def internet_pair_url(host, code):
-    """The page on the address a phone used from the internet (host[:port])."""
+    """The page on the address a phone used from the internet: host[:port]
+    (plain http) or a full https://host address."""
+    if str(host).lower().startswith(('http://', 'https://')):
+        return f"{str(host).rstrip('/')}/#pair={code}"
     return f"http://{host}/#pair={code}"
+
+
+def phone_pair_url(address, code):
+    """The page on the Web Admin tab's "Address for phones" (a full URL)."""
+    return f"{str(address).rstrip('/')}/#pair={code}"
 
 
 def qr_pixmap(text, scale=5, border=4):
@@ -51,6 +61,7 @@ class PairPhoneDialog(QDialog):
         lan_address,
         port,
         internet_address=None,
+        phone_address=None,
         web_running=True,
         parent=None,
         clock=time.time,
@@ -60,6 +71,7 @@ class PairPhoneDialog(QDialog):
         self._lan = lan_address
         self._port = port
         self._internet = internet_address
+        self._phone = phone_address or None
         self._clock = clock
         self._code = None
         self._expires_at = 0.0
@@ -154,7 +166,19 @@ class PairPhoneDialog(QDialog):
         return lan_pair_url(self._lan, self._port, self._code) if self._lan else None
 
     def internet_url(self):
-        return internet_pair_url(self._internet, self._code) if self._internet else None
+        """The away-from-home QR's address (not when it is the phone address)."""
+        if not self._internet:
+            return None
+        url = internet_pair_url(self._internet, self._code)
+        if self._phone and url == self.main_url():
+            return None
+        return url
+
+    def main_url(self):
+        """The main QR's address: the tab's "Address for phones", else this PC's."""
+        if self._phone:
+            return phone_pair_url(self._phone, self._code)
+        return self.lan_url()
 
     def new_code(self):
         """Ask the web server for a fresh code (the old one stops working)."""
@@ -162,12 +186,13 @@ class PairPhoneDialog(QDialog):
         self._paired = False
         self.code_label.setText(f"{self._code[:3]} {self._code[3:]}")
         self.code_label.setStyleSheet("color: #e8c840; padding: 6px;")
-        self._show_qr(self.qr_label, self.url_label, self.lan_url(),
+        self._show_qr(self.qr_label, self.url_label, self.main_url(),
                       "No network address found - check this PC is on Wi-Fi/LAN")
         self._show_qr(self.internet_qr_label, self.internet_url_label, self.internet_url(), None)
-        # A PC whose own address is a public one (a rented server): that QR
-        # works from anywhere, so there is nothing more to say.
-        public = bool(self._lan) and not is_local_address(self._lan)
+        # The tab's address for phones, or a PC whose own address is a public
+        # one (a rented server): that QR works from anywhere, so there is
+        # nothing more to say.
+        public = bool(self._phone) or (bool(self._lan) and not is_local_address(self._lan))
         self.qr_label.heading.setText("Scan with the phone" if public else "On this network")
         if self._internet or public or not getattr(self.ws, "allow_internet", False):
             self.away_label.setText("")

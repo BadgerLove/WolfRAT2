@@ -177,9 +177,10 @@ class PhoneBridge(QObject):
         self.schedule_publish()
 
     def _mod_action(self, answer, operation, *, context, announcement=None,
-                    log_message, success_reply, failure_extra=None):
+                    log_message, success_reply, failure_extra=None, event=None):
         """Through the Mods tab's own path (as !kick / !ban / !warn): the Mod
-        activity line, then the announcement once the server confirmed."""
+        activity line, then the announcement (and the page's alert, ``event``)
+        once the server confirmed."""
         mods = self._get("mods_tab")
         if mods is None:
             return _fail("The WolfRAT window is still starting", 503)
@@ -199,6 +200,7 @@ class PhoneBridge(QObject):
             log_message=log_message,
             on_success=succeeded,
             on_failure=failed,
+            event=event,
         )
         return None                        # settled by the callbacks
 
@@ -214,6 +216,7 @@ class PhoneBridge(QObject):
             announcement=f"{name} was kicked by an admin",
             log_message=f"[{_now()}] {who} kicked {name}: {reason}",
             success_reply=f"{name} was kicked",
+            event=("kick", name, who),
         )
 
     def _ban(self, payload, answer):
@@ -249,6 +252,7 @@ class PhoneBridge(QObject):
             success_reply=reply,
             failure_extra={"replies": [f"{name} is on the ban list ({what}); "
                                        "the kick was not confirmed"]},
+            event=("ban", name, who),
         )
 
     def _warn(self, payload, answer):
@@ -266,6 +270,7 @@ class PhoneBridge(QObject):
             context=f"Warn {name}",
             log_message=f"[{_now()}] {who} warned {name}: {reason}",
             success_reply=f"Warning sent: WARNING to {name}: {reason}",
+            event=("warn", name, who),
         )
 
     def _private_ready(self):

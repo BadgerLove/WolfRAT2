@@ -90,9 +90,9 @@ class FakeMods:
         self._skip_active = False
 
     def _submit_mod_action(self, operation, *, context, announcement=None, log_message=None,
-                           on_success=None, on_failure=None, policy=None):
+                           on_success=None, on_failure=None, policy=None, event=None):
         self.submitted.append({"context": context, "announcement": announcement,
-                               "log_message": log_message})
+                               "log_message": log_message, "event": event})
         result = operation()
         if self.fail:
             on_failure(self.fail)
@@ -198,6 +198,23 @@ def test_warn_is_the_public_warning_line(qtbot):
     assert mods.said == []                 # the warning is the announcement
     refused = run(bridge, "warn", {"entry": ALICE, "reason": "café"})
     assert refused["status"] == 400 and len(window.server.calls) == 1
+
+
+def test_the_phones_kick_ban_and_warn_carry_the_alert(qtbot, tmp_path):
+    """Contract v2: the page's bell hears of each one (through the Mods tab's
+    hook, once the server took it)."""
+    from tests.test_bans_tab import Rig
+    rig = Rig(tmp_path)
+    mods = FakeMods()
+    bridge, _window, _web = make_bridge(mods_tab=mods, bans_tab=rig.tab)
+    run(bridge, "kick", {"entry": ALICE, "device_name": "Pixel"})
+    run(bridge, "ban", {"entry": ALICE, "expiry": "", "device_name": "Pixel"})
+    run(bridge, "warn", {"entry": ALICE, "reason": "language"})
+    assert [item["event"] for item in mods.submitted] == [
+        ("kick", "Alice", "Web Admin (Pixel)"),
+        ("ban", "Alice", "Web Admin (Pixel)"),
+        ("warn", "Alice", "Web Admin"),
+    ]
 
 
 def test_private_message_through_the_helper(qtbot):
