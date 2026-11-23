@@ -43,6 +43,8 @@ wolfrat = [
     "web_templates/*.css",
     "web_templates/*.html",
     "web_templates/*.js",
+    "web_templates/*.png",
+    "web_templates/*.webmanifest",
 ]
 
 [tool.pytest.ini_options]

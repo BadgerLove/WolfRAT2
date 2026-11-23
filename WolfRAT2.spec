@@ -9,6 +9,9 @@ application_data = [
     ("wolfrat/web_templates/*.css", "wolfrat/web_templates"),
     ("wolfrat/web_templates/*.html", "wolfrat/web_templates"),
     ("wolfrat/web_templates/*.js", "wolfrat/web_templates"),
+    # The phone page's install files: manifest.webmanifest and the icons.
+    ("wolfrat/web_templates/*.webmanifest", "wolfrat/web_templates"),
+    ("wolfrat/web_templates/*.png", "wolfrat/web_templates"),
 ]
 
 analysis = Analysis(

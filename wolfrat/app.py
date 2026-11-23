@@ -9311,6 +9311,10 @@ class WebAdminTab(QWidget):
     """Web Admin settings tab - configure the embedded web server for mobile access."""
 
     _web_start_finished_signal = pyqtSignal(object)
+    # From the web server's thread: a device signed in / out or was used.
+    _devices_changed_signal = pyqtSignal()
+    # From the web server's thread: (device id, name) used the pairing code.
+    _paired_signal = pyqtSignal(str, str)
 
     def __init__(
         self,
@@ -9321,43 +9325,77 @@ class WebAdminTab(QWidget):
         self.ws = web_server
         self.runtime = runtime or DesktopRuntime.production()
         self._config_path = self._get_config_path()
+        self._loading = True
+        self._internet_key_added = False
         self._config = self._load_config()
         self._pending_web_start = None
         self._web_start_is_autostart = False
         self._web_autostart_retries = 0
+        self._pair_dialog = None
+        self._device_rows = {}
         self._web_start_finished_signal.connect(
             self._web_start_completed,
             Qt.ConnectionType.QueuedConnection,
         )
+        self._devices_changed_signal.connect(
+            self._on_devices_changed,
+            Qt.ConnectionType.QueuedConnection,
+        )
+        self._paired_signal.connect(
+            self._on_paired,
+            Qt.ConnectionType.QueuedConnection,
+        )
         self._build_ui()
         self._apply_config()
+        # Keeps "last used 3m ago" current in the device list.
+        self._devices_timer = QTimer(self)
+        self._devices_timer.timeout.connect(self._refresh_devices)
+        self._devices_timer.start(30_000)
 
     def _get_config_path(self):
         return str(self.runtime.path("wolfrat_web.json"))
 
     def _load_config(self):
+        cfg = {}
         try:
             if os.path.exists(self._config_path):
-                with open(self._config_path, 'r') as f:
-                    return json.load(f)
+                with open(self._config_path, 'r', encoding='utf-8') as f:
+                    cfg = json.load(f)
         except Exception:
-            pass
-        return {}
+            cfg = {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        if 'web_allow_internet' not in cfg:
+            # New installs: this network only. An install that already had
+            # Web Admin on keeps taking phones from the internet after the update.
+            cfg['web_allow_internet'] = bool(cfg.get('web_enabled', False))
+            self._internet_key_added = True
+        return cfg
 
     def _save_config(self):
+        """Write wolfrat_web.json (Qt thread only; the web server's changes are
+        queued here). Written to a temporary file first, then swapped in."""
         try:
             cfg = {
                 'web_enabled': self.enable_cb.isChecked(),
                 'web_port': self.port_spin.value(),
                 'web_username': self.user_input.text().strip() or 'admin',
                 'web_token': self._config.get('web_token', ''),
-                'login_ips': self._config.get('login_ips', {}),
+                'web_allow_internet': self.internet_cb.isChecked(),
+                # One record per phone: its name, last use and the SHA-256 of
+                # its key (never the key).
+                'devices': self.ws.devices_for_config(),
             }
-            with open(self._config_path, 'w') as f:
+            address = self.ws.internet_address
+            if address:
+                cfg['web_internet_address'] = address
+            temporary = self._config_path + '.tmp'
+            with open(temporary, 'w', encoding='utf-8') as f:
                 json.dump(cfg, f, indent=2)
+            os.replace(temporary, self._config_path)
             self._config = cfg
-        except Exception:
-            pass
+        except Exception as error:
+            wire_log(f"WEB: could not save {self._config_path}: {error}")
 
     def _apply_config(self):
         """Apply loaded config to UI widgets and start server if enabled."""
@@ -9365,20 +9403,31 @@ class WebAdminTab(QWidget):
         self.enable_cb.setChecked(self._config.get('web_enabled', False))
         self.port_spin.setValue(self._config.get('web_port', 8070))
         self.user_input.setText(self._config.get('web_username', 'admin'))
+        allow_internet = bool(self._config.get('web_allow_internet', False))
+        self.internet_cb.setChecked(allow_internet)
         token = self._config.get('web_token', '')
-        if not token:
-            token = generate_token()
-            self._config['web_token'] = token
-            self._save_config()
         self.token_display.setText(token)
         self._loading = False
         # Apply auth to web server
-        self.ws.set_auth(self._config.get('web_username', 'admin'), token)
-        # Load persisted login IPs
-        saved_ips = self._config.get('login_ips', {})
-        self.ws.load_login_ips(saved_ips)
-        # Set callback to persist new logins
-        self.ws.on_login = self._on_web_login
+        self.ws.set_auth(self._config.get('web_username', 'admin'), token or None)
+        self.ws.load_devices(self._config.get('devices', []))
+        self.ws.load_internet_address(self._config.get('web_internet_address'))
+        self.ws.allow_internet = allow_internet
+        # The web server calls these on its own thread; the signals bring
+        # them here (saving and the device list are Qt-thread work).
+        self.ws.on_devices_changed = self._devices_changed_signal.emit
+        self.ws.on_paired = self._paired_signal.emit
+        if not token:
+            token = generate_token()
+            self._config['web_token'] = token
+            self.token_display.setText(token)
+            self.ws.set_auth(self._config.get('web_username', 'admin'), token)
+            self._save_config()
+        elif self._internet_key_added:
+            self._save_config()
+        self._internet_key_added = False
+        self._update_internet_hint()
+        self._refresh_devices()
         # Update status bar LED
         parent = self.window()
         if hasattr(parent, 'update_web_led'):
@@ -9392,15 +9441,6 @@ class WebAdminTab(QWidget):
         self.ws.port = self._config.get("web_port", 8070)
         self._web_autostart_retries = 3
         self._observe_web_start(self.ws.start(), autostart=True)
-
-    def _on_web_login(self, ip, timestamp):
-        """Called by web server when a new login happens. Persists to config."""
-        self._config['login_ips'] = self.ws.get_login_ips_dict()
-        try:
-            with open(self._config_path, 'w') as f:
-                json.dump(self._config, f, indent=2)
-        except Exception:
-            pass
 
     def _build_ui(self):
         outer = QVBoxLayout(self)
@@ -9425,7 +9465,7 @@ class WebAdminTab(QWidget):
         layout.addWidget(desc)
 
         # Warning
-        warning = QLabel("⚠️ OFF by default. When enabled, the web server listens on your network. Ensure your firewall is configured.")
+        warning = QLabel("⚠️ OFF by default. When on, phones on this PC's own network can open the page.")
         warning.setStyleSheet("color: #ff8040; font-size: 10pt; padding: 8px; background: #1a1000; border-radius: 6px;")
         warning.setWordWrap(True)
         layout.addWidget(warning)
@@ -9471,25 +9511,60 @@ class WebAdminTab(QWidget):
         self.user_input.textChanged.connect(self._on_user_change)
         settings_layout.addWidget(self.user_input, 1, 1)
 
+        # One tick for phones away from home (Dale, 2026-11-23: keep it simple).
+        self.internet_cb = QCheckBox("Allow phones from the internet")
+        self.internet_cb.toggled.connect(self._on_internet_toggle)
+        settings_layout.addWidget(self.internet_cb, 2, 0, 1, 2)
+        self.internet_hint = QLabel("")
+        self.internet_hint.setStyleSheet("color: #888; font-size: 9pt;")
+        self.internet_hint.setWordWrap(True)
+        settings_layout.addWidget(self.internet_hint, 3, 0, 1, 2)
+
         settings_group.setLayout(settings_layout)
         layout.addWidget(settings_group)
+
+        # Phones: pairing and every signed-in device (replaces Recent Logins)
+        devices_group = QGroupBox("Phones")
+        devices_layout = QVBoxLayout()
+        pair_row = QHBoxLayout()
+        self.pair_btn = QPushButton("Pair a phone")
+        self.pair_btn.setStyleSheet("font-weight: bold;")
+        self.pair_btn.clicked.connect(self._pair_phone)
+        pair_row.addWidget(self.pair_btn)
+        pair_row.addStretch()
+        devices_layout.addLayout(pair_row)
+        self.devices_empty = QLabel("No phones signed in yet")
+        self.devices_empty.setStyleSheet("color: #888; font-size: 10pt; padding: 4px;")
+        devices_layout.addWidget(self.devices_empty)
+        self.devices_box = QWidget()
+        self.devices_box_layout = QVBoxLayout(self.devices_box)
+        self.devices_box_layout.setContentsMargins(0, 0, 0, 0)
+        self.devices_box_layout.setSpacing(4)
+        devices_layout.addWidget(self.devices_box)
+        devices_group.setLayout(devices_layout)
+        layout.addWidget(devices_group)
 
         # Access Token
         token_group = QGroupBox("Access Token")
         token_layout = QVBoxLayout()
 
-        token_desc = QLabel("Share this username and token with admins who need mobile access.")
+        token_desc = QLabel("Phones sign in with this username and token, or with Pair a phone above.")
         token_desc.setStyleSheet("color: #888; font-size: 9pt;")
         token_desc.setWordWrap(True)
         token_layout.addWidget(token_desc)
 
         self.token_display = QLineEdit()
         self.token_display.setReadOnly(True)
+        self.token_display.setEchoMode(QLineEdit.EchoMode.Password)
         self.token_display.setStyleSheet("font-family: monospace; font-size: 11pt; color: #e8c840; background: #0a0a00; padding: 8px;")
         self.token_display.setPlaceholderText("Click Generate to create a token")
         token_layout.addWidget(self.token_display)
 
         btn_row = QHBoxLayout()
+        self.show_token_btn = QPushButton("Show")
+        self.show_token_btn.setCheckable(True)
+        self.show_token_btn.toggled.connect(self._toggle_token_visible)
+        btn_row.addWidget(self.show_token_btn)
         copy_btn = QPushButton("Copy Token")
         copy_btn.clicked.connect(self._copy_token)
         btn_row.addWidget(copy_btn)
@@ -9501,21 +9576,6 @@ class WebAdminTab(QWidget):
 
         token_group.setLayout(token_layout)
         layout.addWidget(token_group)
-
-        # Login IP History
-        ip_group = QGroupBox("Recent Logins")
-        ip_layout = QVBoxLayout()
-        self.ip_list = QLabel("No logins yet")
-        self.ip_list.setStyleSheet("color: #888; font-size: 10pt; padding: 4px;")
-        self.ip_list.setWordWrap(True)
-        self.ip_list.setAlignment(Qt.AlignmentFlag.AlignTop)
-        ip_layout.addWidget(self.ip_list)
-        refresh_ip_btn = QPushButton("Refresh")
-        refresh_ip_btn.setFixedWidth(80)
-        refresh_ip_btn.clicked.connect(self._refresh_ip_list)
-        ip_layout.addWidget(refresh_ip_btn)
-        ip_group.setLayout(ip_layout)
-        layout.addWidget(ip_group)
 
         layout.addStretch()
 
@@ -9536,6 +9596,7 @@ class WebAdminTab(QWidget):
         self._save_config()
 
     def _on_port_change(self, port):
+        self._update_internet_hint()
         if self._loading:
             return
         self._save_config()
@@ -9566,9 +9627,11 @@ class WebAdminTab(QWidget):
             token = generate_token()
             self.token_display.setText(token)
             self._config['web_token'] = token
+            # A new token forgets every phone and closes its connections.
             self.ws.set_auth(self.user_input.text().strip() or 'admin', token)
             self._save_config()
-            self._show_msg("New token generated!")
+            self._refresh_devices()
+            self._show_msg("New token generated - every phone is signed out")
 
     def _observe_web_start(self, future, autostart=False):
         self._pending_web_start = future
@@ -9645,8 +9708,7 @@ class WebAdminTab(QWidget):
         parent = self.window()
         if hasattr(parent, 'update_web_led'):
             parent.update_web_led(self.ws.is_running)
-        # Refresh IP list
-        self._refresh_ip_list()
+        self._refresh_devices()
 
     def _show_msg(self, msg):
         """Temporary feedback via parent status bar if available."""
@@ -9654,28 +9716,111 @@ class WebAdminTab(QWidget):
         if hasattr(parent, 'show_feedback'):
             parent.show_feedback(msg)
 
-    def _refresh_ip_list(self):
-        """Refresh the login IP history display."""
-        ips = self.ws.get_login_ips()
-        if not ips:
-            self.ip_list.setText("No logins yet")
+    # --- Internet access ---
+
+    def _on_internet_toggle(self, checked):
+        if self._loading:
             return
-        lines = []
-        for entry in ips:
-            ip = entry['ip']
-            ts = entry['last_login']
-            time_str = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts))
-            ago = int(time.time() - ts)
-            if ago < 60:
-                ago_str = f"{ago}s ago"
-            elif ago < 3600:
-                ago_str = f"{ago // 60}m ago"
-            elif ago < 86400:
-                ago_str = f"{ago // 3600}h ago"
-            else:
-                ago_str = f"{ago // 86400}d ago"
-            lines.append(f"● {ip}  -  {time_str} ({ago_str})")
-        self.ip_list.setText("\n".join(lines))
+        self.ws.allow_internet = checked
+        self._save_config()
+
+    def _update_internet_hint(self):
+        self.internet_hint.setText(
+            f"Open port {self.port_spin.value()} on your router to use it away from home."
+        )
+
+    def _toggle_token_visible(self, shown):
+        self.token_display.setEchoMode(
+            QLineEdit.EchoMode.Normal if shown else QLineEdit.EchoMode.Password
+        )
+        self.show_token_btn.setText("Hide" if shown else "Show")
+
+    # --- Phones ---
+
+    def _pair_phone(self):
+        """Show a one-use code (and its QR code) a phone can sign in with."""
+        from wolfrat.web_pairing_dialog import PairPhoneDialog
+
+        if self._pair_dialog is not None:
+            self._pair_dialog.close()
+        lan = _lan_ips()
+        internet = self.ws.internet_address if self.internet_cb.isChecked() else None
+        dialog = PairPhoneDialog(
+            self.ws,
+            lan_address=lan[0] if lan else None,
+            port=self.port_spin.value(),
+            internet_address=internet,
+            web_running=self.ws.is_running,
+            parent=self,
+        )
+        dialog.finished.connect(lambda _result: self._pair_dialog_closed(dialog))
+        self._pair_dialog = dialog
+        dialog.show()
+
+    def _pair_dialog_closed(self, dialog):
+        if self._pair_dialog is dialog:
+            self._pair_dialog = None
+
+    def _on_paired(self, device_id, name):
+        if self._pair_dialog is not None:
+            self._pair_dialog.paired(name)
+        self._refresh_devices()
+        self._show_msg(f"{name} is paired")
+
+    def _on_devices_changed(self):
+        self._save_config()
+        self._refresh_devices()
+
+    def _sign_out_device(self, device_id):
+        if self.ws.sign_out_device(device_id, reason="signed out on the PC"):
+            self._show_msg("Phone signed out")
+        self._save_config()
+        self._refresh_devices()
+
+    @staticmethod
+    def _ago(stamp, now=None):
+        if not stamp:
+            return "never"
+        ago = max(0, int((time.time() if now is None else now) - stamp))
+        if ago < 60:
+            return "just now"
+        if ago < 3600:
+            return f"{ago // 60}m ago"
+        if ago < 86400:
+            return f"{ago // 3600}h ago"
+        return f"{ago // 86400}d ago"
+
+    def _refresh_devices(self):
+        """Rebuild the device list: name, last use, address, Sign out."""
+        devices = self.ws.list_devices()
+        while self.devices_box_layout.count():
+            item = self.devices_box_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        self._device_rows = {}
+        self.devices_empty.setVisible(not devices)
+        for device in devices:
+            row = QWidget()
+            row_layout = QHBoxLayout(row)
+            row_layout.setContentsMargins(0, 0, 0, 0)
+            seen = device.get('last_seen')
+            when = (time.strftime('%Y-%m-%d %H:%M', time.localtime(seen))
+                    if seen else "-")
+            text = (f"● {device['name']}  -  last used {when} ({self._ago(seen)})"
+                    + (f"  from {device['last_ip']}" if device.get('last_ip') else ""))
+            label = QLabel(text)
+            label.setStyleSheet("color: #c8c8c8; font-size: 10pt;")
+            label.setWordWrap(True)
+            row_layout.addWidget(label, 1)
+            button = QPushButton("Sign out")
+            button.setFixedWidth(80)
+            button.clicked.connect(
+                lambda _checked=False, device_id=device['id']: self._sign_out_device(device_id)
+            )
+            row_layout.addWidget(button)
+            self.devices_box_layout.addWidget(row)
+            self._device_rows[device['id']] = (label, button)
 
 
 class DownloadWorker(QThread):

@@ -79,6 +79,16 @@ async def web_client(server_manager):
         await client.close()
 
 
+async def device_headers(client):
+    """Sign in the way the page does and return its Authorization header."""
+    login = await client.post(
+        "/api/auth",
+        json={"username": "operator", "token": "web-access-token"},
+    )
+    assert login.status == 200
+    return {"Authorization": f"Bearer {(await login.json())['key']}"}
+
+
 @pytest.mark.asyncio
 async def test_static_web_resources_are_served_by_the_real_http_stack(web_client):
     expected_resources = {
@@ -116,7 +126,7 @@ async def test_login_requires_a_json_object(web_client):
 
 
 @pytest.mark.asyncio
-async def test_login_grants_bearer_access_to_protected_routes(web_client):
+async def test_login_gives_a_device_key_for_protected_routes(web_client):
     unauthorized = await web_client.get("/api/status")
     assert unauthorized.status == 401
     assert await unauthorized.json() == {"error": "Unauthorized"}
@@ -133,19 +143,28 @@ async def test_login_grants_bearer_access_to_protected_routes(web_client):
         json={"username": "operator", "token": "web-access-token"},
     )
     assert login.status == 200
-    assert await login.json() == {
-        "ok": True,
-        "token": "web-access-token",
-    }
+    body = await login.json()
+    # A key of this phone's own, never the access token.
+    assert body["ok"] is True
+    assert set(body) == {"ok", "key", "device_id"}
+    assert body["key"] != "web-access-token"
+    assert "web-access-token" not in repr(body)
 
     status = await web_client.get(
         "/api/status",
-        headers={"Authorization": "Bearer web-access-token"},
+        headers={"Authorization": f"Bearer {body['key']}"},
     )
     assert status.status == 200
     state = await status.json()
     assert state["connected"] is True
     assert state["game_mode"] == "AAS"
+
+    # The access token only buys a key; it opens nothing else.
+    with_token = await web_client.get(
+        "/api/status",
+        headers={"Authorization": "Bearer web-access-token"},
+    )
+    assert with_token.status == 401
 
 
 @pytest.mark.asyncio
@@ -153,7 +172,7 @@ async def test_retail_passwords_never_cross_the_http_boundary(
     web_client,
     server_manager,
 ):
-    headers = {"Authorization": "Bearer web-access-token"}
+    headers = await device_headers(web_client)
 
     settings_response = await web_client.get("/api/settings", headers=headers)
     status_response = await web_client.get("/api/status", headers=headers)
@@ -185,7 +204,7 @@ async def test_typed_action_returns_its_verified_retail_outcome(
 ):
     response = await web_client.post(
         "/api/action",
-        headers={"Authorization": "Bearer web-access-token"},
+        headers=await device_headers(web_client),
         json={"action": "next_map"},
     )
 

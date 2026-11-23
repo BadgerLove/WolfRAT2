@@ -1,18 +1,26 @@
 """
-WolfRAT v2.4 — Embedded Web Server
-Provides a mobile-friendly web UI for remote server administration.
+WolfRAT Web Admin: the embedded web server behind the phone page.
+
 All state reads from the existing ServerManager instance.
 All commands go through the same protocol.py path as the desktop UI.
+
+Signing in: every phone gets its own device key, either from the username and
+access token (POST /api/auth) or from a code shown on the PC (POST /api/pair).
+The access token itself is only taken by /api/auth; every other route wants a
+device key. Keys are kept as SHA-256 hashes; signing a device out (or a new
+access token) ends its key and closes its open connections.
 """
 
 import asyncio
 from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass, fields, is_dataclass
 from enum import Enum
+import hashlib
+import hmac
+import ipaddress
 import json
 import os
 import re
-import hashlib
 import secrets
 import sys
 import threading
@@ -21,6 +29,7 @@ import logging
 from collections.abc import Mapping
 
 from aiohttp import web
+from aiohttp.web_exceptions import HTTPException
 
 from wolfrat.admin_commands import chat_limit
 from wolfrat.protocol import split_chat, wire_log
@@ -50,6 +59,10 @@ class StalePlayerTarget(ValueError):
     """A posted player identity no longer matches the roster snapshot."""
 
 
+class BadRequestBody(ValueError):
+    """The request body is not the JSON object a route expects."""
+
+
 # In front of every chat line sent from the phone page, so players can see an
 # admin wrote it.  Older pages add it themselves; the server takes it off and
 # puts it back once.
@@ -57,10 +70,151 @@ PHONE_PREFIX = "[ADMIN] "
 # How long a typed phone command may wait for the WolfRAT window to take it.
 PHONE_COMMAND_TIMEOUT = 10.0
 
+# --- Devices (one key per phone) ---
+DEVICE_KEY_BYTES = 32
+MAX_DEVICES = 50                 # the least recently used one goes first
+DEVICE_TOUCH_SECONDS = 60        # last_seen / last_ip are written at most this often
+DEVICE_NAME_MAX = 40
+
+# --- Pairing (a code shown on the PC) ---
+PAIR_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+PAIR_CODE_LENGTH = 6
+PAIR_CODE_SECONDS = 5 * 60
+
+# --- Requests and connections ---
+CLIENT_MAX_SIZE = 64 * 1024      # no route needs a bigger body
+MAX_WS_CLIENTS = 32
+WS_HEARTBEAT = 30.0
+WS_SEND_TIMEOUT = 5.0
+# WebSocket close code when a key stops working (signed out, new token).
+WS_CLOSE_SIGNED_OUT = 4001
+
+SECURITY_HEADERS = {
+    'X-Frame-Options': 'DENY',
+    'X-Content-Type-Options': 'nosniff',
+    'Referrer-Policy': 'no-referrer',
+    'Content-Security-Policy': (
+        "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; connect-src 'self' ws: wss:; "
+        "frame-ancestors 'none'; base-uri 'none'"
+    ),
+}
+
+# Addresses that count as "this network": loopback, private (RFC 1918,
+# fc00::/7), link-local and 100.64.0.0/10 (carrier-grade NAT / VPN overlays).
+_LOCAL_NETWORKS = tuple(ipaddress.ip_network(network) for network in (
+    '127.0.0.0/8',
+    '10.0.0.0/8',
+    '172.16.0.0/12',
+    '192.168.0.0/16',
+    '169.254.0.0/16',
+    '100.64.0.0/10',
+    '::1/128',
+    'fc00::/7',
+    'fe80::/10',
+))
+
+NETWORK_REFUSAL = (
+    "This WolfRAT only takes phones on its own network. To use it from the "
+    "internet, tick 'Allow phones from the internet' on the Web Admin tab in WolfRAT."
+)
+_NETWORK_REFUSAL_PAGE = (
+    "<!doctype html><html><head><meta charset=\"utf-8\">"
+    "<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">"
+    "<title>WolfRAT</title></head><body>"
+    "<h1>WolfRAT</h1>"
+    "<p>This WolfRAT only takes phones on its own network.</p>"
+    "<p>To use it from the internet, tick <b>Allow phones from the internet</b> "
+    "on the Web Admin tab in WolfRAT.</p>"
+    "</body></html>"
+)
+
+# The page's files: fixed names only, never a directory. (file, content type,
+# text served when the file is missing; None = 404).
+STATIC_FILES = {
+    '/': ('index.html', 'text/html',
+          '<h1>WolfRAT Web UI</h1><p>Template not found.</p>'),
+    '/static/app.js': ('app.js', 'application/javascript', '// app.js not found'),
+    '/static/style.css': ('style.css', 'text/css', ''),
+    '/manifest.webmanifest': ('manifest.webmanifest', 'application/manifest+json', None),
+    '/sw.js': ('sw.js', 'application/javascript', None),
+    '/static/icon-192.png': ('icon-192.png', 'image/png', None),
+    '/static/icon-512.png': ('icon-512.png', 'image/png', None),
+    '/static/icon-maskable-512.png': ('icon-maskable-512.png', 'image/png', None),
+}
+
+# Where a checked request keeps the id of the device whose key it carried.
+_DEVICE_ID = (
+    web.RequestKey('wolf_device', str) if hasattr(web, 'RequestKey') else 'wolf_device'
+)
+
+_HOST_HEADER = re.compile(r'[A-Za-z0-9.\-]{1,253}(?::\d{1,5})?|\[[0-9A-Fa-f:.]{2,45}\](?::\d{1,5})?')
+
 
 def _log_text(value, limit=40):
     """Something a visitor typed, safe for one wire-log line."""
     return repr(str(value)[:limit])
+
+
+def _same_text(given, expected):
+    """Constant-time comparison that also copes with non-ASCII text."""
+    return hmac.compare_digest(
+        str(given).encode('utf-8', 'replace'),
+        str(expected).encode('utf-8', 'replace'),
+    )
+
+
+def _key_digest(key):
+    return hashlib.sha256(str(key).encode('utf-8', 'replace')).hexdigest()
+
+
+def is_local_address(address):
+    """True for loopback, private, link-local and 100.64.0.0/10 addresses."""
+    if not address:
+        return False
+    text = str(address).strip()
+    if text.startswith('[') and text.endswith(']'):
+        text = text[1:-1]
+    text = text.split('%', 1)[0]          # IPv6 zone id
+    try:
+        ip = ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    if ip.version == 6 and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return any(ip in network for network in _LOCAL_NETWORKS)
+
+
+def normalize_pair_code(code):
+    """What the phone typed, as the PC shows it: capitals, no spaces or dashes."""
+    return re.sub(r'[\s\-]+', '', str(code or '')).upper()
+
+
+def device_name_from_agent(user_agent):
+    """A readable default name for a device from its browser's User-Agent."""
+    agent = str(user_agent or '')
+    for marker, name in (
+        ('iPhone', 'iPhone'),
+        ('iPad', 'iPad'),
+        ('Android', 'Android phone'),
+        ('Windows', 'Windows PC'),
+        ('Macintosh', 'Mac'),
+        ('CrOS', 'Chromebook'),
+        ('Linux', 'Linux PC'),
+    ):
+        if marker in agent:
+            return name
+    return 'Phone'
+
+
+def clean_device_name(name):
+    """One short printable line for the device list."""
+    text = ''.join(
+        character for character in str(name or '')
+        if character.isprintable()
+    )
+    text = ' '.join(text.split())[:DEVICE_NAME_MAX].strip()
+    return text or 'Phone'
 
 
 def _get_template_path():
@@ -77,12 +231,31 @@ def generate_token():
     return secrets.token_urlsafe(32)
 
 
+async def _add_security_headers(request, response):
+    """Every response: no framing, no sniffing, no referrer, the page's CSP."""
+    for name, value in SECURITY_HEADERS.items():
+        response.headers[name] = value
+    if request.path.startswith('/api/') or request.path == '/ws':
+        response.headers['Cache-Control'] = 'no-store'
+    else:
+        response.headers['Cache-Control'] = 'no-cache'
+
+
 @dataclass(frozen=True)
 class WebServerStartResult:
     """The observable outcome of binding one web-server lifecycle."""
 
     ok: bool
     error: str | None = None
+
+
+@dataclass(frozen=True)
+class _OpenSocket:
+    """One open WebSocket: whose key opened it, from where, on which loop."""
+
+    device_id: str
+    ip: str
+    loop: object
 
 
 class WolfWebServer:
@@ -102,48 +275,78 @@ class WolfWebServer:
         self.host = host
         self.port = port
         self._ws_clients = set()
+        self._ws_lock = threading.Lock()
+        self._ws_info = {}               # ws -> _OpenSocket
         self._loop = None
         self._thread = None
         self._runner = None
         self._last_broadcast = 0
         self._broadcast_interval = 1.0
+        self._push_pending = False
 
         self._template_path = _get_template_path()
         wire_log(f"WEB SERVER: template path = {self._template_path} (exists={os.path.exists(self._template_path)})")
 
-        # Auth state — separate from JO server credentials
+        # Auth state - separate from JO server credentials
         self._login_ips = {}  # {ip: last_login_timestamp}
-        self.on_login = None  # callback(ip, timestamp) for persistence
+        self.on_login = None  # callback(ip, timestamp), kept for older callers
         # callback(text) -> concurrent Future of {'ok', 'command', 'error'}:
         # runs a !command typed on the phone inside WolfRAT as Web Admin.
         # Set by the main window; None = typed commands are refused.
         self.on_command = None
         # Brute-force lockout: {ip: {'guesses': set(digest), 'first': ts, 'until': ts}}
         self._failed_logins = {}
+        # Phones that may use the page: {device id: record}. Records hold the
+        # SHA-256 of the key, never the key.
+        self._devices = {}
+        self._allow_internet = False
+        self._pair = None                # (code, expires_at) while a code is shown
+        self._internet_address = None    # host[:port] a signed-in phone used from outside
+        # callback() after the device list (or the internet address) changed.
+        # Called on the web thread or the caller's; the desktop queues it to Qt.
+        self.on_devices_changed = None
+        # callback(device_id, name) after a pairing code was used.
+        self.on_paired = None
 
     def _create_application(self):
         """Build one aiohttp application for one event-loop lifecycle."""
-        application = web.Application()
 
-        # Routes (public)
-        application.router.add_get('/', self._handle_index)
-        application.router.add_post('/api/auth', self._handle_auth)
-        application.router.add_get('/static/style.css', self._handle_css)
-        application.router.add_get('/static/app.js', self._handle_js)
+        @web.middleware
+        async def network_gate(request, handler):
+            if not self.allow_internet and not is_local_address(request.remote):
+                return self._network_refusal(request)
+            return await handler(request)
 
-        # Routes (protected)
-        application.router.add_get('/api/status', self._handle_status)
-        application.router.add_get('/api/players', self._handle_players)
-        application.router.add_get('/api/chat', self._handle_chat)
-        application.router.add_get('/api/maps', self._handle_maps)
-        application.router.add_get('/api/settings', self._handle_settings)
-        application.router.add_get('/api/login-ips', self._handle_login_ips)
-        application.router.add_post('/api/action', self._handle_quick_action)
+        application = web.Application(
+            middlewares=[network_gate],
+            client_max_size=CLIENT_MAX_SIZE,
+        )
+        application.on_response_prepare.append(_add_security_headers)
+        router = application.router
+
+        # Public: the page's own files, signing in and pairing.
+        for path, spec in STATIC_FILES.items():
+            router.add_get(path, self._static_handler(*spec))
+        router.add_post('/api/auth', self._handle_auth)
+        router.add_post('/api/pair', self._handle_pair)
+
+        # Everything else needs a device key.
+        protect = self._protected
+        router.add_get('/api/status', protect(self._handle_status))
+        router.add_get('/api/players', protect(self._handle_players))
+        router.add_get('/api/chat', protect(self._handle_chat))
+        router.add_get('/api/maps', protect(self._handle_maps))
+        router.add_get('/api/settings', protect(self._handle_settings))
+        router.add_get('/api/login-ips', protect(self._handle_login_ips))
+        router.add_get('/api/devices', protect(self._handle_devices))
+        router.add_post('/api/devices/signout', protect(self._handle_device_signout))
+        router.add_post('/api/logout', protect(self._handle_logout))
+        router.add_post('/api/action', protect(self._handle_quick_action))
         # No raw-command route (/api/command): the page never used it.
-        application.router.add_post('/api/chat/send', self._handle_send_chat)
-        application.router.add_post('/api/player/action', self._handle_player_action)
-        application.router.add_post('/api/map/switch', self._handle_map_switch)
-        application.router.add_get('/ws', self._handle_websocket)
+        router.add_post('/api/chat/send', protect(self._handle_send_chat))
+        router.add_post('/api/player/action', protect(self._handle_player_action))
+        router.add_post('/api/map/switch', protect(self._handle_map_switch))
+        router.add_get('/ws', protect(self._handle_websocket, query_key=True))
         return application
 
     @property
@@ -156,47 +359,310 @@ class WolfWebServer:
         """Return the aiohttp application for an external HTTP host."""
         return self._create_application()
 
+    # --- Settings from the desktop ---
+
+    @property
+    def allow_internet(self):
+        """False = only phones on this PC's own network get in."""
+        with self._auth_lock:
+            return self._allow_internet
+
+    @allow_internet.setter
+    def allow_internet(self, value):
+        value = bool(value)
+        with self._auth_lock:
+            changed = value != self._allow_internet
+            self._allow_internet = value
+        if changed and not value:
+            self._close_sockets(
+                lambda info: not is_local_address(info.ip),
+                "internet access turned off",
+            )
+
+    @property
+    def internet_address(self):
+        """host[:port] a signed-in phone last used from the internet, or None."""
+        with self._auth_lock:
+            return self._internet_address
+
+    def load_internet_address(self, address):
+        with self._auth_lock:
+            text = str(address or '').strip()
+            self._internet_address = text if _HOST_HEADER.fullmatch(text) else None
+
     def set_auth(self, username, token):
         """Set the web admin credentials (called from WebAdminTab).
 
-        A new token signs out every phone connected now (Regenerate Token):
-        an open connection was only checked when it opened.
+        A new token (Regenerate Token) forgets every device and closes every
+        open connection: the page has to sign in again.
         """
         with self._auth_lock:
             old_token = self._web_token
             self._web_username = username or "admin"
             self._web_token = token
-        if old_token and old_token != token:
+            token_changed = bool(old_token) and old_token != token
+            if token_changed:
+                had_devices = bool(self._devices)
+                self._devices = {}
+                self._pair = None
+        if token_changed:
             self._close_connections("token changed")
+            if had_devices:
+                self._devices_changed()
 
     def _current_token(self):
         with self._auth_lock:
             return self._web_token
 
-    def _close_connections(self, reason):
-        """Close every open WebSocket; the page has to sign in again."""
-        loop = self._loop
-        if not self.is_running or loop is None or loop.is_closed():
-            return
+    # --- Devices ---
 
-        async def close_all():
-            for ws in list(self._ws_clients):
-                try:
-                    await ws.close(code=4001, message=reason.encode("ascii", "replace"))
-                except Exception:
-                    pass
+    def create_device(self, name='', ip=None, now=None):
+        """Give one phone its own key. Returns (key, device id); the key is
+        shown to that phone once and only its SHA-256 is kept."""
+        key = secrets.token_urlsafe(DEVICE_KEY_BYTES)
+        stamp = int(time.time() if now is None else now)
+        with self._auth_lock:
+            device_id = secrets.token_hex(4)
+            while device_id in self._devices:
+                device_id = secrets.token_hex(4)
+            self._devices[device_id] = {
+                'id': device_id,
+                'name': clean_device_name(name),
+                'key_sha256': _key_digest(key),
+                'created': stamp,
+                'last_seen': stamp,
+                'last_ip': ip or None,
+            }
+            dropped = []
+            while len(self._devices) > MAX_DEVICES:
+                oldest = min(
+                    (record for record in self._devices.values()
+                     if record['id'] != device_id),
+                    key=lambda record: record.get('last_seen') or 0,
+                )
+                dropped.append(self._devices.pop(oldest['id'])['id'])
+        if dropped:
+            self._close_sockets(
+                lambda info: info.device_id in dropped, "signed out"
+            )
+        self._devices_changed()
+        return key, device_id
 
-        coroutine = close_all()
+    def load_devices(self, records):
+        """Devices saved in wolfrat_web.json (records without a usable hash are skipped)."""
+        loaded = {}
+        for record in records or ():
+            if not isinstance(record, Mapping):
+                continue
+            device_id = str(record.get('id') or '')
+            digest = str(record.get('key_sha256') or '').lower()
+            if not re.fullmatch(r'[0-9a-f]{8}', device_id):
+                continue
+            if not re.fullmatch(r'[0-9a-f]{64}', digest):
+                continue
+            loaded[device_id] = {
+                'id': device_id,
+                'name': clean_device_name(record.get('name')),
+                'key_sha256': digest,
+                'created': self._int_or_none(record.get('created')),
+                'last_seen': self._int_or_none(record.get('last_seen')),
+                'last_ip': (str(record.get('last_ip'))[:64]
+                            if record.get('last_ip') else None),
+            }
+        with self._auth_lock:
+            self._devices = loaded
+
+    @staticmethod
+    def _int_or_none(value):
         try:
-            future = asyncio.run_coroutine_threadsafe(coroutine, loop)
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def devices_for_config(self):
+        """Every device record as saved in wolfrat_web.json (hashes, no keys)."""
+        with self._auth_lock:
+            return [dict(record) for record in self._devices.values()]
+
+    def list_devices(self, this_device=None):
+        """Devices for the desktop list and /api/devices, most recently used first."""
+        with self._auth_lock:
+            records = [dict(record) for record in self._devices.values()]
+        records.sort(key=lambda record: record.get('last_seen') or 0, reverse=True)
+        return [
+            {
+                'id': record['id'],
+                'name': record['name'],
+                'created': record['created'],
+                'last_seen': record['last_seen'],
+                'last_ip': record['last_ip'],
+                'this_device': record['id'] == this_device,
+            }
+            for record in records
+        ]
+
+    def sign_out_device(self, device_id, reason="signed out"):
+        """End one device's key and close its connections. True if it existed."""
+        with self._auth_lock:
+            record = self._devices.pop(str(device_id or ''), None)
+        if record is None:
+            return False
+        wire_log(f"WEB: device {record['id']} ({_log_text(record['name'])}) {reason}")
+        self._close_sockets(lambda info: info.device_id == record['id'], reason)
+        self._devices_changed()
+        return True
+
+    def _device_known(self, device_id):
+        with self._auth_lock:
+            return device_id in self._devices
+
+    def _device_for_key(self, key):
+        """The device record this key belongs to, or None."""
+        if not key:
+            return None
+        digest = _key_digest(key)
+        with self._auth_lock:
+            if not self._web_token:
+                return None          # Web Admin never set up: nobody gets in
+            found = None
+            for record in self._devices.values():
+                if hmac.compare_digest(record['key_sha256'], digest):
+                    found = dict(record)
+            return found
+
+    def _touch_device(self, device_id, ip, now=None):
+        """Note a device's use; written at most once a minute."""
+        now = time.time() if now is None else now
+        with self._auth_lock:
+            record = self._devices.get(device_id)
+            if record is None:
+                return
+            if now - (record.get('last_seen') or 0) < DEVICE_TOUCH_SECONDS:
+                return
+            record['last_seen'] = int(now)
+            record['last_ip'] = ip or record.get('last_ip')
+        self._devices_changed()
+
+    def _devices_changed(self):
+        callback = self.on_devices_changed
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception as error:
+            wire_log(f"WEB: saving the device list failed: {error}")
+
+    def _note_internet_address(self, request):
+        """Remember the address a signed-in phone reached WolfRAT on from outside,
+        so the desktop can offer it when pairing the next phone."""
+        if is_local_address(request.remote):
+            return
+        host = str(request.headers.get('Host', '') or '').strip()
+        if not _HOST_HEADER.fullmatch(host):
+            return
+        with self._auth_lock:
+            if self._internet_address == host:
+                return
+            self._internet_address = host
+        self._devices_changed()
+
+    # --- Pairing ---
+
+    def start_pairing(self, now=None):
+        """A new one-use code for the desktop to show. Returns (code, expires_at)."""
+        code = ''.join(secrets.choice(PAIR_ALPHABET) for _ in range(PAIR_CODE_LENGTH))
+        expires_at = (time.time() if now is None else now) + PAIR_CODE_SECONDS
+        with self._auth_lock:
+            self._pair = (code, expires_at)
+        wire_log("WEB PAIR: a pairing code is shown on the PC (5 minutes, one use)")
+        return code, expires_at
+
+    def cancel_pairing(self):
+        with self._auth_lock:
+            self._pair = None
+
+    def pairing_code(self, now=None):
+        """(code, expires_at) while a code can still be used, else None."""
+        now = time.time() if now is None else now
+        with self._auth_lock:
+            if self._pair is not None and self._pair[1] <= now:
+                self._pair = None
+            return self._pair
+
+    def _take_pair_code(self, code, now=None):
+        """True (and the code is used up) when code is the one shown on the PC."""
+        now = time.time() if now is None else now
+        with self._auth_lock:
+            if self._pair is None:
+                return False
+            expected, expires_at = self._pair
+            if expires_at <= now:
+                self._pair = None
+                return False
+            if not _same_text(code, expected):
+                return False
+            self._pair = None
+            return True
+
+    # --- Open connections ---
+
+    def _add_socket(self, ws, device_id, ip, loop):
+        with self._ws_lock:
+            self._ws_info[ws] = _OpenSocket(device_id, ip or '', loop)
+            self._ws_clients.add(ws)
+
+    def _remove_socket(self, ws):
+        with self._ws_lock:
+            self._ws_info.pop(ws, None)
+            self._ws_clients.discard(ws)
+
+    def _open_sockets(self):
+        with self._ws_lock:
+            return list(self._ws_info.items())
+
+    def _close_sockets(self, select, reason):
+        """Close every open WebSocket that select(info) picks, from any thread."""
+        targets = [ws_info for ws_info in self._open_sockets() if select(ws_info[1])]
+        if not targets:
+            return 0
+        message = reason.encode('ascii', 'replace')[:120]
+        try:
+            running = asyncio.get_running_loop()
         except RuntimeError:
-            coroutine.close()
-            return
+            running = None
+        waiting = []
+        for ws, info in targets:
+            loop = info.loop
+            if loop is None or loop.is_closed():
+                continue
+            closing = self._close_socket(ws, message)
+            if loop is running:
+                loop.create_task(closing)
+                continue
+            try:
+                waiting.append(asyncio.run_coroutine_threadsafe(closing, loop))
+            except RuntimeError:
+                closing.close()
+        for future in waiting:
+            try:
+                future.result(timeout=3)
+            except Exception:
+                pass
+        wire_log(f"WEB: {reason} - {len(targets)} open connection(s) closed")
+        return len(targets)
+
+    @staticmethod
+    async def _close_socket(ws, message):
         try:
-            future.result(timeout=3)
+            await ws.close(code=WS_CLOSE_SIGNED_OUT, message=message)
         except Exception:
             pass
-        wire_log(f"WEB: {reason} - open connections closed")
+
+    def _close_connections(self, reason):
+        """Close every open WebSocket; the page has to sign in again."""
+        return self._close_sockets(lambda _info: True, reason)
+
+    # --- Lifecycle ---
 
     def start(self):
         """Start the web server in a background thread."""
@@ -265,12 +731,14 @@ class WolfWebServer:
                 and loop.is_running()
             ):
                 async def _shutdown():
-                    for ws in list(self._ws_clients):
+                    for ws, _info in self._open_sockets():
                         try:
                             await ws.close()
                         except Exception:
                             pass
-                    self._ws_clients.clear()
+                    with self._ws_lock:
+                        self._ws_clients.clear()
+                        self._ws_info.clear()
 
                 shutdown = _shutdown()
                 try:
@@ -405,6 +873,10 @@ class WolfWebServer:
                         if self._stop_requested is stop_requested:
                             self._stop_requested = None
                         self._running = False
+                with self._ws_lock:
+                    for ws in [ws for ws, info in self._ws_info.items() if info.loop is loop]:
+                        self._ws_info.pop(ws, None)
+                        self._ws_clients.discard(ws)
                 loop.close()
 
     def get_login_ips(self):
@@ -425,10 +897,12 @@ class WolfWebServer:
 
     # --- Brute-force lockout ---
     # An address that presents LOCKOUT_MAX_FAILURES different wrong credentials
-    # within LOCKOUT_WINDOW is refused for LOCKOUT_SECONDS, even with the right
-    # token. Distinct guesses are counted (by digest, never stored in clear) so
-    # a phone re-sending one stale token after a token change cannot lock its
-    # owner out, while a guesser - who never repeats a guess - is stopped.
+    # within LOCKOUT_WINDOW is locked for LOCKOUT_SECONDS: while locked, every
+    # wrong credential gets 429 + Retry-After. A right one (token or device key)
+    # always gets in, so nobody sharing the address can lock the admin out.
+    # Distinct guesses are counted (by digest, never stored in clear) so a phone
+    # re-sending one stale key cannot lock its owner out, while a guesser - who
+    # never repeats a guess - is stopped.
     LOCKOUT_MAX_FAILURES = 5
     LOCKOUT_WINDOW = 15 * 60
     LOCKOUT_SECONDS = 15 * 60
@@ -485,65 +959,151 @@ class WolfWebServer:
         with self._auth_lock:
             self._failed_logins.pop(ip, None)
 
-    def _check_auth(self, request):
-        """Check if request has valid auth token. Returns True if authorized."""
-        with self._auth_lock:
-            if not self._web_token:
-                return False  # No token set = no access
+    # --- Checking a request's key ---
 
+    @staticmethod
+    def _presented_key(request, query_key=False):
+        header = request.headers.get('Authorization', '')
+        if header[:7].lower() == 'bearer ':
+            key = header[7:].strip()
+            if key:
+                return key
+        if query_key:
+            return str(request.query.get('key', '') or '').strip()
+        return ''
+
+    def _authenticate(self, request, query_key=False):
+        """(device record, None) for a valid key, else (None, the refusal)."""
         ip = request.remote or 'unknown'
-        if self._lockout_remaining(ip):
-            return False
+        presented = self._presented_key(request, query_key)
+        if not presented:
+            return None, self._refusal(request, 401, 'Unauthorized')
+        device = self._device_for_key(presented)
+        if device is not None:
+            self._touch_device(device['id'], ip)
+            self._note_internet_address(request)
+            return device, None
+        remaining = self._lockout_remaining(ip)
+        if remaining:
+            return None, self._locked_out(request, remaining)
+        if self._record_failed_login(ip, presented):
+            return None, self._locked_out(request, self.LOCKOUT_SECONDS)
+        return None, self._refusal(request, 401, 'Unauthorized')
 
-        # Check Authorization header
-        auth = request.headers.get('Authorization', '')
-        if auth.startswith('Bearer '):
-            token = auth[7:].strip()
-            with self._auth_lock:
-                if self._web_token and secrets.compare_digest(token, self._web_token):
-                    return True
-            if token:
-                self._record_failed_login(ip, token)
-        # Check query param (for WebSocket)
-        token = request.query.get('token', '')
-        if token:
-            with self._auth_lock:
-                if self._web_token and secrets.compare_digest(token, self._web_token):
-                    return True
-            self._record_failed_login(ip, token)
-        return False
+    def _check_auth(self, request):
+        """True if the request carries a valid device key."""
+        return self._authenticate(request, query_key=request.path == '/ws')[1] is None
+
+    def _protected(self, handler, query_key=False):
+        """Route handler that runs only for a valid device key."""
+        async def protected(request):
+            device, refusal = self._authenticate(request, query_key)
+            if refusal is not None:
+                return refusal
+            request[_DEVICE_ID] = device['id']
+            return await handler(request)
+        protected.__name__ = getattr(handler, '__name__', 'protected')
+        protected.__doc__ = getattr(handler, '__doc__', None)
+        return protected
+
+    @staticmethod
+    def _refusal(request, status, error):
+        if request.path.startswith('/api/'):
+            return web.json_response({'error': error}, status=status)
+        return web.Response(status=status, text=error)
+
+    @staticmethod
+    def _lockout_text(remaining):
+        minutes = max(1, (remaining + 59) // 60)
+        return f'Too many failed logins. Try again in {minutes} min.'
+
+    def _locked_out(self, request, remaining):
+        headers = {'Retry-After': str(remaining)}
+        if request.path.startswith('/api/'):
+            return web.json_response(
+                {'error': self._lockout_text(remaining), 'retry_after': remaining},
+                status=429,
+                headers=headers,
+            )
+        return web.Response(status=429, text=self._lockout_text(remaining), headers=headers)
+
+    @classmethod
+    def _locked_out_response(cls, remaining):
+        return web.json_response(
+            {'error': cls._lockout_text(remaining), 'retry_after': remaining},
+            status=429,
+            headers={'Retry-After': str(remaining)},
+        )
+
+    @staticmethod
+    def _network_refusal(request):
+        if request.path.startswith('/api/'):
+            return web.json_response({'error': NETWORK_REFUSAL}, status=403)
+        return web.Response(status=403, text=_NETWORK_REFUSAL_PAGE, content_type='text/html')
+
+    # --- Pushing state to open pages ---
 
     def broadcast_state(self):
-        """Called by the desktop app when state changes. Pushes to all WebSocket clients.
-        Throttled to avoid flooding — max once per _broadcast_interval seconds."""
-        if not self._running or not self._loop or not self._ws_clients:
+        """Push fresh state to every open page (any thread).
+
+        At most one push a second; a push asked for inside that second goes
+        out at its end, so the last change is never dropped.
+        """
+        loop = self._loop
+        if not self.is_running or loop is None or not self._ws_clients:
             return
-        now = time.time()
-        if now - self._last_broadcast < self._broadcast_interval:
+        try:
+            loop.call_soon_threadsafe(self._schedule_state_push)
+        except RuntimeError:
+            pass
+
+    def _schedule_state_push(self):
+        """Web thread: one push now, or one at the end of this second."""
+        if self._push_pending:
             return
-        self._last_broadcast = now
-        state = self._build_state()
-        asyncio.run_coroutine_threadsafe(self._broadcast(json.dumps(state)), self._loop)
+        loop = asyncio.get_running_loop()
+        wait = self._broadcast_interval - (time.time() - self._last_broadcast)
+        self._push_pending = True
+        loop.call_later(max(0.0, wait), self._push_state_now)
+
+    def _push_state_now(self):
+        self._push_pending = False
+        self._last_broadcast = time.time()
+        for _ws, info in self._open_sockets():
+            self._touch_device(info.device_id, info.ip)
+        try:
+            message = json.dumps(self._build_state())
+        except Exception as error:
+            wire_log(f"WEB: building the page state failed: {error}")
+            return
+        asyncio.get_running_loop().create_task(self._broadcast(message))
 
     def broadcast_chat(self):
         """Push chat update immediately (no throttle). Called on new chat messages."""
-        if not self._running or not self._loop or not self._ws_clients:
+        loop = self._loop
+        if not self.is_running or loop is None or not self._ws_clients:
             return
-        state = {
-            'type': 'chat',
-            'chat': self._json_safe((self.sm.chat_messages or [])[-50:]),
-        }
-        asyncio.run_coroutine_threadsafe(self._broadcast(json.dumps(state)), self._loop)
+        try:
+            message = json.dumps({'type': 'chat', 'chat': self._chat_rows(50)})
+        except Exception as error:
+            wire_log(f"WEB: building the chat push failed: {error}")
+            return
+        coroutine = self._broadcast(message)
+        try:
+            asyncio.run_coroutine_threadsafe(coroutine, loop)
+        except RuntimeError:
+            coroutine.close()
 
     async def _broadcast(self, message):
         """Send a message to all connected WebSocket clients."""
-        dead = set()
-        for ws in self._ws_clients:
+        for ws, _info in self._open_sockets():
             try:
-                await ws.send_str(message)
+                await asyncio.wait_for(ws.send_str(message), timeout=WS_SEND_TIMEOUT)
             except Exception:
-                dead.add(ws)
-        self._ws_clients -= dead
+                self._remove_socket(ws)
+
+    def _chat_rows(self, count):
+        return self._json_safe((self.sm.chat_messages or [])[-count:])
 
     def _resolve_missions(self):
         """Render identity-bearing rows from the authoritative queue snapshot."""
@@ -631,7 +1191,7 @@ class WolfWebServer:
     def _build_state(self):
         """Build a JSON-safe state snapshot from ServerManager."""
         players = self._json_safe(self._resolve_players())
-        chat = self._json_safe((self.sm.chat_messages or [])[-50:])
+        chat = self._chat_rows(50)
         game_state = self._json_safe(self.sm.game_state or {})
         return {
             'type': 'state',
@@ -797,6 +1357,17 @@ class WolfWebServer:
     async def _await_result(self, future):
         return await asyncio.wrap_future(future)
 
+    @staticmethod
+    async def _json_object(request):
+        """The request body as a JSON object, or BadRequestBody (HTTP 400)."""
+        try:
+            body = await request.json()
+        except ValueError as error:      # JSONDecodeError, bad UTF-8
+            raise BadRequestBody('Request body must be valid JSON') from error
+        if not isinstance(body, Mapping):
+            raise BadRequestBody('Request body must be a JSON object')
+        return body
+
     async def _phone_message(self, message):
         """One message typed on the phone page: a !command or a chat line.
 
@@ -844,26 +1415,17 @@ class WolfWebServer:
         return {'ok': True, 'accepted': True, 'replies': ['Run by WolfRAT'],
                 'command': command}
 
-    # --- Auth ---
+    # --- Signing in ---
 
-    @staticmethod
-    def _locked_out_response(remaining):
-        minutes = max(1, (remaining + 59) // 60)
-        return web.json_response(
-            {'error': f'Too many failed logins. Try again in {minutes} min.'},
-            status=429,
-            headers={'Retry-After': str(remaining)},
-        )
+    def _device_name(self, request, given):
+        if isinstance(given, str) and given.strip():
+            return clean_device_name(given)
+        return device_name_from_agent(request.headers.get('User-Agent', ''))
 
     async def _handle_auth(self, request):
-        """POST /api/auth — Validate username + token."""
+        """POST /api/auth - username + access token in, a device key out."""
         try:
-            body = await request.json()
-            if not isinstance(body, Mapping):
-                return web.json_response(
-                    {'error': 'Request body must be a JSON object'},
-                    status=400,
-                )
+            body = await self._json_object(request)
             username = body.get('username', '')
             token = body.get('token', '')
             if not isinstance(username, str) or not isinstance(token, str):
@@ -881,80 +1443,142 @@ class WolfWebServer:
                 return web.json_response({'error': 'Web admin is not enabled'}, status=403)
 
             ip = request.remote or 'unknown'
-            remaining = self._lockout_remaining(ip)
-            if remaining:
-                return self._locked_out_response(remaining)
-
-            if (secrets.compare_digest(username, valid_user) and
-                    secrets.compare_digest(token, valid_token)):
-                # Track IP
-                self._clear_failed_logins(ip)
+            if _same_text(username, valid_user) and _same_text(token, valid_token):
+                # The right token always gets in, even while this address is
+                # locked; it does not lift the lock for anyone else.
+                if not self._lockout_remaining(ip):
+                    self._clear_failed_logins(ip)
+                key, device_id = self.create_device(
+                    self._device_name(request, body.get('device_name')), ip
+                )
                 with self._auth_lock:
                     self._login_ips[ip] = time.time()
-                wire_log(f"WEB AUTH: {username} logged in from {ip}")
-                # Notify for persistence
+                wire_log(
+                    f"WEB AUTH: {_log_text(username)} signed in from {ip} "
+                    f"(device {device_id})"
+                )
                 if self.on_login:
                     try:
                         self.on_login(ip, time.time())
                     except Exception:
                         pass
-                # Return the access token itself — client uses it for all requests
-                return web.json_response({'ok': True, 'token': token})
+                return web.json_response(
+                    {'ok': True, 'key': key, 'device_id': device_id}
+                )
 
+            remaining = self._lockout_remaining(ip)
+            if remaining:
+                return self._locked_out_response(remaining)
             wire_log(f"WEB AUTH FAILED: {_log_text(username)} from {ip}")
             if self._record_failed_login(ip, username + chr(0) + token):
                 return self._locked_out_response(self.LOCKOUT_SECONDS)
             return web.json_response({'error': 'Invalid username or token'}, status=401)
-        except json.JSONDecodeError:
-            return web.json_response(
-                {'error': 'Request body must be valid JSON'},
-                status=400,
-            )
+        except BadRequestBody as error:
+            return web.json_response({'error': str(error)}, status=400)
+        except HTTPException:
+            raise
         except Exception as error:
-            return web.json_response({'error': str(error)}, status=500)
+            wire_log(f"WEB AUTH ERROR: {error}")
+            return web.json_response({'error': 'Sign-in failed'}, status=500)
+
+    async def _handle_pair(self, request):
+        """POST /api/pair - the code shown on the PC in, a device key out."""
+        try:
+            body = await self._json_object(request)
+            code = body.get('code', '')
+            if not isinstance(code, str) or not normalize_pair_code(code):
+                return web.json_response(
+                    {'error': 'Type the code shown on the PC'}, status=400
+                )
+            code = normalize_pair_code(code)
+            ip = request.remote or 'unknown'
+            if self._take_pair_code(code):
+                name = self._device_name(request, body.get('device_name'))
+                key, device_id = self.create_device(name, ip)
+                wire_log(f"WEB PAIR: device {device_id} paired from {ip}")
+                callback = self.on_paired
+                if callback is not None:
+                    try:
+                        callback(device_id, clean_device_name(name))
+                    except Exception:
+                        pass
+                return web.json_response(
+                    {'ok': True, 'key': key, 'device_id': device_id}
+                )
+            remaining = self._lockout_remaining(ip)
+            if remaining:
+                return self._locked_out_response(remaining)
+            if (len(code) != PAIR_CODE_LENGTH
+                    or any(character not in PAIR_ALPHABET for character in code)):
+                return web.json_response(
+                    {'error': f'The code is {PAIR_CODE_LENGTH} letters and numbers '
+                              'from the PC screen'},
+                    status=400,
+                )
+            wire_log(f"WEB PAIR FAILED: wrong or expired code from {ip}")
+            if self._record_failed_login(ip, 'pair' + chr(0) + code):
+                return self._locked_out_response(self.LOCKOUT_SECONDS)
+            return web.json_response(
+                {'error': 'Wrong or expired code. Press Pair a phone on the PC '
+                          'for a new one.'},
+                status=401,
+            )
+        except BadRequestBody as error:
+            return web.json_response({'error': str(error)}, status=400)
+        except HTTPException:
+            raise
+        except Exception as error:
+            wire_log(f"WEB PAIR ERROR: {error}")
+            return web.json_response({'error': 'Pairing failed'}, status=500)
+
+    async def _handle_logout(self, request):
+        """POST /api/logout - this device's key stops working."""
+        self.sign_out_device(request.get(_DEVICE_ID), reason="signed out")
+        return web.json_response({'ok': True})
+
+    async def _handle_devices(self, request):
+        """GET /api/devices - every signed-in device."""
+        return web.json_response(
+            {'devices': self.list_devices(this_device=request.get(_DEVICE_ID))}
+        )
+
+    async def _handle_device_signout(self, request):
+        """POST /api/devices/signout {id} - end that device's key."""
+        try:
+            body = await self._json_object(request)
+        except BadRequestBody as error:
+            return web.json_response({'ok': False, 'error': str(error)}, status=400)
+        device_id = body.get('id', '')
+        if not isinstance(device_id, str) or not device_id.strip():
+            return web.json_response({'ok': False, 'error': 'No device id'}, status=400)
+        if not self.sign_out_device(device_id.strip(), reason="signed out from a phone"):
+            return web.json_response({'ok': False, 'error': 'No such device'}, status=404)
+        return web.json_response({'ok': True})
 
     # --- HTTP Handlers ---
 
-    async def _handle_index(self, request):
-        """Serve the mobile web UI."""
-        template_path = os.path.join(self._template_path, 'index.html')
-        try:
-            with open(template_path, 'r', encoding='utf-8') as f:
-                html = f.read()
-            return web.Response(text=html, content_type='text/html')
-        except FileNotFoundError:
-            return web.Response(text='<h1>WolfRAT Web UI</h1><p>Template not found.</p>', content_type='text/html')
-
-    async def _handle_css(self, request):
-        """Serve the CSS stylesheet."""
-        css_path = os.path.join(self._template_path, 'style.css')
-        try:
-            with open(css_path, 'r', encoding='utf-8') as f:
-                css = f.read()
-            return web.Response(text=css, content_type='text/css')
-        except FileNotFoundError:
-            return web.Response(text='', content_type='text/css')
-
-    async def _handle_js(self, request):
-        """Serve the JavaScript app."""
-        js_path = os.path.join(self._template_path, 'app.js')
-        try:
-            with open(js_path, 'r', encoding='utf-8') as f:
-                js = f.read()
-            return web.Response(text=js, content_type='application/javascript')
-        except FileNotFoundError:
-            return web.Response(text='// app.js not found', content_type='application/javascript')
+    def _static_handler(self, filename, content_type, fallback):
+        """Serve one fixed file from the templates folder."""
+        async def serve(request):
+            path = os.path.join(self._template_path, filename)
+            try:
+                with open(path, 'rb') as handle:
+                    data = handle.read()
+            except OSError:
+                if fallback is None:
+                    return web.Response(status=404, text='Not found')
+                data = fallback.encode('utf-8')
+            charset = None if content_type.startswith('image/') else 'utf-8'
+            return web.Response(body=data, content_type=content_type, charset=charset)
+        serve.__name__ = f"serve_{filename}"
+        return serve
 
     async def _handle_status(self, request):
         """GET /api/status — Server status overview."""
-        if not self._check_auth(request):
-            return web.json_response({'error': 'Unauthorized'}, status=401)
         return web.json_response(self._build_state())
 
     async def _handle_players(self, request):
         """GET /api/players — Current player list."""
-        if not self._check_auth(request):
-            return web.json_response({'error': 'Unauthorized'}, status=401)
         players = self._json_safe(self._resolve_players())
         return web.json_response({
             'players': players,
@@ -963,16 +1587,12 @@ class WolfWebServer:
 
     async def _handle_chat(self, request):
         """GET /api/chat — Recent chat messages."""
-        if not self._check_auth(request):
-            return web.json_response({'error': 'Unauthorized'}, status=401)
         return web.json_response({
-            'messages': self._json_safe((self.sm.chat_messages or [])[-100:]),
+            'messages': self._chat_rows(100),
         })
 
     async def _handle_maps(self, request):
         """GET /api/maps — Current mission rotation with resolved display names."""
-        if not self._check_auth(request):
-            return web.json_response({'error': 'Unauthorized'}, status=401)
         return web.json_response({
             'missions': self._json_safe(self._resolve_missions()),
             'available': self.sm.available_maps_data or '',
@@ -980,26 +1600,20 @@ class WolfWebServer:
 
     async def _handle_settings(self, request):
         """GET /api/settings — Current server settings."""
-        if not self._check_auth(request):
-            return web.json_response({'error': 'Unauthorized'}, status=401)
         return web.json_response({
             'settings': self._safe_settings(),
         })
 
     async def _handle_login_ips(self, request):
         """GET /api/login-ips — List of unique IPs with last login time."""
-        if not self._check_auth(request):
-            return web.json_response({'error': 'Unauthorized'}, status=401)
         return web.json_response({
             'ips': self.get_login_ips(),
         })
 
     async def _handle_quick_action(self, request):
         """POST /api/action — Execute a named, typed dashboard operation."""
-        if not self._check_auth(request):
-            return web.json_response({'error': 'Unauthorized'}, status=401)
         try:
-            body = await request.json()
+            body = await self._json_object(request)
             action = str(body.get('action', '')).strip().lower()
             if not action:
                 return web.json_response({'error': 'No action provided'}, status=400)
@@ -1026,19 +1640,15 @@ class WolfWebServer:
             )
         except ValueError as error:
             return web.json_response({'error': str(error)}, status=400)
+        except HTTPException:
+            raise
         except Exception as error:
             return web.json_response({'error': str(error)}, status=502)
 
     async def _handle_send_chat(self, request):
         """POST /api/chat/send — A chat line or a typed !command from the phone."""
-        if not self._check_auth(request):
-            return web.json_response({'error': 'Unauthorized'}, status=401)
         try:
-            body = await request.json()
-            if not isinstance(body, Mapping):
-                return web.json_response(
-                    {'error': 'Request body must be a JSON object'}, status=400
-                )
+            body = await self._json_object(request)
             msg = body.get('message', '')
             if not isinstance(msg, str) or not msg.strip():
                 return web.json_response({'error': 'No message provided'}, status=400)
@@ -1047,15 +1657,15 @@ class WolfWebServer:
             return web.json_response(await self._phone_message(msg))
         except ValueError as e:
             return web.json_response({'error': str(e)}, status=400)
+        except HTTPException:
+            raise
         except Exception as e:
             return web.json_response({'error': str(e)}, status=502)
 
     async def _handle_player_action(self, request):
         """POST /api/player/action — Admin action on a player."""
-        if not self._check_auth(request):
-            return web.json_response({'error': 'Unauthorized'}, status=401)
         try:
-            body = await request.json()
+            body = await self._json_object(request)
             pid = str(body.get('pid', '')).strip()
             player_name = str(body.get('name', '')).strip()
             revision = body.get('revision')
@@ -1117,15 +1727,15 @@ class WolfWebServer:
             return web.json_response({'error': str(error)}, status=409)
         except ValueError as e:
             return web.json_response({'error': str(e)}, status=400)
+        except HTTPException:
+            raise
         except Exception as e:
             return web.json_response({'error': str(e)}, status=502)
 
     async def _handle_map_switch(self, request):
         """POST /api/map/switch — Switch to a specific map by filename."""
-        if not self._check_auth(request):
-            return web.json_response({'error': 'Unauthorized'}, status=401)
         try:
-            body = await request.json()
+            body = await self._json_object(request)
             map_name = str(body.get('map', '')).strip()
             queue_index = body.get('index')
             revision = body.get('revision')
@@ -1156,18 +1766,20 @@ class WolfWebServer:
             return web.json_response({'error': str(error)}, status=409)
         except ValueError as e:
             return web.json_response({'error': str(e)}, status=400)
+        except HTTPException:
+            raise
         except Exception as e:
             return web.json_response({'error': str(e)}, status=502)
 
     async def _handle_websocket(self, request):
         """WebSocket endpoint for live state updates."""
-        if not self._check_auth(request):
-            return web.Response(status=401, text='Unauthorized')
-        # The token it opened with; a new one (Regenerate) ends this connection.
-        ws_token = self._current_token()
-        ws = web.WebSocketResponse()
+        device_id = request.get(_DEVICE_ID)
+        if len(self._ws_clients) >= MAX_WS_CLIENTS:
+            return web.Response(status=503, text='Too many open connections')
+        ip = request.remote or ''
+        ws = web.WebSocketResponse(heartbeat=WS_HEARTBEAT)
         await ws.prepare(request)
-        self._ws_clients.add(ws)
+        self._add_socket(ws, device_id, ip, asyncio.get_running_loop())
         wire_log(f"WEB: WebSocket connected ({len(self._ws_clients)} total)")
 
         # Send initial state
@@ -1178,9 +1790,12 @@ class WolfWebServer:
 
         try:
             async for msg in ws:
-                if self._current_token() != ws_token:
-                    await ws.close(code=4001, message=b'token changed')
+                # Its key may have been signed out (or the token changed)
+                # since the connection opened.
+                if not self._device_known(device_id):
+                    await ws.close(code=WS_CLOSE_SIGNED_OUT, message=b'signed out')
                     break
+                self._touch_device(device_id, ip)
                 if msg.type == web.WSMsgType.TEXT:
                     try:
                         data = json.loads(msg.data)
@@ -1224,7 +1839,7 @@ class WolfWebServer:
         except Exception:
             pass
         finally:
-            self._ws_clients.discard(ws)
+            self._remove_socket(ws)
             wire_log(f"WEB: WebSocket disconnected ({len(self._ws_clients)} total)")
 
         return ws

@@ -365,10 +365,11 @@ def test_new_token_ends_a_websocket_on_its_next_message():
     async def scenario():
         server, manager, asked = web_with()
         server.set_auth("admin", "token-A")
+        key, _device = server.create_device("test phone")
         client = TestClient(TestServer(server.application))
         await client.start_server()
         try:
-            ws = await client.ws_connect("/ws?token=token-A")
+            ws = await client.ws_connect(f"/ws?key={key}")
             first = await ws.receive_json()
             assert first["type"] == "state"
             await ws.send_json({"type": "command", "command": "SET ServerPassword x"})
@@ -399,11 +400,12 @@ def test_regenerate_closes_connections_on_a_running_server():
         port = reservation.getsockname()[1]
     server = WolfWebServer(WebManager(), host="127.0.0.1", port=port)
     server.set_auth("admin", "token-A")
+    key, _device = server.create_device("test phone")
     assert server.start().result(timeout=5).ok
 
     async def scenario():
         async with ClientSession() as session:
-            ws = await session.ws_connect(f"http://127.0.0.1:{port}/ws?token=token-A")
+            ws = await session.ws_connect(f"http://127.0.0.1:{port}/ws?key={key}")
             assert (await ws.receive_json())["type"] == "state"
             await asyncio.get_running_loop().run_in_executor(
                 None, server.set_auth, "admin", "token-B")
