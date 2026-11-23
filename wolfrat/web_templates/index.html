@@ -1,165 +1,328 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <meta name="apple-mobile-web-app-status-bar-style" content="black">
-    <meta name="theme-color" content="#000000">
-    <title>WolfRAT</title>
-    <link rel="stylesheet" href="/static/style.css">
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, interactive-widget=resizes-content">
+<meta name="theme-color" content="#09090b">
+<meta name="color-scheme" content="dark">
+<meta name="referrer" content="no-referrer">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="WolfRAT">
+<title>WolfRAT</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" type="image/png" href="/static/icon-192.png">
+<link rel="apple-touch-icon" href="/static/icon-192.png">
+<link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <!-- Login overlay -->
-    <div id="login-overlay" class="overlay">
-        <div class="overlay-content">
-            <div class="wolf-logo">🐺</div>
-            <h1>WolfRAT</h1>
-            <p class="subtitle">JO Server Admin</p>
-            <form id="login-form" class="login-form" onsubmit="return doLogin(event)">
-                <input id="login-user" type="text" placeholder="Username" autocomplete="username" autocapitalize="none">
-                <input id="login-pass" type="text" placeholder="Access Token" autocomplete="off" autocapitalize="none" spellcheck="false">
-                <label class="remember-row"><input id="login-remember" type="checkbox" checked> Remember me</label>
-                <button type="submit" class="btn btn-send">Log In</button>
-                <p id="login-error" class="login-error hidden">Login failed</p>
-            </form>
-        </div>
+<!--
+  WolfRAT Web Admin: the phone page. No inline scripts and no inline event
+  handlers (the page runs under a strict Content-Security-Policy); app.js adds
+  every listener. Icons below are an SVG sprite used through <use href>.
+-->
+<svg class="sprite" width="0" height="0" aria-hidden="true" focusable="false">
+  <defs>
+    <symbol id="now" viewBox="0 0 24 24"><path d="M3 12h4l3-8 4 16 3-8h4"/></symbol>
+    <symbol id="users" viewBox="0 0 24 24"><circle cx="9" cy="8" r="4"/><path d="M2 21v-1a7 7 0 0 1 14 0v1"/><path d="M16 4.1a4 4 0 0 1 0 7.8"/><path d="M22 21v-1a7 7 0 0 0-4.5-6.5"/></symbol>
+    <symbol id="chat" viewBox="0 0 24 24"><path d="M21 11.5a8.5 8.5 0 0 1-12.3 7.6L3 20.5l1.4-5.2A8.5 8.5 0 1 1 21 11.5z"/></symbol>
+    <symbol id="map" viewBox="0 0 24 24"><path d="M3 6.5l6-3 6 3 6-3v14l-6 3-6-3-6 3z"/><path d="M9 3.5v14M15 6.5v14"/></symbol>
+    <symbol id="grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="3" width="7.5" height="7.5" rx="2"/><rect x="3" y="13.5" width="7.5" height="7.5" rx="2"/><rect x="13.5" y="13.5" width="7.5" height="7.5" rx="2"/></symbol>
+    <symbol id="refresh" viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 1 1-2.5-6"/><path d="M20.5 3.5V9H15"/></symbol>
+    <symbol id="skip" viewBox="0 0 24 24"><path d="M5 4.5l10 7.5-10 7.5z"/><path d="M19 5v14"/></symbol>
+    <symbol id="listplus" viewBox="0 0 24 24"><path d="M3 6h13M3 12h13M3 18h8M18 15v6M15 18h6"/></symbol>
+    <symbol id="mega" viewBox="0 0 24 24"><path d="M3 10.5v3a1 1 0 0 0 1 1h2.5L12 19V5L6.5 9.5H4a1 1 0 0 0-1 1z"/><path d="M15.5 9a3.5 3.5 0 0 1 0 6"/><path d="M18.5 6a7.5 7.5 0 0 1 0 12"/></symbol>
+    <symbol id="cloud" viewBox="0 0 24 24"><path d="M7 18.5a4.5 4.5 0 0 1-.7-8.95A6 6 0 0 1 17.8 10a4.25 4.25 0 0 1-.3 8.5z"/></symbol>
+    <symbol id="fog" viewBox="0 0 24 24"><path d="M4 9h12M7 13h13M3 17h10M15 17h5M6 5h8"/></symbol>
+    <symbol id="rain" viewBox="0 0 24 24"><path d="M7 15.5a4.5 4.5 0 0 1-.7-8.95A6 6 0 0 1 17.8 7a4.25 4.25 0 0 1-.3 8.5z"/><path d="M8 19l-1 2M12 19l-1 2M16 19l-1 2"/></symbol>
+    <symbol id="storm" viewBox="0 0 24 24"><path d="M7 15.5a4.5 4.5 0 0 1-.7-8.95A6 6 0 0 1 17.8 7a4.25 4.25 0 0 1-.3 8.5"/><path d="M13 12l-3 5h4l-3 5"/></symbol>
+    <symbol id="snow" viewBox="0 0 24 24"><path d="M12 3v18M4.2 7.5l15.6 9M4.2 16.5l15.6-9"/><path d="M9.5 4.5L12 6l2.5-1.5M9.5 19.5L12 18l2.5 1.5"/></symbol>
+    <symbol id="sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4.5"/><path d="M12 2v2.5M12 19.5V22M4.2 4.2 6 6M18 18l1.8 1.8M2 12h2.5M19.5 12H22M4.2 19.8 6 18M18 6l1.8-1.8"/></symbol>
+    <symbol id="shuffle" viewBox="0 0 24 24"><path d="M16 3h5v5M4 20 21 3M21 16v5h-5M15 15l6 6M4 4l5 5"/></symbol>
+    <symbol id="play" viewBox="0 0 24 24"><path d="M7 4.5l12 7.5-12 7.5z"/></symbol>
+    <symbol id="search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M20 20l-4-4"/></symbol>
+    <symbol id="send" viewBox="0 0 24 24"><path d="M21.5 2.5 11 13M21.5 2.5 15 21l-4-8-8-4z"/></symbol>
+    <symbol id="chev" viewBox="0 0 24 24"><path d="M9 6l6 6-6 6"/></symbol>
+    <symbol id="back" viewBox="0 0 24 24"><path d="M15 6l-6 6 6 6"/></symbol>
+    <symbol id="down" viewBox="0 0 24 24"><path d="M6 9l6 6 6-6"/></symbol>
+    <symbol id="kebab" viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.3"/><circle cx="12" cy="12" r="1.3"/><circle cx="12" cy="19" r="1.3"/></symbol>
+    <symbol id="swap" viewBox="0 0 24 24"><path d="M7 4 3 8l4 4M3 8h14M17 20l4-4-4-4M21 16H7"/></symbol>
+    <symbol id="skull" viewBox="0 0 24 24"><path d="M12 3a8 8 0 0 0-8 8c0 2.6 1.2 4.4 3 5.6V20h10v-3.4c1.8-1.2 3-3 3-5.6a8 8 0 0 0-8-8z"/><circle cx="9" cy="11" r="1.6"/><circle cx="15" cy="11" r="1.6"/><path d="M10.5 20v-2.5M13.5 20v-2.5"/></symbol>
+    <symbol id="zero" viewBox="0 0 24 24"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></symbol>
+    <symbol id="msg" viewBox="0 0 24 24"><path d="M4 5h16v11H9l-5 4z"/><path d="M8 9.5h8M8 12.5h5"/></symbol>
+    <symbol id="kick" viewBox="0 0 24 24"><path d="M14 4h5v16h-5"/><path d="M10 17l5-5-5-5M15 12H3"/></symbol>
+    <symbol id="ban" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M5.6 5.6l12.8 12.8"/></symbol>
+    <symbol id="alert" viewBox="0 0 24 24"><path d="M12 3.5 21.5 20h-19z"/><path d="M12 10v4.5M12 17.5h.01"/></symbol>
+    <symbol id="target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/></symbol>
+    <symbol id="phone" viewBox="0 0 24 24"><rect x="6.5" y="2" width="11" height="20" rx="2.5"/><path d="M11 18.5h2"/></symbol>
+    <symbol id="vote" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="3"/><path d="M8.5 12l2.5 2.5 4.5-5"/></symbol>
+    <symbol id="help" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.5 9.2a2.6 2.6 0 1 1 3.6 2.4c-.7.3-1.1.9-1.1 1.6v.6"/><path d="M12 17h.01"/></symbol>
+    <symbol id="link" viewBox="0 0 24 24"><path d="M10 14a4.5 4.5 0 0 0 6.4 0l3.2-3.2a4.5 4.5 0 0 0-6.4-6.4L12 5.6"/><path d="M14 10a4.5 4.5 0 0 0-6.4 0l-3.2 3.2a4.5 4.5 0 0 0 6.4 6.4l1.2-1.2"/></symbol>
+    <symbol id="lock" viewBox="0 0 24 24"><rect x="4.5" y="10.5" width="15" height="10" rx="2.5"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/></symbol>
+    <symbol id="toggle" viewBox="0 0 24 24"><rect x="2" y="6.5" width="20" height="11" rx="5.5"/><circle cx="16.5" cy="12" r="3"/></symbol>
+    <symbol id="logout" viewBox="0 0 24 24"><path d="M10 4H5v16h5"/><path d="M15 17l5-5-5-5M20 12H9"/></symbol>
+    <symbol id="info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 11v5.5M12 7.5h.01"/></symbol>
+    <symbol id="close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
+  </defs>
+</svg>
+
+<!-- ================= SIGN IN (pair / access token) ================= -->
+<div id="signin" class="pairscreen hide">
+  <div class="pair">
+    <div class="bigmark"><img src="/static/icon-192.png" alt="WolfRAT"></div>
+    <h1>WolfRAT</h1>
+    <p id="signin-intro">Pair this phone with WolfRAT on your server PC. You only do this once.</p>
+    <div id="pair-form" class="pairform">
+      <div class="steps">
+        <div class="step"><i>1</i><span>On the PC, open <b>Web Admin</b> and press <b>Pair a phone</b>.</span></div>
+        <div class="step"><i>2</i><span>Scan the QR code with this phone's camera, or type the 6-character code below.</span></div>
+      </div>
+      <label class="code" id="pair-boxes" for="pair-code">
+        <input id="pair-code" type="text" maxlength="6" autocomplete="off" autocapitalize="characters" autocorrect="off" spellcheck="false" aria-label="Pairing code">
+        <b></b><b></b><b></b><b></b><b></b><b></b>
+      </label>
+      <button id="pair-go" class="big" type="button">Pair this phone</button>
+      <button id="show-token" class="ghost" type="button">Use an access token instead</button>
     </div>
+    <form id="token-form" class="tokenform hide" autocomplete="off">
+      <input id="login-user" class="field" type="text" placeholder="Username" autocomplete="username" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="Username">
+      <input id="login-pass" class="field" type="password" placeholder="Access token (from the Web Admin tab)" autocomplete="off" autocapitalize="none" autocorrect="off" spellcheck="false" aria-label="Access token">
+      <button id="token-go" class="big" type="submit">Sign in</button>
+      <button id="show-pair" class="ghost" type="button">Pair with a code instead</button>
+    </form>
+    <p id="signin-msg" class="signin-msg hide" role="alert"></p>
+    <div class="lock"><svg class="i sm"><use href="#lock"/></svg><span id="signin-lock">Each phone has its own key</span></div>
+  </div>
+</div>
 
-    <!-- Connection overlay -->
-    <div id="conn-overlay" class="overlay hidden">
-        <div class="overlay-content">
-            <div class="wolf-logo">🐺</div>
-            <h1>WolfRAT</h1>
-            <p class="subtitle">JO Server Admin</p>
-            <div id="conn-status" class="conn-status disconnected">Connecting...</div>
-        </div>
+<!-- ================= CONNECTING ================= -->
+<div id="connecting" class="pairscreen hide">
+  <div class="pair">
+    <div class="bigmark pulse"><img src="/static/icon-192.png" alt="WolfRAT"></div>
+    <h1>WolfRAT</h1>
+    <p id="connecting-msg">Connecting&hellip;</p>
+    <button id="connecting-out" class="ghost" type="button">Sign this phone out</button>
+  </div>
+</div>
+
+<!-- ================= THE APP ================= -->
+<div id="shell" class="app hide">
+<header class="appbar">
+  <div class="mark"><img src="/static/icon-192.png" alt=""></div>
+  <div class="ttl">
+    <b id="hdr-name">WolfRAT</b>
+    <small><span id="hdr-dot" class="live"></span><span id="hdr-sub">Connecting&hellip;</span></small>
+  </div>
+  <button id="hdr-manual" class="tag hide" type="button">MANUAL</button>
+  <button id="hdr-refresh" class="ibtn" type="button" aria-label="Refresh from the server"><svg class="i"><use href="#refresh"/></svg></button>
+</header>
+<div id="linkbar" class="linkbar hide" role="status"></div>
+
+<main>
+<!-- ================= NOW ================= -->
+<section id="s-now" class="screen on">
+  <div class="card hero">
+    <div class="hero-top">
+      <div class="grow">
+        <div class="row tight"><span id="now-type" class="chip y hide"></span><span class="ov">Now playing</span></div>
+        <h1 id="now-title">&mdash;</h1>
+        <div id="now-file" class="file"></div>
+      </div>
+      <div id="now-ring" class="ring">
+        <svg viewBox="0 0 92 92" aria-hidden="true"><circle class="bg" cx="46" cy="46" r="40"/><circle id="now-ring-fg" class="fg" cx="46" cy="46" r="40" stroke-dasharray="251.3" stroke-dashoffset="251.3"/></svg>
+        <div class="ring-t"><b id="now-left" class="num">&mdash;</b><small id="now-limit"></small></div>
+      </div>
     </div>
+    <button id="now-next" class="next" type="button">
+      <svg class="i sm muted"><use href="#skip"/></svg>
+      <div class="grow"><div class="lbl">Up next</div><b id="now-next-name">&mdash;</b></div>
+      <svg class="i sm faint"><use href="#chev"/></svg>
+    </button>
+  </div>
 
-    <!-- Main app -->
-    <div id="app" class="app hidden">
-        <!-- Top bar -->
-        <header class="topbar">
-            <div class="topbar-left">
-                <span class="wolf-icon">🐺</span>
-                <span class="topbar-title">WolfRAT</span>
-            </div>
-            <div class="topbar-right">
-                <span id="conn-dot" class="conn-dot disconnected"></span>
-                <span id="player-badge" class="badge">0</span>
-            </div>
-        </header>
+  <div id="now-teams" class="card teams"></div>
 
-        <!-- Tab content -->
-        <main class="content">
-            <!-- Dashboard -->
-            <section id="tab-dashboard" class="tab active">
-                <div class="card">
-                    <h2>Server Status</h2>
-                    <div class="stat-grid">
-                        <div class="stat">
-                            <span class="stat-label">Status</span>
-                            <span id="dash-status" class="stat-value">—</span>
-                        </div>
-                        <div class="stat">
-                            <span class="stat-label">Players</span>
-                            <span id="dash-players" class="stat-value">0</span>
-                        </div>
-                        <div class="stat">
-                            <span class="stat-label">Mode</span>
-                            <span id="dash-mode" class="stat-value">—</span>
-                        </div>
-                    </div>
-                </div>
-                <div class="card">
-                    <h2>Quick Actions</h2>
-                    <div class="action-grid">
-                        <button class="btn btn-action" onclick="quickAction('next_map', 'Next map')">⏭ Next Map</button>
-                        <button class="btn btn-action" onclick="quickAction('refresh_players', 'Refresh players')">🔄 Refresh</button>
-                        <button class="btn btn-action" onclick="quickAction('refresh_chat', 'Sync chat')">💬 Sync Chat</button>
-                    </div>
-                </div>
-                <div class="card">
-                    <h2>Recent Chat</h2>
-                    <div id="dash-chat" class="mini-chat"></div>
-                </div>
-            </section>
+  <div class="sechead"><span class="ov">Quick actions</span></div>
+  <div class="qa">
+    <button type="button" data-qa="next_map"><span class="ic"><svg class="i"><use href="#skip"/></svg></span>Next map</button>
+    <button type="button" data-qa="set_next" id="qa-set-next"><span class="ic"><svg class="i"><use href="#listplus"/></svg></span>Set next</button>
+    <button type="button" data-qa="message"><span class="ic"><svg class="i"><use href="#mega"/></svg></span>Message all</button>
+    <button type="button" data-qa="weather" id="qa-weather"><span class="ic"><svg class="i"><use href="#cloud"/></svg></span>Weather</button>
+    <button type="button" data-qa="mix"><span class="ic"><svg class="i"><use href="#shuffle"/></svg></span>Mix teams</button>
+    <button type="button" data-qa="start"><span class="ic"><svg class="i"><use href="#play"/></svg></span>Start game</button>
+  </div>
 
-            <!-- Players -->
-            <section id="tab-players" class="tab">
-                <div class="card">
-                    <h2>Players <span id="player-count" class="count">(0)</span></h2>
-                    <div id="player-list" class="player-list">
-                        <p class="empty">No players connected</p>
-                    </div>
-                </div>
-            </section>
+  <div class="sechead"><span class="ov">Server</span></div>
+  <div id="now-server" class="list"></div>
 
-            <!-- Chat -->
-            <section id="tab-chat" class="tab">
-                <div class="card chat-card">
-                    <h2>Server Chat</h2>
-                    <div id="chat-messages" class="chat-messages"></div>
-                    <div class="chat-input-row">
-<!-- 51 = stock 59-character chat less the 8-character "[ADMIN] " prefix.
-                             The server sends chat_max in every update (110 with the
-                             long-chat patch) and refuses a line that will not fit.
-                             !commands are not sent to chat: WolfRAT runs them. -->
-                        <input id="chat-input" type="text" placeholder="Type a message or !command..." maxlength="51" autocomplete="off">
-                        <button class="btn btn-send" onclick="sendChat()">Send</button>
-                    </div>
-                </div>
-            </section>
+  <div class="sechead"><span class="ov">Latest from WolfRAT</span><button class="link" type="button" data-go="chat" data-filter="wolfrat">All</button></div>
+  <div id="now-events" class="list"></div>
+</section>
 
-            <!-- Maps -->
-            <section id="tab-maps" class="tab">
-                <div class="card">
-                    <h2>Mission Rotation</h2>
-                    <div id="map-list" class="map-list">
-                        <p class="empty">No maps loaded</p>
-                    </div>
-                </div>
-            </section>
-        </main>
+<!-- ================= PLAYERS ================= -->
+<section id="s-players" class="screen">
+  <div id="pl-chips" class="chips"></div>
+  <div id="pl-find" class="search hide"><svg class="i sm"><use href="#search"/></svg><input id="pl-find-input" type="search" placeholder="Find a player" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="Find a player"></div>
+  <div id="plist" class="list"></div>
+  <p class="note center">Tap a player for messages, swaps, kicks and bans. Ping colours match the lag compensation bands (under 80, 80&ndash;149, 150+).</p>
+</section>
 
-        <!-- Bottom nav -->
-        <nav class="bottomnav">
-            <button class="nav-btn active" data-tab="dashboard">
-                <span class="nav-icon">📊</span>
-                <span class="nav-label">Dashboard</span>
-            </button>
-            <button class="nav-btn" data-tab="players">
-                <span class="nav-icon">👥</span>
-                <span class="nav-label">Players</span>
-            </button>
-            <button class="nav-btn" data-tab="chat">
-                <span class="nav-icon">💬</span>
-                <span class="nav-label">Chat</span>
-            </button>
-            <button class="nav-btn" data-tab="maps">
-                <span class="nav-icon">🗺️</span>
-                <span class="nav-label">Maps</span>
-            </button>
-        </nav>
+<!-- ================= CHAT ================= -->
+<section id="s-chat" class="screen">
+  <div id="chat-chips" class="chips">
+    <button class="fchip on" type="button" data-cf="all">All</button>
+    <button class="fchip" type="button" data-cf="players">Players</button>
+    <button class="fchip" type="button" data-cf="wolfrat">WolfRAT</button>
+    <button class="fchip" type="button" data-cf="commands">Commands</button>
+    <button class="fchip" type="button" data-cf="server">Server</button>
+  </div>
+  <div id="chat-messages" class="msgs"></div>
+</section>
+
+<!-- ================= MAPS ================= -->
+<section id="s-maps" class="screen">
+  <div class="card">
+    <div class="nowmini">
+      <div id="mp-now-thumb" class="thumb">&mdash;</div>
+      <div class="grow"><div class="ov">Now playing</div><b id="mp-now-name" class="big-name">&mdash;</b><div id="mp-now-sub" class="file num"></div></div>
+      <span class="chip y">NOW</span>
     </div>
-
-    <!-- Player action sheet -->
-    <div id="action-sheet" class="action-sheet hidden">
-        <div class="action-sheet-content">
-            <div class="action-sheet-header">
-                <h3 id="action-player-name">Player</h3>
-                <button class="btn-close" onclick="closeActionSheet()">✕</button>
-            </div>
-            <div class="action-sheet-body">
-                <button class="btn btn-action-row" onclick="playerAction('swap')">🔄 Swap Team + Kill</button>
-                <button class="btn btn-action-row" onclick="playerAction('kill')">💀 Kill</button>
-                <button class="btn btn-action-row" onclick="playerAction('zero')">0️⃣ Zero Score</button>
-                <button class="btn btn-action-row btn-warning" onclick="playerAction('kick')">👢 Kick</button>
-                <button class="btn btn-action-row btn-danger" onclick="playerAction('ban')">🔨 Ban</button>
-            </div>
-        </div>
+    <div class="gap12"></div>
+    <div class="nowmini">
+      <div id="mp-next-thumb" class="thumb alt">&mdash;</div>
+      <div class="grow"><div class="ov">Up next</div><b id="mp-next-name" class="big-name">&mdash;</b><div id="mp-next-sub" class="file"></div></div>
+      <button id="mp-change" class="fchip" type="button">Change</button>
     </div>
+  </div>
 
-    <script src="/static/app.js"></script>
+  <div id="mp-vote" class="card vote hide"></div>
+
+  <div class="search"><svg class="i sm"><use href="#search"/></svg><input id="mp-find" type="search" placeholder="Find a map in the rotation&hellip;" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="Find a map"></div>
+
+  <div class="sechead"><span id="mp-count" class="ov">Rotation</span></div>
+  <div id="map-list" class="list"></div>
+  <p class="note center">Tap a map to run it now or set it as the next map.</p>
+</section>
+
+<!-- ================= MORE ================= -->
+<section id="s-more" class="screen">
+  <div class="tiles">
+    <button id="tile-weather" class="tile" type="button" data-go="weather"><span class="ic sky"><svg class="i"><use href="#cloud"/></svg></span><b>Weather</b><small id="tile-weather-sub">&mdash;</small></button>
+    <button id="tile-lagcomp" class="tile" type="button" data-go="lagcomp"><span class="ic okc"><svg class="i"><use href="#target"/></svg></span><b>Lag comp</b><small id="tile-lagcomp-sub">&mdash;</small></button>
+    <button id="tile-mode" class="tile" type="button" data-scroll="mode-card"><span class="ic acc"><svg class="i"><use href="#toggle"/></svg></span><b>Mode</b><small id="tile-mode-sub">&mdash;</small></button>
+    <button id="tile-devices" class="tile" type="button" data-scroll="dev-head"><span class="ic"><svg class="i"><use href="#phone"/></svg></span><b>Devices</b><small id="tile-devices-sub">Phones signed in</small></button>
+    <button id="tile-help" class="tile" type="button" data-go="help"><span class="ic"><svg class="i"><use href="#help"/></svg></span><b>Help</b><small>Commands</small></button>
+    <button id="tile-logout" class="tile" type="button" data-logout="1"><span class="ic badc"><svg class="i"><use href="#logout"/></svg></span><b>Log out</b><small>This phone</small></button>
+  </div>
+
+  <div id="mode-card" class="card mt12">
+    <div class="ov">WolfRAT mode</div>
+    <div id="mode-seg" class="seg mt10">
+      <button type="button" data-mode="full">Full</button>
+      <button type="button" data-mode="manual">Manual</button>
+    </div>
+    <p id="mode-text" class="note"></p>
+  </div>
+
+  <div id="dev-head" class="sechead"><span class="ov">Signed-in devices</span><button id="dev-refresh" class="link" type="button">Refresh</button></div>
+  <div id="dev-list" class="list"><p class="empty">Loading&hellip;</p></div>
+</section>
+
+<!-- ================= WEATHER (More) ================= -->
+<section id="s-weather" class="screen">
+  <button class="back" type="button" data-back="more"><svg class="i"><use href="#back"/></svg><b>Weather</b></button>
+  <div id="wx-off" class="card hide"><p class="note">Weather isn't available on this WolfRAT (it needs the game server on the same PC).</p></div>
+  <div id="wx-on">
+    <div class="card">
+      <div class="row"><div class="grow"><b>Weather now</b><div id="wx-summary" class="file">&mdash;</div></div><span id="wx-dyn" class="chip">&mdash;</span></div>
+    </div>
+    <div class="sechead"><span class="ov">Set it now</span></div>
+    <div id="wx-presets" class="wx"></div>
+    <div class="card mt12">
+      <div class="row"><span class="ov grow">Fog distance</span><b id="fog-val" class="num">&mdash;</b></div>
+      <input id="fog-range" class="range" type="range" min="60" max="400" step="10" value="150" aria-label="Fog distance in metres">
+      <div class="fogmarks">
+        <button type="button" data-fog="60">Thick 60 m</button>
+        <button type="button" data-fog="150">Medium 150 m</button>
+        <button type="button" data-fog="400">Light 400 m</button>
+      </div>
+    </div>
+    <div class="card">
+      <div class="row"><svg class="i bolt"><use href="#storm"/></svg><div class="grow"><b>Lightning now</b><div class="file">One flash and thunder for everyone</div></div><button class="fchip" type="button" data-cmd="!lightning">Strike</button></div>
+    </div>
+  </div>
+</section>
+
+<!-- ================= LAG COMP (More) ================= -->
+<section id="s-lagcomp" class="screen">
+  <button class="back" type="button" data-back="more"><svg class="i"><use href="#back"/></svg><b>Lag compensation</b></button>
+  <div id="lc-off" class="card hide"><p class="note">Lag compensation isn't available on this WolfRAT.</p></div>
+  <div id="lc-on">
+    <div class="card">
+      <div class="row"><div class="grow"><b>Lag compensation</b><div id="lc-state" class="file">&mdash;</div></div><button id="lc-switch" class="switch off" type="button" role="switch" aria-checked="false" aria-label="Lag compensation on or off"></button></div>
+      <p id="lc-summary" class="note"></p>
+    </div>
+    <div class="sechead"><span class="ov">Auto-tune per player</span></div>
+    <div id="lc-tune" class="seg">
+      <button type="button" data-tune="off">Off</button>
+      <button type="button" data-tune="watch">Watch</button>
+      <button type="button" data-tune="on">On</button>
+    </div>
+    <p id="lc-tune-note" class="note"></p>
+  </div>
+</section>
+
+<!-- ================= HELP (More) ================= -->
+<section id="s-help" class="screen">
+  <button class="back" type="button" data-back="more"><svg class="i"><use href="#back"/></svg><b>Help</b></button>
+  <div class="card">
+    <b>Typed commands</b>
+    <p class="note">Type a <b>!command</b> in Chat (or press <b>!</b> next to the message box) and WolfRAT runs it as Web Admin. Commands are not posted in game chat. Tap one below to put it in the message box.</p>
+  </div>
+  <div id="help-cmds" class="list"></div>
+  <div id="help-pair" class="card">
+    <b>Another phone</b>
+    <p class="note">On the PC, open <b>Web Admin</b>, press <b>Pair a phone</b> and scan the code with the other phone. Each phone gets its own key; sign one out under <b>Devices</b> any time.</p>
+  </div>
+  <div class="card">
+    <b>Manual mode</b>
+    <p class="note">In Manual mode WolfRAT's automatic jobs are off (welcome lines, votes, auto-balance and the like), for when another WolfRAT looks after the same server. Everything you press here, and every command you type, still works.</p>
+  </div>
+</section>
+</main>
+
+<div id="composer" class="composer">
+  <div id="quick" class="quick"></div>
+  <div class="inrow">
+    <button id="chat-to" class="to" type="button" aria-label="Who the message goes to"><span id="chat-to-label">All</span><svg class="i sm"><use href="#down"/></svg></button>
+    <div class="inp">
+      <input id="chat-input" type="text" placeholder="Message everyone" maxlength="51" autocomplete="off" autocorrect="off" enterkeyhint="send" aria-label="Message">
+      <span id="chat-count" class="cnt num">0/51</span>
+      <button id="chat-bang" class="bang" type="button" aria-label="Commands">!</button>
+    </div>
+    <button id="chat-send" class="sendb" type="button" aria-label="Send"><svg class="i"><use href="#send"/></svg></button>
+  </div>
+</div>
+
+<nav class="bottom" aria-label="Sections">
+  <button type="button" data-nav="now" class="on"><span class="ind"><svg class="i"><use href="#now"/></svg></span>Now</button>
+  <button type="button" data-nav="players"><span class="ind"><svg class="i"><use href="#users"/></svg><span id="nav-players" class="badge hide">0</span></span>Players</button>
+  <button type="button" data-nav="chat"><span class="ind"><svg class="i"><use href="#chat"/></svg><span id="nav-chat" class="dot hide"></span></span>Chat</button>
+  <button type="button" data-nav="maps"><span class="ind"><svg class="i"><use href="#map"/></svg></span>Maps</button>
+  <button type="button" data-nav="more"><span class="ind"><svg class="i"><use href="#grid"/></svg></span>More</button>
+</nav>
+</div>
+
+<!-- ================= BOTTOM SHEET (player, confirm, pickers) ================= -->
+<div id="scrim" class="scrim"></div>
+<div id="sheet" class="sheet" role="dialog" aria-modal="true" aria-hidden="true">
+  <div class="grab"></div>
+  <div id="sheet-body"></div>
+</div>
+
+<div id="operation-result" class="toast" role="status" aria-live="polite"></div>
+
+<script src="/static/app.js"></script>
 </body>
 </html>
