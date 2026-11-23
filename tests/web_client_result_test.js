@@ -885,7 +885,7 @@ test('missing and null fields from an older WolfRAT do not break the page', asyn
     assert(page.shown('hdr-bell'));
     assert.deepStrictEqual(page.json('currentEvents.map(e => e.id)'), [3], 'only whole ids from 0 up');
     page.run('openAlerts()');
-    assert.match(page.el('sheet-body').innerHTML, /<div class="al new"><span class="ic"><svg class="i sm"><use href="#info"\/>/);
+    assert.match(page.el('sheet-body').innerHTML, /<div class="al"><span class="ic"><svg class="i sm"><use href="#info"\/>/);
     page.run('closeSheet()');
     page.serve = () => respond(404, {error: 'Not Found'});
     await page.run(`go('notify')`);
@@ -1088,6 +1088,11 @@ test('the Alerts sheet: newest first, icon per kind, name in bold; opening marks
     page.run('closeSheet()');
     page.run(`handleWebSocketMessage(${JSON.stringify({type: 'event', event: event5})})`);
     assert(page.shown('hdr-pip'));
+
+    const first = await signedInPage(stateWith({events: EVENTS, events_last_id: 3}));
+    first.run('openAlerts()');
+    assert(!first.el('sheet-body').innerHTML.includes('al new'), 'nothing seen before: no row is marked, all are new');
+    assert.strictEqual(first.local.getItem('wolfseen'), '3');
 
     const empty = await signedInPage(stateWith({events: [], events_last_id: 0}));
     assert(!empty.shown('hdr-pip'));

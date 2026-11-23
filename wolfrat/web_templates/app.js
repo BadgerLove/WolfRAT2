@@ -1484,9 +1484,10 @@ function eventAgo(e) {
     return text === 'now' ? 'just now' : text;
 }
 
+/** `before` = the seen mark when the sheet opened; 0 (nothing seen yet) marks none as new. */
 function alertRowHtml(e, before) {
     const kind = Object.prototype.hasOwnProperty.call(EVENT_ICON, e.kind) ? e.kind : '';
-    const fresh = eventId(e) > before ? ' new' : '';
+    const fresh = before > 0 && eventId(e) > before ? ' new' : '';
     return `<div class="al${fresh}"><span class="ic${kind ? ` k-${kind}` : ''}"><svg class="i sm"><use href="#${kind ? EVENT_ICON[kind] : 'info'}"/></svg></span>`
         + `<div class="main"><div class="tx">${eventLine(e)}</div><small>${esc(eventAgo(e))}</small></div></div>`;
 }
@@ -2664,14 +2665,14 @@ function firstJoins() {
 function phoneStatus(support) {
     if (support === 'unsupported') {
         return isIphone() && !runningInstalled()
-            ? ['On iPhone, add WolfRAT to the Home Screen first (Share, then Add to Home Screen) and turn them on in the app.', 'OFF', '']
+            ? ['On iPhone, add WolfRAT to the Home Screen first (see Install below), then turn them on in the app.', 'OFF', '']
             : ["This browser can't show notifications from WolfRAT.", 'OFF', ''];
     }
     if (!pushInfo) {
         return [pushFailed ? "Couldn't load the notification settings." : `Checking${ELLIPSIS}`, DASH, ''];
     }
     if (!pushInfo.public_key) return ['This WolfRAT sent no notification key.', 'OFF', ''];
-    if (pushIsOn()) return ['On: this phone gets the alerts below.', 'ON', 'g'];
+    if (pushIsOn()) return ["On: this phone gets WolfRAT's notifications.", 'ON', 'g'];
     if (notifyPermission() === 'denied') {
         return ["Blocked: allow notifications for this site in the browser's settings.", 'BLOCKED', 'r'];
     }

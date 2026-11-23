@@ -301,13 +301,13 @@ body.typing .composer{bottom:0;padding-bottom:calc(10px + var(--safe-b))}
 .al .ic.k-ban{background:var(--bad-soft);color:var(--bad)}
 .al .main{flex:1;min-width:0;padding-top:1px}
 .al .tx{font-size:14.5px;overflow-wrap:anywhere}
-.al .tx b{font-weight:800}
+.al .tx b{font-weight:700}
 .al small{display:block;color:var(--faint);font-size:12px;margin-top:2px}
 .al.new .tx::before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--bad);margin-right:7px;vertical-align:1px}
 
 /* ---------- notifications ---------- */
 .note.first{margin-top:0;color:var(--muted);font-size:14px}
-.seclink{display:flex;align-items:center;gap:8px;margin-top:12px;padding:12px 14px;border-radius:14px;background:var(--accent-soft);color:var(--accent);font-weight:800;font-size:15px;text-decoration:none;overflow-wrap:anywhere}
+.seclink{display:flex;align-items:center;gap:8px;margin-top:12px;padding:12px 14px;border-radius:14px;background:var(--accent-soft);color:var(--accent);font-weight:700;font-size:15px;text-decoration:none;overflow-wrap:anywhere}
 .stepper{display:flex;align-items:center;gap:2px;flex:none;background:var(--s2);border:1px solid var(--line);border-radius:14px;padding:3px}
 .stepper button{width:40px;height:40px;border-radius:11px;font-size:22px;font-weight:800;color:var(--accent);display:grid;place-items:center;text-align:center}
 .stepper button:disabled{color:var(--faint);opacity:1}
