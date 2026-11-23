@@ -12,6 +12,7 @@ from PyQt6.QtGui import QColor, QFont, QImage, QPainter, QPixmap
 from PyQt6.QtWidgets import QDialog, QHBoxLayout, QLabel, QPushButton, QVBoxLayout
 
 from wolfrat import qr_code
+from wolfrat.web_server import is_local_address
 
 
 def lan_pair_url(address, port, code):
@@ -164,13 +165,16 @@ class PairPhoneDialog(QDialog):
         self._show_qr(self.qr_label, self.url_label, self.lan_url(),
                       "No network address found - check this PC is on Wi-Fi/LAN")
         self._show_qr(self.internet_qr_label, self.internet_url_label, self.internet_url(), None)
-        if self._internet:
+        # A PC whose own address is a public one (a rented server): that QR
+        # works from anywhere, so there is nothing more to say.
+        public = bool(self._lan) and not is_local_address(self._lan)
+        self.qr_label.heading.setText("Scan with the phone" if public else "On this network")
+        if self._internet or public or not getattr(self.ws, "allow_internet", False):
             self.away_label.setText("")
         else:
             self.away_label.setText(
-                "Away from home (when phones from the internet are allowed): sign in "
-                f"once on http://<this PC's internet address>:{self._port} with the "
-                "username and token; this window shows that address after that."
+                f"Away from home: open this PC's internet address, port {self._port}, "
+                "on the phone and type the code."
             )
         if self.status_label.text().startswith("✓"):
             self.status_label.setText("")

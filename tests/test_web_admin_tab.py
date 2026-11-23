@@ -191,6 +191,30 @@ def test_the_internet_address_is_offered_only_when_internet_is_allowed(qtbot, tm
     assert saved(tmp_path)["web_internet_address"] == "203.0.113.7:8070"
 
 
+def test_pair_window_text_stays_short(qtbot, tmp_path, monkeypatch):
+    import wolfrat.app as app_module
+    # A rented server: its own address is public, so its QR works from anywhere.
+    monkeypatch.setattr(app_module, "_lan_ips", lambda: ["203.0.113.9"])
+    tab, _server = make_tab(qtbot, tmp_path, {"web_token": "t", "web_allow_internet": True})
+    tab.pair_btn.click()
+    dialog = tab._pair_dialog
+    assert dialog.qr_label.heading.text() == "Scan with the phone"
+    assert dialog.away_label.text() == ""
+    dialog.close()
+    # A home PC behind a router, internet allowed: one short line for away from home.
+    monkeypatch.setattr(app_module, "_lan_ips", lambda: ["192.168.1.20"])
+    tab.pair_btn.click()
+    dialog = tab._pair_dialog
+    assert dialog.qr_label.heading.text() == "On this network"
+    assert dialog.away_label.text().startswith("Away from home: open this PC's internet address")
+    dialog.close()
+    # This network only: nothing about away from home.
+    tab.internet_cb.setChecked(False)
+    tab.pair_btn.click()
+    assert tab._pair_dialog.away_label.text() == ""
+    tab._pair_dialog.close()
+
+
 @pytest.mark.parametrize("seconds, text", [
     (None, "never"), (10, "just now"), (300, "5m ago"), (7200, "2h ago"), (172800, "2d ago"),
 ])

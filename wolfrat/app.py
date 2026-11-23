@@ -9815,7 +9815,7 @@ class WebAdminTab(QWidget):
             label.setWordWrap(True)
             row_layout.addWidget(label, 1)
             button = QPushButton("Sign out")
-            button.setFixedWidth(80)
+            button.setMinimumWidth(100)
             button.clicked.connect(
                 lambda _checked=False, device_id=device['id']: self._sign_out_device(device_id)
             )
