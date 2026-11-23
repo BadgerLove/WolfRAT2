@@ -325,7 +325,7 @@ test('a pairing link signs in by itself and leaves the address at once', async (
     assert(pair, 'the code must be posted to /api/pair');
     assert.strictEqual(pair.method, 'POST');
     assert.strictEqual(pair.body.code, 'K7QX4M');
-    assert.match(pair.body.device_name, /Pixel 8/);
+    assert.strictEqual(pair.body.device_name, 'Pixel 8 (Chrome)', 'plain ASCII, 40 characters at most');
     assert.strictEqual(pair.headers.Authorization, undefined, 'pairing is a public route');
     const cleared = page.events.indexOf('replaceState /');
     assert(cleared >= 0, 'the #pair= hash must be cleared');
@@ -350,6 +350,10 @@ test('a wrong pairing code says so; a locked address says when to try again', as
     await page.run(`pairWithCode('ABCDEF')`);
     assert.match(page.el('signin-msg').textContent, /locked/i);
     assert.match(page.el('signin-msg').textContent, /try again in 10 min/i);
+
+    page.serve = () => respond(400, {error: 'Bad code'});
+    await page.run(`pairWithCode('ABCDEF')`);
+    assert.match(page.el('signin-msg').textContent, /not a pairing code/);
 
     const before = page.requests.length;
     await page.run(`pairWithCode('K7Q')`);
@@ -587,6 +591,27 @@ test('a socket that drops asks the API at once and signs out on 401', async () =
     await new Promise(resolve => setImmediate(resolve));
     assert.strictEqual(page.local.getItem('wolfkey'), null);
     assert(page.shown('signin'));
+});
+
+test('a 4001 close says why: token changed signs out, internet off keeps the key', async () => {
+    const changed = await signedInPage();
+    changed.serve = () => respond(401, {error: 'Unauthorized'});
+    changed.sockets[0].onclose({code: 4001, reason: 'token changed'});
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(changed.local.getItem('wolfkey'), null);
+    assert.match(changed.el('signin-msg').textContent, /token was changed/);
+
+    const outside = await signedInPage();
+    const gate = 'This WolfRAT only takes phones on its own network.';
+    outside.serve = () => respond(403, {error: gate});
+    outside.sockets[0].onclose({code: 4001, reason: 'internet access turned off'});
+    await new Promise(resolve => setImmediate(resolve));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.strictEqual(outside.local.getItem('wolfkey'), 'k1', 'the key still works at home');
+    assert(outside.shown('shell'));
+    assert.strictEqual(outside.el('linkbar').textContent, gate);
+    assert(outside.el('linkbar').classList.contains('bad'));
 });
 
 test('hostile names and lines are escaped everywhere', async () => {
@@ -856,6 +881,17 @@ test('chat lines: team colours, WolfRAT pills, admin bubbles, old servers', asyn
     assert(!page.el('chat-messages').innerHTML.includes('hello'));
 });
 
+test('new chat while on another screen marks the Chat tab until it is opened', async () => {
+    const page = await signedInPage(stateWith({chat: [{id: 1, time: '17:00', text: 'Alice: hi', kind: 'player', name: 'Alice'}]}));
+    assert(page.el('nav-chat').classList.contains('hide'), 'lines already there on arrival are not new');
+    page.run(`handleWebSocketMessage({type: 'chat', chat: [{id: 1, time: '17:00', text: 'Alice: hi', kind: 'player', name: 'Alice'}, {id: 2, time: '17:01', text: 'Bob: yo', kind: 'player', name: 'Bob'}]})`);
+    assert(!page.el('nav-chat').classList.contains('hide'), 'a new line marks the tab');
+    assert(page.el('chat-messages').innerHTML.includes('yo'));
+    page.run(`go('chat')`);
+    assert(page.el('nav-chat').classList.contains('hide'), 'opening Chat clears the mark');
+    assert.strictEqual(page.location.hash, '#chat');
+});
+
 test('Log out ends this key on the server and forgets it', async () => {
     const page = await signedInPage(stateWith({features: ALL_FEATURES}));
     page.serve = request => {
@@ -887,8 +923,10 @@ test('devices: the list loads with the key and another phone can be signed out',
     };
     await page.run('loadDevices()');
     const html = page.el('dev-list').innerHTML;
-    assert(html.includes('Pixel 8 (this phone)'));
-    assert(html.includes('YOU'));
+    assert(html.includes('<b>Pixel 8</b>'));
+    assert(html.includes('YOU'), 'this phone is marked');
+    assert(html.includes('not seen yet'));
+    assert(html.includes('Paired 20 Nov'), 'an ISO date works too');
     assert(html.includes('data-signout="cc33dd44"'));
     assert(!html.includes('data-signout="aa11bb22"'), 'this phone signs out with Log out');
     page.run(`askSignOutDevice('cc33dd44', "Tinman's phone")`);

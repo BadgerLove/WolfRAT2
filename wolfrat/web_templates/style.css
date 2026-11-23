@@ -222,6 +222,7 @@ main{padding:14px 14px calc(var(--nav-h) + var(--safe-b) + 18px)}
 .card,.sechead{scroll-margin-top:84px}
 .field{width:100%;height:50px;border-radius:14px;border:1px solid var(--line2);background:var(--bg);color:var(--text);padding:0 14px;font-size:16px;outline:0}
 .field:focus{border-color:var(--accent)}
+.field:focus-visible{outline:none}
 textarea.field{height:auto;min-height:160px;padding:12px 14px;line-height:1.45;resize:vertical}
 
 /* ---------- chat ---------- */

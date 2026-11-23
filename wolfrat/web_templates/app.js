@@ -438,6 +438,14 @@ function lockedText(seconds) {
 
 const SIGNED_OUT_TEXT = 'This phone was signed out of WolfRAT. Pair it again to carry on.';
 
+/** Why the key stopped working, from the socket's close reason when it gave one. */
+function signedOutText(reason) {
+    if (/token/i.test(String(reason || ''))) {
+        return 'The Web Admin token was changed on the PC, so every phone was signed out. Pair this phone again.';
+    }
+    return SIGNED_OUT_TEXT;
+}
+
 async function submitHttpOperation(path, body, context = {}) {
     const res = await api(path, {method: 'POST', body});
     if (res.status === 401) {
@@ -482,7 +490,9 @@ function deviceName() {
     else if (/OPR\//.test(ua)) browser = 'Opera';
     else if (/Chrome|CriOS/.test(ua)) browser = 'Chrome';
     else if (/Safari/.test(ua)) browser = 'Safari';
-    return (browser ? `${device}${DOT}${browser}` : device).slice(0, 48);
+    // The server keeps up to 40 printable characters; plain ASCII to be safe.
+    const name = (browser ? `${device} (${browser})` : device).replace(/[^\x20-\x7e]/g, '');
+    return name.slice(0, 40).trim() || 'Phone';
 }
 
 function normalizeCode(raw) {
@@ -522,6 +532,7 @@ function signinMessage(message, tone = 'bad') {
 
 function showSignin(message, tone) {
     appShown = false;
+    hideToast();
     show('shell', false);
     show('connecting', false);
     show('signin', true);
@@ -535,6 +546,9 @@ function showSignin(message, tone) {
 function showTokenForm(visible) {
     show('token-form', visible);
     show('pair-form', !visible);
+    setText('signin-intro', visible
+        ? 'Sign in with the username and access token from the Web Admin tab on the PC.'
+        : 'Pair this phone with WolfRAT on your server PC. You only do this once.');
     signinMessage('');
     const field = visible ? $('login-user') : $('pair-code');
     if (field && typeof field.focus === 'function') {
@@ -616,6 +630,8 @@ function acceptSignin(res, how) {
     const status = res ? res.status : 0;
     if (status === 429) {
         signinMessage(lockedText(res.retryAfter));
+    } else if (how === 'pair' && status === 400) {
+        signinMessage(`That is not a pairing code. Type the ${PAIR_LENGTH} characters shown on the PC.`);
     } else if (status === 401 || status === 400) {
         signinMessage(how === 'pair'
             ? 'That code is wrong or has run out. Press Pair a phone on the PC for a new one.'
@@ -789,12 +805,12 @@ function setLinkState(state, text) {
 }
 
 /** Ask the API why the socket failed (a browser never says). */
-async function checkKey() {
+async function checkKey(reason) {
     if (!deviceKey) return 'signedout';
     const res = await api('/api/status');
     if (!deviceKey) return 'signedout';
     if (res.status === 401) {
-        signedOut(SIGNED_OUT_TEXT);
+        signedOut(signedOutText(reason));
         return 'signedout';
     }
     if (res.status === 429) {
@@ -813,11 +829,11 @@ async function checkKey() {
     return 'down';
 }
 
-function scheduleReconnect(checkNow) {
+function scheduleReconnect(checkNow, reason) {
     if (!deviceKey || reconnectTimer) return;
     const wait = reconnectDelay;
     reconnectDelay = Math.min(reconnectDelay * 2, RECONNECT_MAX_MS);
-    if (checkNow) checkKey();
+    if (checkNow) checkKey(reason);
     reconnectTimer = setTimeout(async () => {
         reconnectTimer = null;
         if (!deviceKey) return;
@@ -868,8 +884,11 @@ function connectWS() {
         ws = null;
         pendingChatTexts = [];
         setLinkState('down');
-        // Signed out from the PC (4001), or never got in: ask why at once.
-        scheduleReconnect(!opened || (event && event.code === 4001));
+        // 4001: the key stopped working (signed out, token changed, or no
+        // internet access any more). Never got in: the same question. Ask the
+        // API at once; a 401 means sign in again, a 403 keeps the key.
+        const ended = !!event && event.code === 4001;
+        scheduleReconnect(!opened || ended, ended ? event.reason : '');
     };
     socket.onerror = () => {};
 }
@@ -1257,7 +1276,11 @@ function teamTotals() {
 function renderHeader() {
     const state = lastState || {};
     const server = obj(state.server);
-    setText('hdr-name', server.name || settingValue(obj(state.settings), 'servername') || 'WolfRAT');
+    const serverName = server.name || settingValue(obj(state.settings), 'servername') || '';
+    setText('hdr-name', serverName || 'WolfRAT');
+    try {
+        document.title = serverName ? `${serverName}${DOT}WolfRAT` : 'WolfRAT';
+    } catch (error) { /* ignore */ }
     let sub;
     let tone;
     if (linkState === 'locked') {
@@ -1402,7 +1425,7 @@ function weatherShort(weather) {
 function lagShort(lc) {
     const l = obj(lc);
     const tune = TUNE_NAMES[l.tune_mode];
-    return (l.enabled ? 'On' : 'Off') + (tune ? `${DOT}${tune}` : '');
+    return (l.enabled ? 'On' : 'Off') + (tune ? `${DOT}tune ${tune}` : '');
 }
 
 function renderServerList() {
@@ -2312,7 +2335,7 @@ function deviceRowHtml(d) {
         ? chip('YOU', 'g')
         : `<button class="fchip sm" type="button" data-signout="${esc(d.id)}" data-name="${esc(name)}">Sign out</button>`;
     return `<div class="li"><span class="ic${d.this_device ? ' acc' : ''}"><svg class="i sm"><use href="#phone"/></svg></span>`
-        + `<div class="main"><b>${esc(name)}${d.this_device ? ' (this phone)' : ''}</b><small>${esc(parts.join(DOT))}</small></div>${right}</div>`;
+        + `<div class="main"><b>${esc(name)}</b><small>${esc(parts.join(DOT))}</small></div>${right}</div>`;
 }
 
 function renderDevices() {
