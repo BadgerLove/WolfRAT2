@@ -69,6 +69,9 @@
     <symbol id="leave" viewBox="0 0 24 24"><circle cx="9" cy="8" r="4"/><path d="M2 21v-1a7 7 0 0 1 14 0v1"/><path d="M16 11h6"/></symbol>
     <symbol id="server" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></symbol>
     <symbol id="install" viewBox="0 0 24 24"><path d="M12 3v12M7 10l5 5 5-5"/><path d="M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></symbol>
+    <symbol id="sky" viewBox="0 0 24 24"><path d="M12.5 3a7 7 0 0 0 8.5 8.5A9 9 0 1 1 12.5 3z"/><path d="M18 3v3M16.5 4.5h3"/></symbol>
+    <symbol id="scales" viewBox="0 0 24 24"><path d="M12 4v16M7 20h10M5 7h14"/><path d="M5 7l-3 6.5a3.2 3.2 0 0 0 6 0zM19 7l-3 6.5a3.2 3.2 0 0 0 6 0z"/></symbol>
+    <symbol id="flag" viewBox="0 0 24 24"><path d="M5 21V4"/><path d="M5 4.5h12.5l-2.5 4 2.5 4H5"/></symbol>
   </defs>
 </svg>
 
@@ -140,6 +143,7 @@
         <div class="ring-t"><b id="now-left" class="num">&mdash;</b><small id="now-limit"></small></div>
       </div>
     </div>
+    <div id="now-objective" class="objective hide"></div>
     <button id="now-next" class="next" type="button">
       <svg class="i sm muted"><use href="#skip"/></svg>
       <div class="grow"><div class="lbl">Up next</div><b id="now-next-name">&mdash;</b></div>
@@ -155,8 +159,11 @@
     <button type="button" data-qa="set_next" id="qa-set-next"><span class="ic"><svg class="i"><use href="#listplus"/></svg></span>Set next</button>
     <button type="button" data-qa="message"><span class="ic"><svg class="i"><use href="#mega"/></svg></span>Message all</button>
     <button type="button" data-qa="weather" id="qa-weather"><span class="ic"><svg class="i"><use href="#cloud"/></svg></span>Weather</button>
+    <button type="button" data-qa="sky" id="qa-sky" class="hide"><span class="ic"><svg class="i"><use href="#sky"/></svg></span>Sky</button>
     <button type="button" data-qa="mix"><span class="ic"><svg class="i"><use href="#shuffle"/></svg></span>Mix teams</button>
     <button type="button" data-qa="start"><span class="ic"><svg class="i"><use href="#play"/></svg></span>Start game</button>
+    <button type="button" data-qa="balance"><span class="ic"><svg class="i"><use href="#scales"/></svg></span>Balance teams</button>
+    <button type="button" data-qa="vote"><span class="ic"><svg class="i"><use href="#vote"/></svg></span>Start vote</button>
   </div>
 
   <div class="sechead"><span class="ov">Server</span></div>
@@ -215,9 +222,10 @@
 <section id="s-more" class="screen">
   <div class="tiles">
     <button id="tile-weather" class="tile" type="button" data-go="weather"><span class="ic sky"><svg class="i"><use href="#cloud"/></svg></span><b>Weather</b><small id="tile-weather-sub">&mdash;</small></button>
+    <button id="tile-sky" class="tile hide" type="button" data-go="sky"><span class="ic night"><svg class="i"><use href="#sky"/></svg></span><b>Sky</b><small id="tile-sky-sub">&mdash;</small></button>
     <button id="tile-lagcomp" class="tile" type="button" data-go="lagcomp"><span class="ic okc"><svg class="i"><use href="#target"/></svg></span><b>Lag comp</b><small id="tile-lagcomp-sub">&mdash;</small></button>
     <button id="tile-mode" class="tile" type="button" data-scroll="mode-card"><span class="ic acc"><svg class="i"><use href="#toggle"/></svg></span><b>Mode</b><small id="tile-mode-sub">&mdash;</small></button>
-    <button id="tile-notify" class="tile hide" type="button" data-go="notify"><span class="ic acc"><svg class="i"><use href="#bell"/></svg></span><b>Notifications</b><small id="tile-notify-sub">Player joins</small></button>
+    <button id="tile-notify" class="tile" type="button" data-go="notify"><span class="ic acc"><svg class="i"><use href="#bell"/></svg></span><b>Notifications</b><small id="tile-notify-sub">Bell and phone</small></button>
     <button id="tile-devices" class="tile" type="button" data-scroll="dev-head"><span class="ic"><svg class="i"><use href="#phone"/></svg></span><b>Devices</b><small id="tile-devices-sub">Phones signed in</small></button>
     <button id="tile-help" class="tile" type="button" data-go="help"><span class="ic"><svg class="i"><use href="#help"/></svg></span><b>Help</b><small>Commands</small></button>
     <button id="tile-logout" class="tile" type="button" data-logout="1"><span class="ic badc"><svg class="i"><use href="#logout"/></svg></span><b>Log out</b><small>This phone</small></button>
@@ -261,6 +269,32 @@
   </div>
 </section>
 
+<!-- ================= SKY (Now, More) ================= -->
+<section id="s-sky" class="screen">
+  <button class="back" type="button" data-back="more"><svg class="i"><use href="#back"/></svg><b>Sky</b></button>
+  <div id="sky-off" class="card hide"><p class="note">Sky colours aren't available on this WolfRAT (it needs the game server on the same PC).</p></div>
+  <div id="sky-on">
+    <div class="card">
+      <div class="row"><div class="grow"><b>Sky now</b><div id="sky-summary" class="file">&mdash;</div></div><span id="sky-chip" class="chip y hide">ON</span></div>
+      <p id="sky-problem" class="sh-gone hide" role="status"></p>
+    </div>
+    <button id="sky-own" class="btn wide" type="button"><svg class="i"><use href="#sun"/></svg>Back to the map's own sky</button>
+    <div class="card mt12">
+      <div class="ov">Keep it for</div>
+      <div id="sky-keep" class="keep">
+        <button class="fchip on" type="button" data-keep="">Until the map changes</button>
+        <div class="mins">
+          <button class="fchip" type="button" data-keep="10">10 min</button>
+          <button class="fchip" type="button" data-keep="30">30 min</button>
+          <button class="fchip" type="button" data-keep="60">60 min</button>
+        </div>
+      </div>
+    </div>
+    <div class="sechead"><span id="sky-count" class="ov">Skies</span></div>
+    <div id="sky-tiles" class="skyg"></div>
+  </div>
+</section>
+
 <!-- ================= LAG COMP (More) ================= -->
 <section id="s-lagcomp" class="screen">
   <button class="back" type="button" data-back="more"><svg class="i"><use href="#back"/></svg><b>Lag compensation</b></button>
@@ -296,8 +330,14 @@
     </div>
     <p id="nt-note" class="note hide"></p>
   </div>
-  <div class="sechead"><span class="ov">When players join</span></div>
-  <div class="card">
+  <div id="nt-prefs" class="hide">
+    <div class="sechead"><span class="ov">What this phone hears about</span></div>
+    <div id="nt-rows" class="list"></div>
+    <p class="note under">Bell = the list at the top of the page. Phone = a notification, even with the app closed.</p>
+    <p id="nt-phone-hint" class="note under hide"></p>
+  </div>
+  <div id="nt-joins-head" class="sechead"><span class="ov">When players join</span></div>
+  <div id="nt-joins-card" class="card">
     <div class="row">
       <div class="grow"><b>First players who join an empty server</b><div class="file">One notification each, then none until it has been empty for 10 minutes. For every phone; 0 = off.</div></div>
       <div class="stepper"><button id="nt-minus" type="button" aria-label="Fewer">&minus;</button><b id="nt-count" class="num">&mdash;</b><button id="nt-plus" type="button" aria-label="More">+</button></div>
