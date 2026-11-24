@@ -859,6 +859,7 @@ class ServerTab(QWidget):
         if self._closing:
             return
         self._manual_disconnect = False
+        self.server.disconnected_on_purpose = False
         self.reconnect_timer.stop()
 
         host = self.host_input.text().strip()
@@ -1012,6 +1013,9 @@ class ServerTab(QWidget):
 
     def _do_disconnect(self):
         self._manual_disconnect = True
+        # The phone page's "game server down" alert reads this: the admin
+        # closing the link is never the server going down.
+        self.server.disconnected_on_purpose = True
         self._pending_connect = None
         self._reconnect_attempts = 0
         self.reconnect_timer.stop()
