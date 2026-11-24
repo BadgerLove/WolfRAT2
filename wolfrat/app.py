@@ -6132,18 +6132,40 @@ class ModsTab(QWidget):
     def _mod_commands():
         """Commands for mods (each rank allows some), plus the map vote numbers."""
         return {
-            '!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map',
+            '!warn', '!kick', '!ban', '!unban', '!swap', '!kill', '!next', '!map',
             '!setnext', '!add', '!remove', '!1', '!2', '!3', '!4', '!5',
             '!startvote', '!startgame', '!mixteams', '!balanceteams', '!time',
             '!gametime', *weather.CHAT_COMMANDS,
         }
+
+    @staticmethod
+    def _time_of_day(text):
+        """What was typed after !time, as (hour, minute); None when it is not
+        a time.  "9" and "09" are 09:00, "930" and "9:30" are 09:30, "1830"
+        and "18:30" are 18:30."""
+        text = str(text or "").strip()
+        if ':' in text:
+            hours, _, minutes = text.partition(':')
+            if len(minutes) != 2:
+                return None
+        elif len(text) <= 2:
+            hours, minutes = text, '00'
+        else:
+            hours, minutes = text[:-2], text[-2:]
+        if not (text.isascii() and hours.isdigit() and minutes.isdigit()) or len(hours) > 2:
+            return None
+        hour, minute = int(hours), int(minutes)
+        if hour > 23 or minute > 59:
+            return None
+        return hour, minute
 
     def run_web_command(self, message):
         """A !command typed on the phone page: run it here as Web Admin.
 
         The web server hands it straight here; it is not posted to chat and
         read back.  Manual mode does not stop it: the admin typed it, same as
-        a button (Dale, 2026-11-23).  Returns what the phone shows.
+        a button (Dale, 2026-11-23).  Returns what the phone shows: when the
+        command did not run, the reason (it is not posted in game chat).
         """
         text = " ".join(str(message or "").split())
         if not text.startswith('!'):
@@ -6159,7 +6181,11 @@ class ModsTab(QWidget):
             return {'ok': False, 'command': cmd,
                     'error': f'Add a player name: {cmd} <name>'}
         wire_log(f"[MODS] Web Admin typed: {text[:200]}")
-        self._check_mod_command(text, typed_on_phone=True)
+        refusals = []
+        self._check_mod_command(text, typed_on_phone=True, refusals=refusals)
+        if refusals:
+            wire_log(f"[MODS] Web Admin {cmd} not run: {refusals}")
+            return {'ok': False, 'command': cmd, 'error': ' '.join(refusals)}
         return {'ok': True, 'command': cmd}
 
     def _submit_mod_action(
@@ -6440,7 +6466,8 @@ class ModsTab(QWidget):
             ("!setnext <name>", "Make a map the next one, without skipping this one "
              "(added to the rotation if it isn't in it)", False),
             ("!gametime <1-240>", "Set the game time in minutes", False),
-            ("!time <0000-2300>", "Set time of day (!time 930 becomes 1000)", False),
+            ("!time <hhmm>", "Set time of day: !time 9 is 09:00, !time 1830 or "
+             "!time 18:30 is 18:30", False),
         )),
         ("Weather (mods - switch on in the Weather tab)", (
             ("!storm [minutes]", "Rain, dark cloud and fog. !storm 10 lasts ten minutes", False),
@@ -6629,13 +6656,16 @@ class ModsTab(QWidget):
 
         self._forget_chat_ids_outside(messages)
 
-    def _check_mod_command(self, text, *, typed_on_phone=False):
+    def _check_mod_command(self, text, *, typed_on_phone=False, refusals=None):
         """Run a chat command, if ``text`` is one its sender may use.
 
         A chat line counts only as "Name: !command".  A line with no name in
         front came from the server console (WolfRAT's own lines, or another
         admin tool's) and is never a command.  The phone's typed commands
         come in through run_web_command (``typed_on_phone``), not from chat.
+
+        ``refusals``: the phone's list.  With it, the reason a command did
+        not run is put there instead of being said in game chat.
         """
         if '!' not in text:
             return
@@ -6661,12 +6691,34 @@ class ModsTab(QWidget):
         if not message.startswith('!'):
             return
 
-        # Parse command
+        # Parse command.  ``args``: the first word after the command, then the
+        # rest as one piece (a reason, a map name).  ``words``: every word on
+        # its own, for commands that take several ("!weather on custom 5 20").
         parts = message.split(None, 2)
         cmd = parts[0].lower()
         args = parts[1:] if len(parts) > 1 else []
+        words = message.split()[1:]
 
         wire_log(f"[MODS] Command: cmd={cmd} sender={sender} args={args} mods={list(self.mods.keys())}")
+
+        def refuse(line, context, phone=None):
+            """Why the command did not run.  Typed in the game: a chat line.
+            Typed on the phone: back to the phone (``phone`` when it can say
+            more than the chat line), nothing in game chat."""
+            if refusals is None:
+                self._send_mod_chat(line, context)
+            else:
+                refusals.append(phone or line)
+
+        def tell_phone(line):
+            """A reason for the phone where the game says nothing."""
+            if refusals is not None:
+                refusals.append(line)
+
+        def no_player():
+            """For the phone: nobody on the server has the name typed."""
+            tell_phone(f"Player not found: {args[0]}" if args
+                       else f"Add a player name: {cmd} <player>")
 
         # !switch is handled by ChatBot for ALL players
         if cmd == '!switch':
@@ -6682,12 +6734,16 @@ class ModsTab(QWidget):
             if career_panel is not None:
                 lines = career_panel.reply('!rank' if cmd == '!rank' else '!stats', target_name, chat_limit())
             if lines is not None:
-                for line in lines:
-                    self._send_mod_chat(line, f"Send {cmd} response")
+                if len(lines) == 1 and lines[0].startswith("No stats yet for "):
+                    refuse(lines[0], f"Send {cmd} response")    # nobody by that name
+                else:
+                    for line in lines:
+                        self._send_mod_chat(line, f"Send {cmd} response")
                 wire_log(f"[MODS] {cmd}: sent {lines}")
                 return
             if cmd == '!rank':
                 wire_log("[MODS] !rank: switched off or nothing to read")
+                tell_phone("No rank to show: !rank is off or there are no stats yet.")
                 return
             cmd = '!kd'
 
@@ -6696,13 +6752,16 @@ class ModsTab(QWidget):
             wire_log(f"[MODS] !kd triggered: sender={sender} args={args}")
             if not hasattr(self, 'messages_tab') or not self.messages_tab:
                 wire_log("[MODS] !kd: no messages_tab")
+                tell_phone("WolfRAT has no stats to show.")
                 return
             if not self.messages_tab._kd_enabled:
                 wire_log("[MODS] !kd: kd_enabled=False")
+                tell_phone("Stats are switched off in WolfRAT.")
                 return
             stats_store = self.messages_tab.stats_store
             if not stats_store:
                 wire_log("[MODS] !kd: no stats_store")
+                tell_phone("WolfRAT has no stats to show.")
                 return
             # If args provided, look up that player; otherwise look up sender
             if args:
@@ -6716,7 +6775,7 @@ class ModsTab(QWidget):
                 self._send_mod_chat(kd_str, "Send KD response")
                 wire_log(f"[MODS] !kd: sent '{kd_str}'")
             else:
-                self._send_mod_chat(
+                refuse(
                     one_chat_line(
                         f"No stats found for {target_name}",
                         "No stats found for that name.",
@@ -6758,10 +6817,10 @@ class ModsTab(QWidget):
             """'Map not found', or the maps it could be (nothing is loaded on a guess)."""
             if map_choices:
                 for line in map_match.choices_lines(map_name, map_choices):
-                    self._send_mod_chat(line, "Send map choices")
+                    refuse(line, "Send map choices")
             else:
                 # One line, or a fixed one: the name is the player's own text.
-                self._send_mod_chat(
+                refuse(
                     one_chat_line(f"Map not found: {map_name}", "Map not found."),
                     "Send missing map response",
                 )
@@ -6864,22 +6923,23 @@ class ModsTab(QWidget):
         # !vote <map> - any player can start a map vote
         if cmd == '!vote':
             if not self._vote_enabled:
+                tell_phone("Map voting is switched off in WolfRAT.")
                 return
             if self._vote_active:
-                self._send_mod_chat(
+                refuse(
                     "Vote already in progress", "Send vote status"
                 )
                 return
             map_name = ' '.join(args) if args else ''
             if not map_name:
-                self._send_mod_chat(
+                refuse(
                     "Usage: !vote <map name>", "Send vote usage"
                 )
                 return
             # Need 2+ players
             player_count = len(self.server.players)
             if player_count < 2:
-                self._send_mod_chat(
+                refuse(
                     "Need at least 2 players to vote",
                     "Send vote player requirement",
                 )
@@ -6896,13 +6956,13 @@ class ModsTab(QWidget):
                         self.server.mission_entries, filename
                     )
                 except ValueError:
-                    self._send_mod_chat(
+                    refuse(
                         f"Map is queued more than once: {name}",
                         "Reject ambiguous map vote",
                     )
                     return
                 if mission_entry is None:
-                    self._send_mod_chat(
+                    refuse(
                         f"Map queue changed: {name}",
                         "Reject stale map vote",
                     )
@@ -6929,9 +6989,10 @@ class ModsTab(QWidget):
         # !skip - any player can start a skip vote for the current map
         if cmd == '!skip':
             if not self._skip_enabled:
+                tell_phone("Skip voting is switched off in WolfRAT.")
                 return
             if self._skip_active:
-                self._send_mod_chat(
+                refuse(
                     "Skip vote already in progress", "Send skip vote status"
                 )
                 return
@@ -6940,14 +7001,14 @@ class ModsTab(QWidget):
             if remaining > 0:
                 mins = remaining // 60
                 secs = remaining % 60
-                self._send_mod_chat(
+                refuse(
                     f"Skip on cooldown - {mins}m {secs}s left",
                     "Send skip cooldown",
                 )
                 return
             player_count = len(self.server.players)
             if player_count < 1:
-                self._send_mod_chat(
+                refuse(
                     "Need at least 1 player to vote",
                     "Send skip player requirement",
                 )
@@ -7065,7 +7126,7 @@ class ModsTab(QWidget):
             map_tab = getattr(self.server, '_map_voting_tab', None)
             if map_tab:
                 if map_tab._vote_active:
-                    self._send_mod_chat(
+                    refuse(
                         "Vote is already running.", "Send vote status"
                     )
                 else:
@@ -7080,7 +7141,7 @@ class ModsTab(QWidget):
                         "Announce forced map vote",
                     )
             else:
-                self._send_mod_chat(
+                refuse(
                     "Map voting tab not found.", "Send vote error"
                 )
             return
@@ -7103,6 +7164,7 @@ class ModsTab(QWidget):
                 )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to warn but player not found")
+                no_player()
 
         elif cmd == '!kick':
             target = find_player(args[0]) if args else None
@@ -7122,6 +7184,7 @@ class ModsTab(QWidget):
                 )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to kick but player not found")
+                no_player()
 
         elif cmd == '!ban':
             target = find_player(args[0]) if args else None
@@ -7145,23 +7208,30 @@ class ModsTab(QWidget):
                 )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to ban but player not found")
+                no_player()
 
         elif cmd == '!unban':
             bans_tab = getattr(self.server, '_bans_tab', None)
             value = " ".join(args).strip()
             if not value:
-                self._send_mod_chat("Usage: !unban <name or IP>", "Send unban usage")
+                refuse("Usage: !unban <name or IP>", "Send unban usage")
             elif bans_tab is None or not bans_tab.unban(value):
-                self._send_mod_chat(f"{value} is not on the ban list.", "Send unban reply")
+                # One line, or a fixed one: the name is the mod's own text.
+                refuse(
+                    one_chat_line(f"{value} is not on the ban list.", "That is not on the ban list."),
+                    "Send unban reply",
+                )
                 self.mod_log.addItem(f"[{now}] {sender} tried to unban {value} - not on the list")
             else:
-                self._send_mod_chat(f"{value} unbanned.", "Send unban reply")
+                self._send_mod_chat(
+                    one_chat_line(f"{value} unbanned.", "Unbanned."), "Send unban reply"
+                )
                 self.mod_log.addItem(f"[{now}] {sender} unbanned {value}")
 
         elif cmd == '!swap':
             target = find_player(args[0]) if args else None
             if target and coop_swaps_blocked(self.server):
-                self._send_mod_chat(coop_guard.REFUSAL, "Send co-op swap refusal")
+                refuse(coop_guard.REFUSAL, "Send co-op swap refusal")
                 self.mod_log.addItem(f"[{now}] {sender} tried to swap {target['name']} - refused, co-op map")
             elif target:
                 target_entry = player_entry_from_legacy(target)
@@ -7177,6 +7247,7 @@ class ModsTab(QWidget):
                 )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to swap but player not found")
+                no_player()
 
         elif cmd == '!kill':
             target = find_player(args[0]) if args else None
@@ -7192,6 +7263,7 @@ class ModsTab(QWidget):
                 )
             else:
                 self.mod_log.addItem(f"[{now}] {sender} tried to kill but player not found")
+                no_player()
 
         elif cmd == '!startgame':
             try:
@@ -7199,14 +7271,18 @@ class ModsTab(QWidget):
             except (start_game.StartGameError, weather.WeatherError) as exc:
                 wire_log(f"[MODS] !startgame failed: {exc}")
                 self.mod_log.addItem(f"[{now}] {sender} tried !startgame - {exc}")
-                self._send_mod_chat("Could not start the game early.", "Send start game error")
+                refuse("Could not start the game early.", "Send start game error",
+                       phone=f"Could not start the game early. {exc}")
                 return
             if outcome.kind == start_game.STARTED:
                 self.mod_log.addItem(
                     f"[{now}] {sender} started the game "
                     f"({outcome.seconds_before}s wait cut to {start_game.SECONDS_LEFT}s)"
                 )
-            self._send_mod_chat(start_game.reply_for(outcome), "Send start game reply")
+                self._send_mod_chat(start_game.reply_for(outcome), "Send start game reply")
+            else:
+                # nothing to cut short: about to start, or already started
+                refuse(start_game.reply_for(outcome), "Send start game reply")
 
         elif cmd == '!next':
             self._submit_mod_action(
@@ -7220,7 +7296,7 @@ class ModsTab(QWidget):
             if sender not in self.mods and sender != 'web_admin':
                 return
             if coop_swaps_blocked(self.server):
-                self._send_mod_chat(coop_guard.REFUSAL, "Send co-op swap refusal")
+                refuse(coop_guard.REFUSAL, "Send co-op swap refusal")
                 self.mod_log.addItem(f"[{now}] {sender} tried to mix teams - refused, co-op map")
                 return
             submit_team_workflow(
@@ -7236,7 +7312,7 @@ class ModsTab(QWidget):
             if sender not in self.mods and sender != 'web_admin':
                 return
             if coop_swaps_blocked(self.server):
-                self._send_mod_chat(coop_guard.REFUSAL, "Send co-op swap refusal")
+                refuse(coop_guard.REFUSAL, "Send co-op swap refusal")
                 self.mod_log.addItem(f"[{now}] {sender} tried to balance teams - refused, co-op map")
                 return
             submit_team_workflow(
@@ -7251,53 +7327,40 @@ class ModsTab(QWidget):
         elif cmd == '!time':
             if sender not in self.mods and sender != 'web_admin':
                 return
-            raw = args[0] if args else ''
-            # Strip colons: "09:31" -> "0931", "9:30" -> "930"
-            raw = raw.replace(':', '')
-            # Validate: must be all digits
-            if not raw.isdigit() or not raw:
-                self._send_mod_chat(
-                    "Usage: !time <0000-2300> e.g. !time 0100",
+            wanted = self._time_of_day(args[0] if args else '')
+            if wanted is None:
+                refuse(
+                    "Usage: !time <hhmm> e.g. !time 9 or !time 1830",
                     "Send time usage",
                 )
                 return
-            # Pad to 4 digits: "1" -> "0100", "13" -> "1300", "930" -> "0930"
-            if len(raw) == 1:
-                raw = raw + '00'
-            elif len(raw) == 2:
-                raw = raw + '00'
-            elif len(raw) == 3:
-                raw = '0' + raw
-            # Now raw is 4 digits: HHMM
-            hour = int(raw[:2])
-            minute = int(raw[2:])
-            # Clamp minutes to nearest hour (>=30 rounds up)
-            if minute >= 30:
-                hour += 1
-            # Wrap 24 -> 0
-            hour = hour % 24
-            time_str = f"{hour:02d}00"
+            # The time as typed: no rounding to the hour, never another hour.
+            hour, minute = wanted
+            time_str = f"{hour:02d}{minute:02d}"
             self._submit_mod_action(
                 lambda: self.server.set_time_of_day(time_str),
                 context="Set time of day",
                 announcement=(
-                    f"Time set to {hour:02d}:00"
+                    f"Time set to {hour:02d}:{minute:02d}"
                 ),
                 log_message=(
                     f"[{now}] {sender} requested time of day "
-                    f"{hour:02d}:00 (unverified)"
+                    f"{hour:02d}:{minute:02d} (unverified)"
                 ),
                 policy=CompletionPolicy.ACCEPTED,
             )
 
         elif cmd in weather.CHAT_COMMANDS:
             weather_tab = getattr(self.server, '_weather_tab', None)
-            reply = (
-                weather_tab.on_mod_command(display_name, cmd, args)
-                if weather_tab else "Weather is not available."
+            # (reply, refused): refused = nothing changed, the reply says why
+            reply, refused = (
+                weather_tab.mod_command(display_name, cmd, words)
+                if weather_tab else ("Weather is not available.", True)
             )
-            self.mod_log.addItem(f"[{now}] {sender} used {cmd} {' '.join(args)}".rstrip())
-            if reply:
+            self.mod_log.addItem(f"[{now}] {sender} used {cmd} {' '.join(words)}".rstrip())
+            if reply and refused:
+                refuse(reply, "Send weather reply")
+            elif reply:
                 self._send_mod_chat(reply, "Send weather reply")
 
         elif cmd == '!gametime':
@@ -7305,14 +7368,14 @@ class ModsTab(QWidget):
                 return
             raw = args[0] if args else ''
             if not raw.isdigit() or not raw:
-                self._send_mod_chat(
+                refuse(
                     "Usage: !gametime <1-240> minutes",
                     "Send game time usage",
                 )
                 return
             val = int(raw)
             if val < 1 or val > 240:
-                self._send_mod_chat(
+                refuse(
                     "Game time must be 1-240 minutes",
                     "Send game time range",
                 )
@@ -7341,13 +7404,13 @@ class ModsTab(QWidget):
                             self.server.mission_entries, filename
                         )
                     except ValueError:
-                        self._send_mod_chat(
+                        refuse(
                             f"Map is queued more than once: {name}",
                             "Reject ambiguous mission switch",
                         )
                         return
                     if entry is None:
-                        self._send_mod_chat(
+                        refuse(
                             f"Map queue changed: {name}",
                             "Reject stale mission switch",
                         )
@@ -7372,7 +7435,7 @@ class ModsTab(QWidget):
             # Queue Next; a map not in the rotation is added first.
             map_name = ' '.join(args) if args else ''
             if not map_name:
-                self._send_mod_chat("Usage: !setnext <map>", "Send setnext usage")
+                refuse("Usage: !setnext <map>", "Send setnext usage")
                 return
             name, filename, source = find_map(map_name)
             if not (name and filename):
@@ -7384,14 +7447,14 @@ class ModsTab(QWidget):
                 if m.filename.casefold() == filename.casefold()
             ]
             if len(queued) > 1:
-                self._send_mod_chat(
+                refuse(
                     f"Map is queued more than once: {name}",
                     "Reject ambiguous next mission",
                 )
                 self.mod_log.addItem(f"[{now}] {sender} tried !setnext {name} - queued more than once")
                 return
             if not queued and source == "rotation":
-                self._send_mod_chat(
+                refuse(
                     f"Map queue changed: {name}",
                     "Reject stale next mission",
                 )
@@ -7442,7 +7505,7 @@ class ModsTab(QWidget):
                     None,
                 )
                 if match is None:
-                    self._send_mod_chat(
+                    refuse(
                         f"{name} is not in the rotation",
                         "Send mission rotation response",
                     )
@@ -7456,7 +7519,7 @@ class ModsTab(QWidget):
                     ),
                 )
             elif name and filename and source == 'available':
-                self._send_mod_chat(
+                refuse(
                     f"{name} is not in the rotation",
                     "Send mission rotation response",
                 )

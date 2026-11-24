@@ -877,16 +877,17 @@ class BansTab(QWidget):
         return added
 
     def unban(self, value: str) -> int:
-        """Remove every entry matching this name or address text.  Returns how many."""
-        count = 0
-        for kind in (KIND_NAME, KIND_IP):
-            if self.bans.remove(kind, value):
-                count += 1
-        if count:
-            self.log(f"Unbanned {value}")
+        """Remove every entry matching this name or address text, and with a
+        name the addresses that were banned with it (so the player can join
+        again).  Returns how many."""
+        gone = self.bans.remove_with_linked(value)
+        if gone:
+            also = [e.value for e in gone if e.value.lower() != value.strip().lower()]
+            self.log(f"Unbanned {value}" + (
+                f" (and the address{'es' if len(also) > 1 else ''} {', '.join(also)})" if also else ""))
             self._dirty = True
             self._refresh_ban_table(); self.save()
-        return count
+        return len(gone)
 
     # ---- button handlers ----------------------------------------------------------
     def _expiry_code(self, combo: QComboBox) -> str:
