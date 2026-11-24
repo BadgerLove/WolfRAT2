@@ -180,6 +180,23 @@ class BanList:
         target[:] = [e for e in target if e.key() != (kind, value.lower())]
         return len(target) != before
 
+    def remove_with_linked(self, value: str) -> list:
+        """Unban a name or an address.  Returns the entries taken off.
+
+        A ban by name + IP is two entries, and the address entry says which
+        name it was banned with.  Taking only the name off would leave that
+        player locked out, so the address entries banned with the name go
+        too.  An address banned with another name, or typed in by hand, stays.
+        """
+        wanted = value.strip().lower()
+        if not wanted:
+            return []
+        gone = [e for e in self.entries
+                if e.value.lower() == wanted
+                or (e.kind == KIND_IP and e.linked.strip().lower() == wanted)]
+        self.entries[:] = [e for e in self.entries if not any(e is g for g in gone)]
+        return gone
+
     def purge_expired(self, now: float) -> int:
         before = len(self.entries)
         self.entries[:] = [e for e in self.entries if e.is_live(now)]

@@ -6128,7 +6128,7 @@ class ModsTab(QWidget):
     def _mod_commands():
         """Commands for mods (each rank allows some), plus the map vote numbers."""
         return {
-            '!warn', '!kick', '!ban', '!swap', '!kill', '!next', '!map',
+            '!warn', '!kick', '!ban', '!unban', '!swap', '!kill', '!next', '!map',
             '!setnext', '!add', '!remove', '!1', '!2', '!3', '!4', '!5',
             '!startvote', '!startgame', '!mixteams', '!balanceteams', '!time',
             '!gametime', *weather.CHAT_COMMANDS,
@@ -7148,10 +7148,16 @@ class ModsTab(QWidget):
             if not value:
                 self._send_mod_chat("Usage: !unban <name or IP>", "Send unban usage")
             elif bans_tab is None or not bans_tab.unban(value):
-                self._send_mod_chat(f"{value} is not on the ban list.", "Send unban reply")
+                # One line, or a fixed one: the name is the mod's own text.
+                self._send_mod_chat(
+                    one_chat_line(f"{value} is not on the ban list.", "That is not on the ban list."),
+                    "Send unban reply",
+                )
                 self.mod_log.addItem(f"[{now}] {sender} tried to unban {value} - not on the list")
             else:
-                self._send_mod_chat(f"{value} unbanned.", "Send unban reply")
+                self._send_mod_chat(
+                    one_chat_line(f"{value} unbanned.", "Unbanned."), "Send unban reply"
+                )
                 self.mod_log.addItem(f"[{now}] {sender} unbanned {value}")
 
         elif cmd == '!swap':
