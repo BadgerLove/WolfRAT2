@@ -11,9 +11,10 @@ device key. Keys are kept as SHA-256 hashes; signing a device out (or a new
 access token) ends its key and closes its open connections.
 
 Alerts and notifications: the server keeps the last 100 events (joins,
-leaves, maps, votes, admin actions, the game server link) for the page's
-bell, and sends a phone notification for the first players who join a server
-that has been empty (web_events.py has the rules, web_push.py sends).
+leaves, maps, votes, admin actions, zones and flags, the game server going
+down) for the page's bell, and sends phone notifications. Each signed-in
+phone chooses the kinds it wants, for its bell and for its notifications
+(web_events.py has the rules, web_push.py sends).
 
 Behind a proxy on this PC (nginx for an https:// address), the phone's
 address is the last X-Forwarded-For entry; the header is read from loopback
@@ -483,6 +484,7 @@ class WolfWebServer:
         self._push_session_loop = None
         self._push_failing = set()       # device ids whose last push failed (logged once)
         self._tasks = set()              # notification sends in flight
+        self._notice_loop = None         # the loop they go out on (set while the server runs)
         self._watch_task = None
         self._watch_error_logged = False
         # The bell: the last 100 events, in memory only.
@@ -554,6 +556,8 @@ class WolfWebServer:
         router.add_post('/api/push/unsubscribe', protect(self._handle_push_unsubscribe))
         router.add_post('/api/push/test', protect(self._handle_push_test))
         router.add_post('/api/push/settings', protect(self._handle_push_settings))
+        router.add_get('/api/alerts/prefs', protect(self._handle_alert_prefs))
+        router.add_post('/api/alerts/prefs', protect(self._handle_alert_prefs_update))
         router.add_get('/ws', protect(self._handle_websocket, query_key=True))
         return application
 
@@ -731,6 +735,9 @@ class WolfWebServer:
             push = self._push_record(record.get('push'))
             if push is not None:
                 loaded[device_id]['push'] = push
+            alerts = self._alerts_record(record.get('alerts'))
+            if alerts is not None:
+                loaded[device_id]['alerts'] = alerts
         with self._auth_lock:
             self._devices = loaded
 
@@ -747,6 +754,21 @@ class WolfWebServer:
         if len(p256dh) > 200 or len(auth) > 100:
             return None
         return {'endpoint': endpoint, 'p256dh': p256dh, 'auth': auth}
+
+    @staticmethod
+    def _alerts_record(value):
+        """A phone's saved alert choices {bell: {group: bool}, phone: {...}} made
+        whole (a damaged switch goes back to its default), or None when it
+        saved none: then the defaults apply."""
+        if not isinstance(value, Mapping):
+            return None
+        return web_events.clean_prefs(value)
+
+    def _alert_prefs(self, device_id):
+        """This device's alert choices, whole (the defaults until it chose)."""
+        with self._auth_lock:
+            record = self._devices.get(device_id) if device_id else None
+            return web_events.clean_prefs(record.get('alerts') if record else None)
 
     @staticmethod
     def _int_or_none(value):
@@ -1431,9 +1453,17 @@ class WolfWebServer:
     # --- The bell: events ---
 
     def add_event(self, kind, text, name=None, ts=None):
-        """Keep one event for the bell and push it to every open page (any thread)."""
+        """Keep one event for the bell, push it to every open page and notify
+        the phones that asked for its kind (any thread).
+
+        Every page gets every event; each page lists the kinds its phone
+        switched on.
+        """
         event = self._events.add(kind, text, name, ts)
         self._push_to_pages({'type': 'event', 'event': event})
+        group = web_events.group_of(event['kind'])
+        if group in web_events.EVENT_NOTICE_GROUPS:
+            self._notify_group(group, event['text'])
         return event
 
     def admin_event(self, kind, name, who=None):
@@ -1465,9 +1495,11 @@ class WolfWebServer:
 
     async def _start_watching(self, _application):
         """Web thread, as the server starts: a new baseline, then a check every
-        few seconds (the timers: gone 2 minutes, empty 10, link down 2)."""
+        few seconds (the timers: gone 2 minutes, empty 10, link down 2 and 3)."""
         self._reset_watch()
-        self._watch_task = asyncio.get_running_loop().create_task(self._watch_loop())
+        loop = asyncio.get_running_loop()
+        self._notice_loop = loop
+        self._watch_task = loop.create_task(self._watch_loop())
 
     async def _watch_loop(self):
         while True:
@@ -1478,6 +1510,8 @@ class WolfWebServer:
         """Web thread, as the server stops: end the checks and sends, close the
         notification session."""
         loop = asyncio.get_running_loop()
+        if self._notice_loop is loop:
+            self._notice_loop = None         # no new sends from here on
         task, self._watch_task = self._watch_task, None
         pending = [item for item in (task, *self._tasks)
                    if item is not None and not item.done() and item.get_loop() is loop]
@@ -1503,7 +1537,15 @@ class WolfWebServer:
             player.name for player in tuple(self.sm.player_entries or ())
             if player.server_id != 0               # the host slot is not a player
         ]
-        events = list(self._link_watch.update(connected, now))
+        # Two plain flags of the server manager: its last try to connect was
+        # refused (the game server is not running), and the admin pressed
+        # Disconnect on the PC (never a server going down).
+        link_events, notices = self._link_watch.update(
+            connected, now,
+            refused=bool(getattr(self.sm, 'connect_refused', False)),
+            on_purpose=bool(getattr(self.sm, 'disconnected_on_purpose', False)),
+        )
+        events = list(link_events)
         player_events, joins = self._players_watch.update(
             connected, names, now, self.notify_first_joins
         )
@@ -1519,6 +1561,8 @@ class WolfWebServer:
             self.add_event(event.kind, event.text, event.name, event.ts)
         if joins:
             self._notify_joins(joins)
+        for text in notices:
+            self._notify_group('server', text)
 
     # --- Phone notifications (Web Push) ---
 
@@ -1605,15 +1649,26 @@ class WolfWebServer:
             name = str((self.sm.game_settings or {}).get('servername') or '').strip()
         return str(name or 'WolfRAT')[:60]
 
-    async def _send_to_phones(self, payload, only=None):
-        """Send one notification to every subscribed phone (or only to device
-        ``only``). Returns {device id: (ok, gone, error)}."""
+    @staticmethod
+    def _wants(record, group):
+        """True when this device has notifications on and ``group`` switched on
+        for them (``group`` None = any notification)."""
+        if not record.get('push'):
+            return False
+        if group is None:
+            return True
+        return web_events.clean_prefs(record.get('alerts'))['phone'].get(group, False)
+
+    async def _send_to_phones(self, payload, only=None, group=None):
+        """Send one notification to every subscribed phone: only to device
+        ``only`` when given, only to the phones that have ``group`` switched on
+        when given. Returns {device id: (ok, gone, error)}."""
         web_push = _web_push()
         with self._auth_lock:
             targets = [
                 (device_id, dict(record['push']))
                 for device_id, record in self._devices.items()
-                if record.get('push') and (only is None or device_id == only)
+                if self._wants(record, group) and (only is None or device_id == only)
             ]
         if not targets:
             return {}
@@ -1645,24 +1700,45 @@ class WolfWebServer:
             outcome[device_id] = (ok, gone, error)
         return outcome
 
-    def _notify_joins(self, joins):
-        """Web thread: one notification per join to every subscribed phone."""
+    def _notify_group(self, group, body, url='/#now'):
+        """One notification to every phone that has ``group`` switched on (any
+        thread: it is sent on the web server's own loop).  Nothing happens
+        when no phone wants it or the web server is not running."""
         with self._auth_lock:
-            anyone = any(record.get('push') for record in self._devices.values())
+            anyone = any(self._wants(record, group) for record in self._devices.values())
         if not anyone or not self._push_available():
             return
-        title = self._push_title()
-        for join in joins:
-            self._spawn(self._send_notice({
-                'title': title,
-                'body': web_events.join_body(join),
-                'tag': 'join',
-                'url': '/#players',
-            }))
-
-    async def _send_notice(self, payload):
+        loop = self._notice_loop
+        if loop is None or loop.is_closed():
+            return
+        payload = {'title': self._push_title(), 'body': str(body), 'tag': group, 'url': url}
         try:
-            await self._send_to_phones(payload)
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if loop is running:
+            self._spawn_notice(payload, group)
+            return
+        try:
+            loop.call_soon_threadsafe(self._spawn_notice, payload, group)
+        except RuntimeError:
+            pass                             # the web server stopped meanwhile
+
+    def _spawn_notice(self, payload, group):
+        """Web thread: start one send (none once the server is stopping)."""
+        if self._notice_loop is not asyncio.get_running_loop():
+            return
+        self._spawn(self._send_notice(payload, group))
+
+    def _notify_joins(self, joins):
+        """Web thread: one notification per join to every phone that has joins
+        switched on."""
+        for join in joins:
+            self._notify_group('join', web_events.join_body(join), url='/#players')
+
+    async def _send_notice(self, payload, group=None):
+        try:
+            await self._send_to_phones(payload, group=group)
         except Exception as error:
             wire_log(f"WEB PUSH: sending a notification failed: {error}")
 
@@ -1782,6 +1858,38 @@ class WolfWebServer:
             wire_log(f"WEB PUSH: notify the first {first} players who join an empty server")
             self._devices_changed()
         return web.json_response({'ok': True, 'first_joins': first})
+
+    async def _handle_alert_prefs(self, request):
+        """GET /api/alerts/prefs - what this phone hears about: for its bell and
+        for its notifications, one switch per group."""
+        return web.json_response(
+            web_events.prefs_reply(self._alert_prefs(request.get(_DEVICE_ID)))
+        )
+
+    async def _handle_alert_prefs_update(self, request):
+        """POST /api/alerts/prefs {bell?: {group: bool}, phone?: {group: bool}} -
+        set some of this phone's switches; the answer is all of them.  A group
+        or a value that is not one of ours changes nothing (400)."""
+        try:
+            body = await self._json_object(request)
+        except BadRequestBody as error:
+            return web.json_response({'error': str(error)}, status=400)
+        device_id = request.get(_DEVICE_ID)
+        with self._auth_lock:
+            device = self._devices.get(device_id)
+            if device is None:
+                return web.json_response({'error': 'Unauthorized'}, status=401)
+            current = web_events.clean_prefs(device.get('alerts'))
+            prefs, reason = web_events.changed_prefs(current, body)
+            changed = reason is None and prefs != current
+            if changed:
+                device['alerts'] = prefs     # saved with this phone's record
+        if reason is not None:
+            return web.json_response({'error': reason}, status=400)
+        if changed:
+            wire_log(f"WEB: device {device_id} changed what it hears about")
+            self._devices_changed()
+        return web.json_response(web_events.prefs_reply(prefs))
 
     def _chat_rows(self, count):
         """The last chat lines, each with "kind" (player / wolfrat / console)
