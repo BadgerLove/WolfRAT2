@@ -139,6 +139,7 @@ class CommandRig:
         monkeypatch.setattr(app_module, "submit_team_workflow", submit_team_workflow)
         monkeypatch.setattr(app_module.start_game, "start_local_server", self._start_game)
         self.start_outcome = app_module.start_game.Outcome(app_module.start_game.STARTED, 30)
+        self.game_starts = 0
 
         folder = tmp_path / "server"
         folder.mkdir()
@@ -189,6 +190,7 @@ class CommandRig:
         self.server._map_voting_tab = self.map_vote
 
     def _start_game(self):
+        self.game_starts += 1
         if isinstance(self.start_outcome, Exception):
             raise self.start_outcome
         return self.start_outcome
