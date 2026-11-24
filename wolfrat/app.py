@@ -6134,6 +6134,27 @@ class ModsTab(QWidget):
             '!gametime', *weather.CHAT_COMMANDS,
         }
 
+    @staticmethod
+    def _time_of_day(text):
+        """What was typed after !time, as (hour, minute); None when it is not
+        a time.  "9" and "09" are 09:00, "930" and "9:30" are 09:30, "1830"
+        and "18:30" are 18:30."""
+        text = str(text or "").strip()
+        if ':' in text:
+            hours, _, minutes = text.partition(':')
+            if len(minutes) != 2:
+                return None
+        elif len(text) <= 2:
+            hours, minutes = text, '00'
+        else:
+            hours, minutes = text[:-2], text[-2:]
+        if not (text.isascii() and hours.isdigit() and minutes.isdigit()) or len(hours) > 2:
+            return None
+        hour, minute = int(hours), int(minutes)
+        if hour > 23 or minute > 59:
+            return None
+        return hour, minute
+
     def run_web_command(self, message):
         """A !command typed on the phone page: run it here as Web Admin.
 
@@ -6436,7 +6457,8 @@ class ModsTab(QWidget):
             ("!setnext <name>", "Make a map the next one, without skipping this one "
              "(added to the rotation if it isn't in it)", False),
             ("!gametime <1-240>", "Set the game time in minutes", False),
-            ("!time <0000-2300>", "Set time of day (!time 930 becomes 1000)", False),
+            ("!time <hhmm>", "Set time of day: !time 9 is 09:00, !time 1830 or "
+             "!time 18:30 is 18:30", False),
         )),
         ("Weather (mods - switch on in the Weather tab)", (
             ("!storm [minutes]", "Rain, dark cloud and fog. !storm 10 lasts ten minutes", False),
@@ -7256,41 +7278,25 @@ class ModsTab(QWidget):
         elif cmd == '!time':
             if sender not in self.mods and sender != 'web_admin':
                 return
-            raw = args[0] if args else ''
-            # Strip colons: "09:31" -> "0931", "9:30" -> "930"
-            raw = raw.replace(':', '')
-            # Validate: must be all digits
-            if not raw.isdigit() or not raw:
+            wanted = self._time_of_day(args[0] if args else '')
+            if wanted is None:
                 self._send_mod_chat(
-                    "Usage: !time <0000-2300> e.g. !time 0100",
+                    "Usage: !time <hhmm> e.g. !time 9 or !time 1830",
                     "Send time usage",
                 )
                 return
-            # Pad to 4 digits: "1" -> "0100", "13" -> "1300", "930" -> "0930"
-            if len(raw) == 1:
-                raw = raw + '00'
-            elif len(raw) == 2:
-                raw = raw + '00'
-            elif len(raw) == 3:
-                raw = '0' + raw
-            # Now raw is 4 digits: HHMM
-            hour = int(raw[:2])
-            minute = int(raw[2:])
-            # Clamp minutes to nearest hour (>=30 rounds up)
-            if minute >= 30:
-                hour += 1
-            # Wrap 24 -> 0
-            hour = hour % 24
-            time_str = f"{hour:02d}00"
+            # The time as typed: no rounding to the hour, never another hour.
+            hour, minute = wanted
+            time_str = f"{hour:02d}{minute:02d}"
             self._submit_mod_action(
                 lambda: self.server.set_time_of_day(time_str),
                 context="Set time of day",
                 announcement=(
-                    f"Time set to {hour:02d}:00"
+                    f"Time set to {hour:02d}:{minute:02d}"
                 ),
                 log_message=(
                     f"[{now}] {sender} requested time of day "
-                    f"{hour:02d}:00 (unverified)"
+                    f"{hour:02d}:{minute:02d} (unverified)"
                 ),
                 policy=CompletionPolicy.ACCEPTED,
             )
