@@ -7,7 +7,8 @@ writing.  Slot 0 is the host itself (no network player).
 
 Also read here, for the vote and announcer rules: AAS zone owners, the game
 type (values in coop_guard.GAME_TYPES), co-op objectives and AI left, and
-CTF / Flagball captures against the win target.
+CTF / Flagball captures against the win target.  For the phone page's score
+card: the hill clocks on King of the Hill and Team King of the Hill.
 
 Addresses and how each was found: WolfRAT vault, Systems/Memory Map.md.
 """
@@ -47,6 +48,18 @@ CTF_GOAL_VA = {1: 0xC8FF00, 2: 0xC8FEFC}
 MAX_SCORE_VA = 0x24D2138
 GAME_CTF, GAME_FB = 0x10004, 0x10008
 NO_LIMIT = 65000
+GAME_KOTH, GAME_TKOTH = 0x00001, 0x10001
+HILL_GAME_TYPES = (GAME_KOTH, GAME_TKOTH)
+HILL_LIMIT_VA = 0x24D2144       # minutes a hill clock must reach; then the delta, in seconds
+HILL_NO_LIMIT = 100000          # this and above (or 0 and below) = no hill limit
+TEAM_RECORD_VA, TEAM_RECORD_STRIDE = 0xC87B10, 0x154
+TEAM_HOLDERS_OFFSET = 0x14C     # live players of the team in the hill zone, then its clock
+SLOT_USED_OFFSET, SLOT_STATE_OFFSET = 4, 0x20
+STATE_PLAYING = 6
+SLOT_ZONE_MASK_OFFSET = 0x15F0C  # bit 0 = inside a hill zone now
+SLOT_HILL_OFFSET = 0x170AC      # the player's own hill clock, in seconds
+MAX_HILL_SECONDS = 86400
+MAX_HOLDERS = 256
 AI_GROUPS_VA = 0xA33FA4
 AI_GROUP_STRIDE, AI_GROUP_COUNT = 48, 64
 AI_INITIAL_OFFSET, AI_LIVE_OFFSET = 4, 8
@@ -65,6 +78,30 @@ class ZoneInfo:
     tier: int
     team: int
     pos: Optional[tuple] = None
+
+
+@dataclass(frozen=True)
+class HillTeam:
+    team: int            # 1 Joint Ops, 2 Rebels
+    hold_s: int          # where the team's hill clock stands, in seconds
+    holders: int         # its live players inside the hill zone now
+
+
+@dataclass(frozen=True)
+class HillPlayer:
+    name: str
+    hold_s: int          # the player's own hill clock, in seconds
+    in_zone: bool
+
+
+@dataclass(frozen=True)
+class HillInfo:
+    """The hill clocks: ``teams`` on Team King of the Hill (Joint Ops first),
+    ``players`` on King of the Hill."""
+    limit_s: Optional[int]       # seconds a clock must reach to win, None = no limit
+    delta: int                   # seconds a team's clock loses each second it is off the hill
+    teams: tuple = ()
+    players: tuple = ()
 
 
 class LocalServerPlayers:
@@ -249,18 +286,66 @@ class LocalServerPlayers:
         except Exception:
             return None
 
+    def _cap_numbers(self) -> tuple:
+        """(captures, CTF targets, Flagball target) as the server holds them now."""
+        dword = lambda va: struct.unpack("<i", self._memory.read(va, 4))[0]
+        caps = {t: dword(va + CAPS_OFFSET) for t, va in TEAM_SCORE_VA.items()}
+        goal = {t: dword(va) for t, va in CTF_GOAL_VA.items()}
+        return caps, goal, dword(MAX_SCORE_VA)
+
     def read_caps_to_go(self, game_type) -> Optional[int]:
         """caps_to_go() from the live server, None off CTF/Flagball."""
         if game_type not in (GAME_CTF, GAME_FB) or not self._attach():
             return None
-        dword = lambda va: struct.unpack("<i", self._memory.read(va, 4))[0]
         try:
-            caps = {t: dword(va + CAPS_OFFSET) for t, va in TEAM_SCORE_VA.items()}
-            goal = {t: dword(va) for t, va in CTF_GOAL_VA.items()}
-            max_score = dword(MAX_SCORE_VA)
+            caps, goal, max_score = self._cap_numbers()
         except Exception:
             return None
         return caps_to_go(game_type, caps, goal, max_score)
+
+    def read_cap_goals(self, game_type) -> Optional[dict]:
+        """cap_goals() from the live server, None off CTF/Flagball."""
+        if game_type not in (GAME_CTF, GAME_FB) or not self._attach():
+            return None
+        try:
+            _caps, goal, max_score = self._cap_numbers()
+        except Exception:
+            return None
+        return cap_goals(game_type, goal, max_score)
+
+    def read_hill(self, game_type) -> Optional[HillInfo]:
+        """The hill clocks on King of the Hill / Team King of the Hill, else None.
+        None too when a value read makes no sense: better no card than a wrong one."""
+        if game_type not in HILL_GAME_TYPES or not self._attach():
+            return None
+        mem = self._memory
+        try:
+            limit, delta = struct.unpack("<ii", mem.read(HILL_LIMIT_VA, 8))
+            if game_type == GAME_TKOTH:
+                teams = []
+                for team in (1, 2):
+                    record = TEAM_RECORD_VA + TEAM_RECORD_STRIDE * team
+                    holders, clock = struct.unpack("<ii", mem.read(record + TEAM_HOLDERS_OFFSET, 8))
+                    teams.append(HillTeam(team, clock, holders))
+                return hill_info(limit, delta, teams=teams)
+            capacity = struct.unpack("<I", mem.read(CAPACITY_VA, 4))[0]
+            base = struct.unpack("<I", mem.read(SLOTPTR_VA, 4))[0]
+            if not base or capacity == 0 or capacity > MAX_CAPACITY:
+                return None
+            players = []
+            for index in range(1, capacity):         # slot 0 is the host
+                slot = base + index * SLOT_STRIDE
+                head = mem.read(slot, NAME_OFFSET + NAME_LEN)
+                if not head[SLOT_USED_OFFSET]:
+                    continue
+                name = head[NAME_OFFSET:NAME_OFFSET + NAME_LEN].split(b"\0", 1)[0].decode("latin-1", "replace")
+                playing = struct.unpack_from("<I", head, SLOT_STATE_OFFSET)[0] == STATE_PLAYING
+                mask = struct.unpack("<I", mem.read(slot + SLOT_ZONE_MASK_OFFSET, 4))[0]
+                clock = struct.unpack("<i", mem.read(slot + SLOT_HILL_OFFSET, 4))[0]
+                players.append(HillPlayer(name, clock, playing and bool(mask & 1)))
+            return hill_info(limit, delta, players=players)
+        except Exception:
+            return None
 
     def read_ai_left(self) -> Optional[tuple]:
         """ai_left() from the live server."""
@@ -294,6 +379,32 @@ def caps_to_go(game_type, caps: dict, ctf_goal: dict, max_score: int):
             return None
         return max(0, max_score - max(caps.values()))
     return None
+
+
+def cap_goals(game_type, ctf_goal: dict, max_score: int) -> Optional[dict]:
+    """{1: n, 2: n}: the flags (CTF) or goals (Flagball) each team needs to win,
+    or None when there is no target."""
+    if game_type == GAME_CTF:
+        goals = {t: int(ctf_goal.get(t, 0)) for t in (1, 2)}
+        return goals if all(0 < n < NO_LIMIT for n in goals.values()) else None
+    if game_type == GAME_FB:
+        return {1: int(max_score), 2: int(max_score)} if 0 < max_score < NO_LIMIT else None
+    return None
+
+
+def hill_info(limit_minutes: int, delta: int, teams=(), players=()) -> Optional[HillInfo]:
+    """HillInfo from the numbers as read, or None when one of them cannot be
+    right (a clock below 0 or over a day, more holders than slots, a delta
+    below 0 or over a day)."""
+    clocks = [t.hold_s for t in teams] + [p.hold_s for p in players]
+    if any(not 0 <= clock <= MAX_HILL_SECONDS for clock in clocks):
+        return None
+    if any(not 0 <= t.holders <= MAX_HOLDERS for t in teams):
+        return None
+    if not 0 <= delta <= MAX_HILL_SECONDS:
+        return None
+    limit_s = 60 * limit_minutes if 0 < limit_minutes < HILL_NO_LIMIT else None
+    return HillInfo(limit_s, int(delta), tuple(teams), tuple(players))
 
 
 def ai_left(table: bytes):

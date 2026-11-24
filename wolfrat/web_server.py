@@ -547,6 +547,8 @@ class WolfWebServer:
         router.add_post('/api/weather', protect(self._handle_weather))
         router.add_post('/api/lagcomp', protect(self._handle_lagcomp))
         router.add_post('/api/mode', protect(self._handle_mode))
+        router.add_post('/api/sky', protect(self._handle_sky))
+        router.add_post('/api/timeleft', protect(self._handle_timeleft))
         # The bell and phone notifications.
         router.add_get('/api/events', protect(self._handle_events))
         router.add_get('/api/push', protect(self._handle_push))
@@ -1906,6 +1908,9 @@ class WolfWebServer:
             'manual_switch': False,
             'set_next': False,
             'ban_expiry': [],
+            'sky': False,
+            'sky_scenes': [],
+            'time_left': False,
         }
         if self.on_desktop is not None:
             features.update(desktop_features or {})
@@ -1959,6 +1964,11 @@ class WolfWebServer:
             'vote': self._json_safe(top.get('vote')),
             'weather': self._json_safe(top.get('weather')),
             'lag_comp': self._json_safe(top.get('lag_comp')),
+            # What decides the match (zones, the hill, flags, co-op), the sky
+            # scene showing, and the round length WolfRAT will put back.
+            'objective': self._json_safe(top.get('objective')),
+            'sky': self._json_safe(top.get('sky')),
+            'time_restore': self._json_safe(top.get('time_restore')),
             'features': self._json_safe(self._features(top.get('features'))),
             # The bell: the newest events (oldest first) and the newest id.
             'events': self._events.recent(web_events.STATE_EVENTS),
@@ -2619,6 +2629,14 @@ class WolfWebServer:
     async def _handle_mode(self, request):
         """POST /api/mode {mode: full|manual}: Manual mode for this server."""
         return await self._desktop_route(request, 'mode', ('mode',))
+
+    async def _handle_sky(self, request):
+        """POST /api/sky {scene: an id from features.sky_scenes | "off", minutes?}."""
+        return await self._desktop_route(request, 'sky', ('scene', 'minutes'))
+
+    async def _handle_timeleft(self, request):
+        """POST /api/timeleft {minutes: 1-240}: the time left on the running map."""
+        return await self._desktop_route(request, 'timeleft', ('minutes',))
 
     async def _handle_map_setnext(self, request):
         """POST /api/map/setnext {filename, index} - the desktop's Queue Next."""

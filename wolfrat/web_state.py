@@ -13,7 +13,9 @@ from typing import Iterable, Optional
 
 from wolfrat import coop_guard
 from wolfrat import vote_rules
+from wolfrat.jo_players import GAME_CTF, GAME_FB, GAME_KOTH, GAME_TKOTH
 from wolfrat.lag_comp import band_of
+from wolfrat.zone_rules import zone_letter
 
 TEAM_NAMES = {1: "Joint Ops", 2: "Rebels"}
 
@@ -43,6 +45,8 @@ FAMILY_CODES = {
 }
 
 _MAP_SUFFIX = re.compile(r"(?i)\.(?:bms|npj|npz)$")
+# King of the Hill (every player for themselves): this many players on the card.
+HILL_SOLO_ROWS = 5
 
 
 def ping_band(ping) -> Optional[int]:
@@ -184,6 +188,68 @@ def server_block(sm, map_titles=None, *, game_type=None, time_left=None) -> dict
         "time_left_min": left,
         "time_limit_min": limit,
     }
+
+
+def objective_block(game_type, zones, hill, caps, goals, coop_objectives, ai_left) -> Optional[dict]:
+    """The page's "objective" object: what decides the running match, or None
+    (Team Deathmatch, Deathmatch, a server on another PC, nothing read).
+
+    ``zones``: objects with .tier and .team; ``hill``: jo_players.HillInfo;
+    ``caps`` / ``goals``: {1: n, 2: n}; ``coop_objectives``: (done, total);
+    ``ai_left``: (alive, at start).  Team numbers are text keys, as the page gets them.
+    """
+    if game_type is None:
+        return None
+    if coop_guard.is_coop(game_type):
+        if not coop_objectives:
+            return None
+        done, total = coop_objectives
+        alive, start = ai_left if ai_left else (None, None)
+        return {"kind": "coop", "objectives_done": int(done), "objectives_total": int(total),
+                "ai_alive": alive, "ai_start": start}
+    if vote_rules.family_from_game_type(game_type) == vote_rules.MODE_AS:
+        rows = [{"letter": zone_letter(zone.tier),
+                 "team": int(zone.team) if int(zone.team) in TEAM_NAMES else 0}
+                for zone in sorted(zones or (), key=lambda zone: int(zone.tier))]
+        if not rows:
+            return None
+        held = {str(team): sum(1 for row in rows if row["team"] == team) for team in TEAM_NAMES}
+        return {"kind": "zones", "zones": rows, "held": held,
+                "neutral": len(rows) - sum(held.values()), "total": len(rows)}
+    if game_type == GAME_TKOTH:
+        by_team = {row.team: row for row in getattr(hill, "teams", ())}
+        if set(by_team) != set(TEAM_NAMES):
+            return None
+        limit = hill.limit_s
+        return {"kind": "hill_team", "limit_s": limit, "delta": int(hill.delta),
+                "teams": [{"team": team, "hold_s": int(by_team[team].hold_s),
+                           "left_s": _hill_left(limit, by_team[team].hold_s),
+                           "holders": int(by_team[team].holders)}
+                          for team in sorted(TEAM_NAMES)]}
+    if game_type == GAME_KOTH:
+        if hill is None:
+            return None
+        limit = hill.limit_s
+        on_card = sorted((row for row in hill.players if row.hold_s > 0 or row.in_zone),
+                         key=lambda row: (-row.hold_s, not row.in_zone, row.name.casefold()))
+        return {"kind": "hill_solo", "limit_s": limit,
+                "in_zone": sum(1 for row in hill.players if row.in_zone),
+                "players": [{"name": row.name, "hold_s": int(row.hold_s),
+                             "left_s": _hill_left(limit, row.hold_s), "in_zone": bool(row.in_zone)}
+                            for row in on_card[:HILL_SOLO_ROWS]]}
+    if game_type in (GAME_CTF, GAME_FB):
+        if not caps:
+            return None
+        return {"kind": "flags", "mode": "ctf" if game_type == GAME_CTF else "fb",
+                "caps": {str(team): int(caps.get(team, 0)) for team in sorted(TEAM_NAMES)},
+                "goal": ({str(team): int(goals[team]) for team in sorted(TEAM_NAMES)}
+                         if goals and all(goals.get(team) for team in TEAM_NAMES) else None)}
+    return None
+
+
+def _hill_left(limit_s, hold_s) -> Optional[int]:
+    """Seconds a hill clock still needs to win; None when the server has no hill limit."""
+    return None if limit_s is None else max(0, int(limit_s) - int(hold_s))
 
 
 def next_map_block(sm, map_titles=None) -> Optional[dict]:

@@ -9976,6 +9976,8 @@ class MainWindow(QMainWindow):
         # commands and the phone's buttons), and a look at the player list
         # after every update (joins, leaves, notifications).
         self.mods_tab.on_admin_event = self.web_server.admin_event
+        # A zone, a flag or the hill changing hands (the Bans tab sees it in its poll).
+        self.bans_tab.on_objective_event = self.web_server.add_event
         self.signals.players_signal.connect(lambda _players: self.web_server.watch_now())
         for signal in (
             self.signals.missions_signal,

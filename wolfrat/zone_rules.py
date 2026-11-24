@@ -27,6 +27,12 @@ def zone_name(tier: int) -> str:
     return NATO[tier - 1] if 1 <= tier <= len(NATO) else f"Zone {tier}"
 
 
+def zone_letter(tier: int) -> str:
+    """Tier 1 = A ... 26 = Z, the letter on the zone in the game; past that the number."""
+    tier = int(tier)
+    return chr(64 + tier) if 1 <= tier <= 26 else str(tier)
+
+
 def team_name(team: int) -> str:
     return TEAM_NAMES.get(int(team), f"team {team}")
 

@@ -661,6 +661,49 @@ class SkyPage(QWidget):
             return "Sky: ready after the next map change."
         return None
 
+    # ------------------------------------------- the phone page (Web Admin)
+    def phone_scenes(self) -> list:
+        """Every scene on this page, in its order, with the colours players see."""
+        return [{"id": scene.key, "label": scene.label, "own": not scene.builtin,
+                 "colours": scene.look.to_json()["colours"]} for scene in self.scenes()]
+
+    def phone_state(self) -> Optional[dict]:
+        """The sky showing now, for the phone; None when this server cannot do
+        sky colours at all (no server on this PC, or an exe without the patch)."""
+        if self._memory is None or not self._capable:
+            return None
+        active = self.keeper.active
+        key = active.scene.key if active is not None else None
+        if key is not None and all(scene.key != key for scene in self.scenes()):
+            key = None                      # a "Try it" look: not one of the scenes
+        problem = self.chat_problem()
+        return {"summary": self.keeper.describe(), "scene": key,
+                "problem": problem[:80] if problem else None}
+
+    def phone_show(self, key: str, minutes: Optional[int], who: str) -> tuple:
+        """A scene picked on the phone: what the scene button does, with the
+        phone's own minutes (None = until the map changes) and ``who`` in the
+        log.  The admin pressed it, so the mods' !sky box does not matter.
+        Returns (done, text for the phone)."""
+        problem = self.chat_problem()
+        if problem:
+            return False, problem
+        scene = self.scene(key)
+        if scene is None:
+            return False, "Sky: no scene with that name."
+        minutes = int(minutes) if minutes else None
+        self._do(self.keeper.show(scene, "page", minutes, who))
+        span = f"for {minutes} min" if minutes else "until the map changes"
+        return True, f"Sky: {scene.label} {span}."
+
+    def phone_off(self, who: str) -> tuple:
+        """The map's own sky from the phone: what the "Map's own sky" button does."""
+        problem = self.chat_problem()
+        if problem:
+            return False, problem
+        self._do(self.keeper.off(who))
+        return True, "Sky: back to the map's own."
+
     def coloured_strike(self, sender: str, rgb, far: bool = False) -> Optional[str]:
         """``!lightning red``: colour, strike, colour back (Dale's spec 2026-10-05:
         "check lightning's white, request is red, slap red down, return to white")."""

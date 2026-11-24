@@ -7,12 +7,17 @@ Two jobs:
   returns a ``concurrent.futures.Future``; the window's thread runs the action
   through the desktop's own code (the Mods tab's kick/ban/warn path with its
   log line and announcement, the Bans tab's list, the Weather tab's
-  ``_start``, the lag comp panel's own box and list, Manual mode's switch)
-  and settles the Future with the result dict the phone gets.
-* **Snapshot.** What only the window knows (game type, the vote, weather,
-  lag comp, career ranks, countries, time on the server, what this WolfRAT
-  can do) is built here and published whole as ``WolfWebServer.desktop_state``;
-  the web thread only ever reads that object.
+  ``_start``, the Sky page's scene buttons, the lag comp panel's own box and
+  list, Manual mode's switch) and settles the Future with the result dict the
+  phone gets.
+* **Snapshot.** What only the window knows (game type, what decides the
+  match, the vote, weather, the sky, lag comp, career ranks, countries, time
+  on the server, what this WolfRAT can do) is built here and published whole
+  as ``WolfWebServer.desktop_state``; the web thread only ever reads that object.
+
+The phone's "time left on this map" is for one round: after every poll
+``check_time_restore`` puts the round length back once that round is over
+(web_timeleft.py).
 
 Result dicts: ``{"ok", "accepted", "replies", "error"?, "status"?}``;
 "status" is the HTTP status the web server should use (400 bad input, 409
@@ -29,8 +34,10 @@ from PyQt6.QtCore import QObject, Qt, QTimer, pyqtSignal
 from wolfrat import coop_guard
 from wolfrat import lag_comp
 from wolfrat import manual_mode
+from wolfrat import sky
 from wolfrat import weather
 from wolfrat import web_state
+from wolfrat import web_timeleft
 from wolfrat.ban_rules import KIND_IP
 from wolfrat.map_timeline import MapClock
 from wolfrat.protocol import wire_log
@@ -46,6 +53,9 @@ REVISIT_SECONDS = 600
 TUNE_BY_NAME = {name: mode for mode, name in lag_comp.PT_MODE_NAMES.items()}
 # How soon after a burst of signals (one poll) the snapshot is rebuilt.
 PUBLISH_DELAY_MS = 150
+# A round-time change of ours that the server has not answered after this long
+# no longer holds up the next one.
+TIME_BUSY_SECONDS = 30.0
 
 
 def _settle(answer, value):
@@ -71,6 +81,10 @@ def _done(*replies, **extra):
 
 def _now():
     return time.strftime("%H:%M:%S")
+
+
+def _minutes(count):
+    return f"{count} minute" if count == 1 else f"{count} minutes"
 
 
 def _ban_lengths():
@@ -118,6 +132,10 @@ class PhoneBridge(QObject):
         self._visit_start = {}             # name.casefold() -> when this visit began
         self._visit_seen = {}              # name.casefold() -> last time in the player list
         self._problems_logged = set()
+        # The round length to put back after the phone set the time left.
+        self._time = web_timeleft.TimeRestore(self._settings_file(web_timeleft.FILE_NAME))
+        self._time_busy_until = 0.0        # a round-time change of ours is on its way
+        self._monotonic = time.monotonic
         self._request.connect(self._run, Qt.ConnectionType.QueuedConnection)
         self._publish_timer = QTimer(self)
         self._publish_timer.setSingleShot(True)
@@ -138,6 +156,14 @@ class PhoneBridge(QObject):
 
     def _get(self, name):
         return getattr(self._window, name, None)
+
+    def _settings_file(self, filename):
+        """A file next to WolfRAT's other settings, or None (no settings folder)."""
+        runtime = self._get("runtime")
+        try:
+            return runtime.path(filename) if runtime is not None else None
+        except Exception:
+            return None
 
     @property
     def _server(self):
@@ -164,6 +190,8 @@ class PhoneBridge(QObject):
             "weather": self._weather,
             "lagcomp": self._lagcomp,
             "mode": self._mode,
+            "sky": self._sky,
+            "timeleft": self._timeleft,
         }
         handler = handlers.get(action)
         try:
@@ -177,19 +205,23 @@ class PhoneBridge(QObject):
         self.schedule_publish()
 
     def _mod_action(self, answer, operation, *, context, announcement=None,
-                    log_message, success_reply, failure_extra=None, event=None):
+                    log_message, success_reply, failure_extra=None, event=None, after=None):
         """Through the Mods tab's own path (as !kick / !ban / !warn): the Mod
         activity line, then the announcement (and the page's alert, ``event``)
-        once the server confirmed."""
+        once the server confirmed.  ``after()`` runs first, whichever way it went."""
         mods = self._get("mods_tab")
         if mods is None:
             return _fail("The WolfRAT window is still starting", 503)
 
         def succeeded(_result):
+            if after is not None:
+                after()
             _settle(answer, _done(success_reply))
             self.schedule_publish()
 
         def failed(message):
+            if after is not None:
+                after()
             _settle(answer, _fail(message, **(failure_extra or {})))
             self.schedule_publish()
 
@@ -448,6 +480,153 @@ class PhoneBridge(QObject):
             wire_log(f"[WEB] Manual mode -> {mode} by {self._who(payload)}")
         return _done(state.describe(), mode=state.mode)
 
+    def _sky_page(self):
+        tab = self._get("weather_tab")
+        return getattr(tab, "sky_page", None) if tab is not None else None
+
+    def _sky(self, payload, answer):
+        """A sky scene through the Sky page's own code (as its scene buttons)."""
+        page = self._sky_page()
+        if page is None:
+            return _fail("Sky colours are not available", 409)
+        scene = payload.get("scene")
+        minutes = payload.get("minutes")
+        if not isinstance(scene, str) or (
+                scene != "off" and all(item.key != scene for item in page.scenes())):
+            return _fail("Unknown sky", 400)
+        if scene != "off" and minutes is not None and (
+                isinstance(minutes, bool) or not isinstance(minutes, int)
+                or not 1 <= minutes <= sky.MAX_MINUTES):
+            return _fail(f"minutes must be 1-{sky.MAX_MINUTES} "
+                         "(leave it out for until the map changes)", 400)
+        who = self._who(payload)
+        if scene == "off":
+            shown, text = page.phone_off(who)
+        else:
+            shown, text = page.phone_show(scene, minutes, who)
+        return _done(text) if shown else _fail(text, 409)
+
+    # --- time left on this map -------------------------------------------------
+
+    def _time_reading(self):
+        """(the running map's file, minutes left, round length) as the server
+        says now; None for what it does not say."""
+        sm = self._server
+        current = web_state.current_entry(tuple(sm.mission_entries or ()))
+        left, limit = web_state.parse_gametime((sm.game_settings or {}).get("gametime"))
+        return (current.filename if current is not None else None), left, limit
+
+    def _time_left_problem(self):
+        """Why the phone cannot set the time left right now, or None."""
+        if not self._server.is_connected:
+            return "Not connected to the game server"
+        bans = self._get("bans_tab")
+        if coop_guard.is_coop(bans.game_type_now() if bans is not None else None):
+            return "A co-op map has no round timer"
+        map_file, _left, limit = self._time_reading()
+        if limit is None:
+            return "This map has no round timer"
+        if not map_file:
+            return "WolfRAT has not read the map list yet - try again in a moment"
+        return None
+
+    def _time_busy(self):
+        return self._monotonic() < self._time_busy_until
+
+    def _timeleft(self, payload, answer):
+        """The time left on the running map, for this round only.  The server
+        takes it as its round length, so the length found now is remembered
+        and put back when the next round starts (check_time_restore)."""
+        minutes = payload.get("minutes")
+        if (isinstance(minutes, bool) or not isinstance(minutes, int)
+                or not web_timeleft.MIN_MINUTES <= minutes <= web_timeleft.MAX_MINUTES):
+            return _fail(f"minutes must be a whole number from {web_timeleft.MIN_MINUTES} "
+                         f"to {web_timeleft.MAX_MINUTES}", 400)
+        problem = self._time_left_problem()
+        if problem:
+            return _fail(problem, 409)
+        if self._get("mods_tab") is None:
+            return _fail("The WolfRAT window is still starting", 503)
+        if self._time_busy():
+            return _fail("WolfRAT is still changing the round time - try again in a moment", 409)
+        server = manual_mode.state.key
+        map_file, _left, limit = self._time_reading()
+        who = self._who(payload)
+        original = self._time.note_set(server, map_file, limit, minutes)
+        reply = f"{_minutes(minutes)} left on this map."
+        if original != minutes:
+            reply += f" The next map goes back to {_minutes(original)}."
+
+        def answered():
+            # Our own change restarted the clock: the minutes left before it
+            # must not look like a new round to check_time_restore.
+            self._time_busy_until = 0.0
+            self._time.clock_restarted(server)
+
+        self._time_busy_until = self._monotonic() + TIME_BUSY_SECONDS
+        try:
+            return self._mod_action(
+                answer,
+                lambda: self._server.set_setting("gameTime", str(minutes)),
+                context="Set the time left",
+                announcement=f"{_minutes(minutes)} left on this map",
+                log_message=f"[{_now()}] {who} set {_minutes(minutes)} left on this map",
+                success_reply=reply,
+                after=answered,
+            )
+        except Exception:
+            answered()
+            raise
+
+    def check_time_restore(self):
+        """After every poll: once the round the phone shortened is over, set the
+        round length the server had before.  Quietly: no chat line, one line in
+        the Mod activity list and the wire log.  This finishes what the admin
+        pressed, so it runs in Manual mode too."""
+        server = manual_mode.state.key
+        entry = self._time.pending(server)
+        if entry is None or self._time_busy() or not self._server.is_connected:
+            return
+        map_file, left, limit = self._time_reading()
+        if limit is None:
+            return
+        original = self._time.reading(server, map_file, left, limit)
+        mods = self._get("mods_tab")
+        if original is None or mods is None:
+            return
+        was = entry.minutes
+
+        def sent(_result):
+            self._time_busy_until = 0.0
+            self._time.sent(server)
+            wire_log(f"[WEB] round length back to {original} min (the phone had set "
+                     f"{was} min left for one map)")
+            self.schedule_publish()
+
+        def failed(message):
+            self._time_busy_until = 0.0
+            again = self._time.failed(server)
+            wire_log(f"[WEB] round length not put back to {original} min: {message}"
+                     + ("; trying again at the next poll" if again else "; given up"))
+            if not again and hasattr(mods, "mod_log"):
+                mods.mod_log.addItem(f"[{_now()}] WolfRAT could not put the round length back "
+                                     f"to {_minutes(original)}: set it on the Settings tab")
+            self.schedule_publish()
+
+        self._time_busy_until = self._monotonic() + TIME_BUSY_SECONDS
+        try:
+            mods._submit_mod_action(
+                lambda: self._server.set_setting("gameTime", str(original)),
+                context="Put the round length back",
+                log_message=f"[{_now()}] WolfRAT put the round length back to "
+                            f"{_minutes(original)} (the phone's {_minutes(was)} was for one map)",
+                on_success=sent,
+                on_failure=failed,
+            )
+        except Exception:
+            self._time_busy_until = 0.0
+            raise
+
     # --- the snapshot --------------------------------------------------------
 
     def schedule_publish(self, *_args):
@@ -455,6 +634,7 @@ class PhoneBridge(QObject):
         self._publish_timer.start()
 
     def publish(self):
+        self._part("time left", self.check_time_restore)
         try:
             snapshot = self.build_snapshot()
         except Exception as error:             # never break the window for the phone
@@ -484,6 +664,10 @@ class PhoneBridge(QObject):
             "weather", self._weather_state, default=(None, False, False))
         top["weather"] = weather_state
         top["lag_comp"] = self._part("lag_comp", self._lag_comp_state)
+        top["objective"] = self._part("objective", self._objective_state)
+        sky_state = self._part("sky", self._sky_state)
+        top["sky"] = sky_state
+        top["time_restore"] = self._part("time_restore", self._time_restore_state)
         top["features"] = {
             "bans": self._get("bans_tab") is not None and self._get("mods_tab") is not None,
             "warn": self._get("mods_tab") is not None,
@@ -495,6 +679,11 @@ class PhoneBridge(QObject):
             "lag_comp": bool(self._part("lag_comp_feature", self._lag_comp_usable, default=False)),
             "manual_switch": bool(manual_mode.state.key),
             "ban_expiry": self._part("ban_expiry", _ban_lengths, default=[]),
+            "sky": sky_state is not None,
+            "sky_scenes": self._part("sky_scenes", self._sky_scenes, default=[])
+            if sky_state is not None else [],
+            "time_left": bool(self._part(
+                "time_left", lambda: self._time_left_problem() is None, default=False)),
         }
         players = self._part("players", self._player_extras, default={})
         return {"top": top, "players": players}
@@ -614,6 +803,33 @@ class PhoneBridge(QObject):
         }
         lightning = bool(tab.flash_btn.isEnabled())
         return state, True, lightning
+
+    def _objective_state(self):
+        """What decides the running match (web_state.objective_block), from the
+        Bans tab's last poll; None when that says nothing."""
+        bans = self._get("bans_tab")
+        if bans is None or not self._server.is_connected:
+            return None
+        return web_state.objective_block(
+            bans.game_type_now(), bans.zones_now(), bans.hill_now(), bans.team_caps_now(),
+            bans.cap_goals_now(), bans.objectives_now(), bans.ai_left_now())
+
+    def _sky_state(self):
+        page = self._sky_page()
+        return page.phone_state() if page is not None else None
+
+    def _sky_scenes(self):
+        page = self._sky_page()
+        return page.phone_scenes() if page is not None else []
+
+    def _time_restore_state(self):
+        """{"limit_min": n} while the server is on a round length the phone set
+        and WolfRAT will put n back at the next round; else None."""
+        entry = self._time.pending(manual_mode.state.key)
+        if entry is None or not self._server.is_connected:
+            return None
+        _map, _left, limit = self._time_reading()
+        return {"limit_min": entry.original} if limit == entry.minutes else None
 
     def _lag_comp_state(self):
         panel = self._get("lag_comp_panel")

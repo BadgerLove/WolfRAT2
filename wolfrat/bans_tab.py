@@ -29,10 +29,11 @@ from wolfrat import ban_rules as br
 from wolfrat import manual_mode
 from wolfrat import idle_rules
 from wolfrat import ip_checks
+from wolfrat import objective_watch
 from wolfrat import zone_rules
 from wolfrat.ban_rules import BanEntry, BanList, Enforcer, KIND_IP, KIND_NAME
 from wolfrat import coop_guard
-from wolfrat.jo_players import LocalServerPlayers, ips_by_name, positions_by_name
+from wolfrat.jo_players import HILL_GAME_TYPES, LocalServerPlayers, ips_by_name, positions_by_name
 from wolfrat.player_history import PlayerHistory, describe_when
 from wolfrat.admin_commands import MAX_CHAT_LEN
 
@@ -160,8 +161,12 @@ class BansTab(QWidget):
         self.caps_to_go: Optional[int] = None             # CTF / Flagball: fewest a team still needs
         self.team_caps: Optional[dict] = None             # CTF / Flagball: {1: caps, 2: caps}
         self.ai_left: Optional[tuple] = None              # co-op: (AI alive, AI at mission start)
+        self.cap_goals: Optional[dict] = None             # CTF / Flagball: {1: target, 2: target}
+        self.hill = None                                  # King of the Hill clocks (jo_players.HillInfo)
         self._zone_watch = zone_rules.ZoneWatch()
         self.zone_capture: Optional[Callable] = None      # set by the main window (Sprees tab)
+        self._objective_watch = objective_watch.ObjectiveWatch()
+        self.on_objective_event: Optional[Callable] = None   # (kind, text): the phone page's bell
         self._loading_idle = True
         self._ips: dict = {}
         self._online: list = []
@@ -452,6 +457,18 @@ class BansTab(QWidget):
         """Game type read at the last poll (coop_guard), or None."""
         return self.game_type
 
+    def zones_now(self) -> list:
+        """The AAS zones (tier, team, position) at the last poll, [] without any."""
+        return list(self.zones)
+
+    def hill_now(self):
+        """The hill clocks at the last poll (jo_players.HillInfo), None off King of the Hill."""
+        return self.hill
+
+    def cap_goals_now(self) -> Optional[dict]:
+        """What each team needs to win on CTF / Flagball, at the last poll."""
+        return self.cap_goals
+
     def _ip_of(self, name: str) -> str:
         ip = self._ips.get(name, "")
         if not ip:
@@ -499,6 +516,24 @@ class BansTab(QWidget):
                     self.zone_capture(event)
                 except Exception as exc:
                     self.log(f"Capture announcement failed: {exc}")
+
+    def _objective_tick(self) -> None:
+        """A zone, a flag or the hill changing hands, for the phone page's bell.
+        Nothing goes to the game, so Manual mode makes no difference here."""
+        try:
+            events = self._objective_watch.update(self._current_map, self.game_type, self.zones,
+                                                  self.team_caps, self.cap_goals, self.hill)
+        except Exception as exc:
+            self._objective_watch.reset()
+            self.log(f"Zone and flag alerts: {exc}")
+            return
+        if self.on_objective_event is None:
+            return
+        for kind, text in events:
+            try:
+                self.on_objective_event(kind, text)
+            except Exception as exc:
+                self.log(f"Alert not shown ({text}): {exc}")
 
     def _build_checks_page(self):
         page = QWidget()
@@ -749,6 +784,12 @@ class BansTab(QWidget):
         self.caps_to_go = (self._reader.read_caps_to_go(self.game_type)
                            if self.game_type is not None and hasattr(self._reader, "read_caps_to_go")
                            else None)
+        self.cap_goals = (self._reader.read_cap_goals(self.game_type)
+                          if self.game_type is not None and hasattr(self._reader, "read_cap_goals")
+                          else None)
+        self.hill = (self._reader.read_hill(self.game_type)
+                     if self.game_type in HILL_GAME_TYPES and hasattr(self._reader, "read_hill")
+                     else None)
         self.status_lbl.setText(("IPs: " + self._reader.status) if not self._reader.available
                                 else f"IPs: reading from the server on this PC ({len(self._ips)} known)")
         self.history.observe(self._online, self._ips, now)
@@ -756,6 +797,7 @@ class BansTab(QWidget):
         self._enforce(now)
         self._idle_tick(now)
         self._zone_tick()
+        self._objective_tick()
         self._refresh_online()
         self._update_checks_status()
         if self._dirty or self.history.dirty or self.verdicts.dirty:
