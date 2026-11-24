@@ -89,6 +89,11 @@ class ServerMemory(WeatherMemory):
     def close(self):
         pass
 
+    def write(self, address, data):
+        super().write(address, data)
+        if address == weather.ADDON_REQUEST:
+            self.run_script()          # the server's script runs many times a second
+
 
 class SlotReader:
     """Where the Bans tab gets players' addresses from."""
@@ -157,12 +162,11 @@ class CommandRig:
         self.weather.mods_cb.setChecked(True)
         self.weather.sky_page.mods_cb.setChecked(True)
         self.server._weather_tab = self.weather
+        self.weather._dynamic._rng = __import__("random").Random(1)   # same dice every run
         if local_server:
-            # the lightning add-on answers "are you there?"
-            controller = self.weather._ensure(writable=True)
-            controller.probe_addon()
-            self.memory.run_script()
-            controller.probe_addon()
+            # two looks at the server: the lightning add-on is asked, then heard
+            self.weather._ensure(writable=True)
+            self.weather._poll()
             self.weather._poll()
 
         self.ban_log = []
@@ -206,7 +210,9 @@ class CommandRig:
     def weather_now(self):
         """(the sky WolfRAT holds, seconds it has left) from the Weather tab."""
         schedule = self.weather._schedule
-        return schedule.active, schedule.seconds_left()
+        if schedule.active is None or schedule._until is None:
+            return schedule.active, None
+        return schedule.active, round(schedule._until - schedule._clock())
 
     def sky_now(self):
         """(scene key, seconds it lasts or None) of the sky the Sky page holds."""

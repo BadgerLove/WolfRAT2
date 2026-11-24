@@ -6657,10 +6657,13 @@ class ModsTab(QWidget):
         if not message.startswith('!'):
             return
 
-        # Parse command
+        # Parse command.  ``args``: the first word after the command, then the
+        # rest as one piece (a reason, a map name).  ``words``: every word on
+        # its own, for commands that take several ("!weather on custom 5 20").
         parts = message.split(None, 2)
         cmd = parts[0].lower()
         args = parts[1:] if len(parts) > 1 else []
+        words = message.split()[1:]
 
         wire_log(f"[MODS] Command: cmd={cmd} sender={sender} args={args} mods={list(self.mods.keys())}")
 
@@ -7295,10 +7298,10 @@ class ModsTab(QWidget):
         elif cmd in weather.CHAT_COMMANDS:
             weather_tab = getattr(self.server, '_weather_tab', None)
             reply = (
-                weather_tab.on_mod_command(display_name, cmd, args)
+                weather_tab.on_mod_command(display_name, cmd, words)
                 if weather_tab else "Weather is not available."
             )
-            self.mod_log.addItem(f"[{now}] {sender} used {cmd} {' '.join(args)}".rstrip())
+            self.mod_log.addItem(f"[{now}] {sender} used {cmd} {' '.join(words)}".rstrip())
             if reply:
                 self._send_mod_chat(reply, "Send weather reply")
 

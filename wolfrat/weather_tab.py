@@ -1127,30 +1127,44 @@ class WeatherTab(QWidget):
     def on_mod_command(self, sender: str, cmd: str, args: list[str]) -> Optional[str]:
         """Called by the Mods tab for an authorised mod.  Returns a chat reply
         for the mod, or None when the public announcement already says it."""
+        return self.mod_command(sender, cmd, args)[0]
+
+    def mod_command(self, sender: str, cmd: str, args: list[str]) -> tuple:
+        """``on_mod_command`` as (reply, refused).  ``refused`` is True when
+        nothing was changed and the reply says why: a usage line, a switch
+        that is off, no server on this PC.  ``args``: the words typed after
+        the command, one word each."""
         if cmd.lower() == "!sky":
-            return self.sky_page.on_chat(sender, args)      # its own switch, on the Sky page
+            refused = self._sky_refused(args)
+            return self.sky_page.on_chat(sender, args), refused     # its own switch, on the Sky page
         if not self.mods_cb.isChecked():
-            return "Weather commands are switched off in WolfRAT."
+            return "Weather commands are switched off in WolfRAT.", True
         request = weather.parse_chat_command(cmd, args)
         if request.kind == "usage":
-            return request.message
+            return request.message, True
+        if request.kind == "sky":
+            # "!weather sky ...": the sky colours have their own command
+            return sky.CHAT_USAGE, True
         if request.kind == "dynamic":
-            return self._dynamic_from_chat(sender, request)
+            already_off = request.switch == "off" and not self.dynamic_page.enabled_cb.isChecked()
+            return self._dynamic_from_chat(sender, request), already_off
         if request.kind == "lightning":
             strike = sky.parse_lightning(request.name.split())
             if strike.message:
-                return strike.message
+                return strike.message, True
             if strike.colour is None:
-                return None if self._flash(sender, strike.far) else \
-                    "Lightning is not set up on this server."
+                if self._flash(sender, strike.far):
+                    return None, False
+                return "Lightning is not set up on this server.", True
             controller = self._ensure(writable=True)
             try:
                 can_flash = controller is not None and controller.lightning_available()
             except weather.WeatherError:
                 can_flash = False
             if not can_flash:
-                return "Lightning is not set up on this server."
-            return self.sky_page.coloured_strike(sender, strike.colour, strike.far)
+                return "Lightning is not set up on this server.", True
+            problem = self.sky_page.coloured_strike(sender, strike.colour, strike.far)
+            return problem, problem is not None
         if request.kind == "quake":
             ok = self._quake(request.seconds, sender)
         else:
@@ -1160,5 +1174,18 @@ class WeatherTab(QWidget):
             minutes = request.minutes or self.minutes_spin.value() or MOD_FALLBACK_MINUTES
             ok = self._start(request.weather, request.name, minutes, sender)
         if not ok:
-            return "No weather: WolfRAT must run on the server PC."
-        return None if self.announce_cb.isChecked() else "Weather changed."
+            return "No weather: WolfRAT must run on the server PC.", True
+        return (None if self.announce_cb.isChecked() else "Weather changed."), False
+
+    def _sky_refused(self, args: list) -> bool:
+        """Will the Sky page answer this "!sky ..." with why it cannot do it?
+        The same checks, in the same order, as its on_chat."""
+        page = self.sky_page
+        if not page.mods_cb.isChecked():
+            return True
+        request = sky.parse_chat(args, page.scenes())
+        if request.kind == "usage":
+            return True
+        if request.kind in ("list", "off"):
+            return False
+        return page.chat_problem() is not None
