@@ -2,17 +2,10 @@
 WolfRAT's list - the name and the address that was banned with it."""
 import json
 
-import pytest
-
-from tests.command_rig import CommandRig
+from tests.command_rig import rig, rigs  # noqa: F401  (fixtures)
 from wolfrat import ban_rules as br
 from wolfrat.ban_rules import BanEntry, BanList, KIND_IP, KIND_NAME
 from wolfrat.protocol import _split_chat_message
-
-
-@pytest.fixture
-def rig(qtbot, tmp_path, monkeypatch):
-    return CommandRig(qtbot, tmp_path, monkeypatch)
 
 
 def banned(rig):

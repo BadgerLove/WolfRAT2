@@ -12,6 +12,7 @@ import pytest
 
 pytest.importorskip("PyQt6")
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+from PyQt6.QtCore import QCoreApplication, QEvent  # noqa: E402
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
 from tests.test_sky import FakeSkyServer  # noqa: E402
@@ -107,16 +108,19 @@ class SlotReader:
 
 
 class CommandRig:
-    """``phone(text)`` types on the phone page, ``game(name, text)`` in the game."""
+    """``phone(text)`` types on the phone page, ``game(name, text)`` in the game.
 
-    def __init__(self, qtbot, tmp_path, monkeypatch, *, local_server=True):
+    Build it with the ``rig`` / ``rigs`` fixtures below: they take the tabs
+    down again when the test ends.
+    """
+
+    def __init__(self, tmp_path, monkeypatch, *, local_server=True):
         self.folder = tmp_path
         self.rt = DesktopRuntime.isolated(tmp_path)
         with open(self.rt.path("wolfrat_mods.json"), "w") as handle:
             json.dump({"mods": ["Dale", "Ham"], "mod_ranks": {"Dale": ADMIN}}, handle)
         self.server = GameServer()
         self.tab = ModsTab(self.server, MissionsStore(self.rt), self.rt)
-        qtbot.addWidget(self.tab)
         self.tab.missions_store._data["available"] = [
             {"name": name, "file": file} for name, file in MAPS
         ]
@@ -156,7 +160,6 @@ class CommandRig:
 
         self.weather = WeatherTab(self.rt, send_chat=self.server.send_chat, attach=attach,
                                   server_pids=lambda: [])
-        qtbot.addWidget(self.weather)
         self.weather._timer.stop()
         self.weather.sky_page._timer.stop()
         self.weather._poll()
@@ -174,7 +177,6 @@ class CommandRig:
         self.bans = BansTab(str(tmp_path), punt=lambda player, why: None,
                             announce=self.server.send_chat, log=self.ban_log.append,
                             reader=SlotReader(), admin_name="Dale")
-        qtbot.addWidget(self.bans)
         self.bans._timer.stop()
         self.bans.on_players(list(self.server.players))
         self.server._bans_tab = self.bans
@@ -188,6 +190,16 @@ class CommandRig:
 
         self.map_vote = MapVote()
         self.server._map_voting_tab = self.map_vote
+
+    def close(self):
+        """Take the tabs down now.  Left for Qt to delete some time later, they
+        slow every later test that builds a window (each one restyles every
+        widget still alive)."""
+        self.server._weather_tab = self.server._bans_tab = self.server._map_voting_tab = None
+        for widget in (self.tab, self.weather, self.bans):
+            widget.close()
+            widget.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete.value)
 
     def _start_game(self):
         self.game_starts += 1
@@ -227,3 +239,25 @@ class CommandRig:
     def last_log(self):
         log = self.tab.mod_log
         return log.item(log.count() - 1).text() if log.count() else ""
+
+
+@pytest.fixture
+def rigs(qtbot, tmp_path, monkeypatch):
+    """``rigs(local_server=False)`` builds a rig; all are taken down after the test."""
+    made = []
+
+    def make(**options):
+        folder = tmp_path / f"rig{len(made)}"
+        folder.mkdir()
+        made.append(CommandRig(folder, monkeypatch, **options))
+        return made[-1]
+
+    yield make
+    for one in made:
+        one.close()
+
+
+@pytest.fixture
+def rig(rigs):
+    """A rig with a game server on this PC (weather, lightning and sky ready)."""
+    return rigs()

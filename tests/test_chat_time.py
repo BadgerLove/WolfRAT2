@@ -5,16 +5,11 @@ is not a time gets the usage line and sets nothing.
 """
 import pytest
 
-from tests.command_rig import CommandRig
+from tests.command_rig import rig, rigs  # noqa: F401  (fixtures)
 from wolfrat.admin_commands import AdminCommands
 from wolfrat.app import ModsTab
 
 USAGE = "Usage: !time <hhmm> e.g. !time 9 or !time 1830"
-
-
-@pytest.fixture
-def rig(qtbot, tmp_path, monkeypatch):
-    return CommandRig(qtbot, tmp_path, monkeypatch)
 
 
 TIMES = [

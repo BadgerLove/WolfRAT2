@@ -9,14 +9,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.command_rig import CommandRig
+from tests.command_rig import rig, rigs  # noqa: F401  (fixtures)
 from wolfrat import sky
 from wolfrat import weather
-
-
-@pytest.fixture
-def rig(qtbot, tmp_path, monkeypatch):
-    return CommandRig(qtbot, tmp_path, monkeypatch)
 
 
 def typed(rig, where, text):

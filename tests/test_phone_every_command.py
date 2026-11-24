@@ -15,7 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.command_rig import CommandRig
+from tests.command_rig import rig, rigs  # noqa: F401  (fixtures)
 from wolfrat import mod_ranks
 from wolfrat import mycmd
 from wolfrat import weather
@@ -24,11 +24,6 @@ from wolfrat.mod_ranks import ADMIN, ALL_PERMISSIONS, Rank
 
 VOTE_NUMBERS = {"!1", "!2", "!3", "!4", "!5"}
 PAGE_SCRIPT = Path(__file__).resolve().parent.parent / "wolfrat" / "web_templates" / "app.js"
-
-
-@pytest.fixture
-def rig(qtbot, tmp_path, monkeypatch):
-    return CommandRig(qtbot, tmp_path, monkeypatch)
 
 
 # ---- how each command shows it reached its handler ---------------------------------

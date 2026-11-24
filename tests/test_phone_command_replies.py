@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.command_rig import CommandRig
+from tests.command_rig import rigs  # noqa: F401  (fixture)
 from wolfrat import coop_guard
 from wolfrat import sky
 from wolfrat import start_game
@@ -22,8 +22,8 @@ WEATHER_USAGE = "Usage: !weather <" + "|".join(weather.PRESETS) + "> [minutes]"
 
 
 @pytest.fixture
-def rig(qtbot, tmp_path, monkeypatch):
-    rig = CommandRig(qtbot, tmp_path, monkeypatch)
+def rig(rigs):
+    rig = rigs()
     rig.tab.messages_tab = SimpleNamespace(_kd_enabled=True, stats_store=SimpleNamespace(
         get_player=lambda name: None))
     return rig
@@ -124,8 +124,8 @@ def test_weather_and_sky_switched_off(rig):
     assert rig.server.chat == ["Weather commands are switched off in WolfRAT."]
 
 
-def test_no_game_server_on_this_pc(qtbot, tmp_path, monkeypatch):
-    rig = CommandRig(qtbot, tmp_path, monkeypatch, local_server=False)
+def test_no_game_server_on_this_pc(rigs):
+    rig = rigs(local_server=False)
     refused(rig, "!storm 10", "No weather: WolfRAT must run on the server PC.")
     refused(rig, "!quake 5", "No weather: WolfRAT must run on the server PC.")
     refused(rig, "!lightning", "Lightning is not set up on this server.")
@@ -309,8 +309,8 @@ def test_the_weather_tab_marks_refusals(rig):
 @pytest.mark.parametrize("announce", [True, False])
 @pytest.mark.parametrize("ready", [True, False])
 def test_the_weather_tab_reads_sky_replies_the_way_the_sky_page_gives_them(
-        qtbot, tmp_path, monkeypatch, announce, ready):
-    rig = CommandRig(qtbot, tmp_path, monkeypatch, local_server=ready)
+        rigs, announce, ready):
+    rig = rigs(local_server=ready)
     page = rig.weather.sky_page
     page.announce_cb.setChecked(announce)
     # with announcements off the Sky page gives the mod a short line when it worked
