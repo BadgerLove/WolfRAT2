@@ -91,6 +91,10 @@ class FakeElement {
         return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null;
     }
 
+    removeAttribute(name) {
+        delete this.attributes[name];
+    }
+
     focus() {
         this.doc.activeElement = this;
     }
@@ -247,6 +251,7 @@ function makePage({
         },
         pushState(state, title, url) {
             this.calls.push(['push', url]);
+            this.setUrl(url);
         },
         back() {
             this.calls.push(['back']);
@@ -378,7 +383,29 @@ const PUSH_FEATURES = {...ALL_FEATURES, push: true};
 const ok = (extra = {}) => respond(200, {ok: true, accepted: true, replies: ['OK'], ...extra});
 const refused = message => respond(200, {ok: false, accepted: false, replies: [message], error: message});
 
-/** A page already signed in with device key "k1" and an open socket. */
+// GET /api/alerts/prefs: a phone's Bell and Phone choices. DEFAULT_PREFS is
+// what WolfRAT gives a phone that has chosen nothing yet.
+const GROUPS = ['join', 'leave', 'map', 'vote', 'admin', 'server', 'objective'];
+const everyGroup = value => Object.fromEntries(GROUPS.map(group => [group, value]));
+const DEFAULT_PREFS = {
+    groups: GROUPS,
+    bell: {join: true, leave: false, map: false, vote: false, admin: true, server: true, objective: false},
+    phone: {join: true, leave: false, map: false, vote: false, admin: false, server: true, objective: false},
+};
+const EVERY_ALERT = {groups: GROUPS, bell: everyGroup(true), phone: everyGroup(true)};
+
+/** A server that answers GET /api/alerts/prefs with `prefs`; `rest` gets every other request. */
+function withPrefs(prefs, rest = null) {
+    return request => {
+        if (request.path === '/api/alerts/prefs' && request.method === 'GET') return respond(200, prefs);
+        return rest ? rest(request) : respond(500, {error: 'no server in this test'});
+    };
+}
+
+/**
+ * A page already signed in with device key "k1" and an open socket. The
+ * choices it asks for on arrival (GET /api/alerts/prefs) have been answered.
+ */
 async function signedInPage(state = stateWith(), options = {}) {
     const page = makePage({local: {wolfkey: 'k1'}, ...options});
     await page.run('booting');
@@ -386,7 +413,15 @@ async function signedInPage(state = stateWith(), options = {}) {
     socket.readyState = 1;
     socket.onopen();
     socket.onmessage({data: JSON.stringify(state)});
+    await settle();
     return page;
+}
+
+/** A tap in the app on an element that matches `selector` and carries `dataset`. */
+function tap(page, selector, dataset = {}, extra = {}) {
+    const el = {dataset, disabled: false, classList: new FakeClassList(), ...extra};
+    const target = {closest: wanted => (wanted === selector ? el : null)};
+    return page.el('shell').listeners.click.map(handler => handler({target}));
 }
 
 // ------------------------------------------------------------------ cases
@@ -879,7 +914,7 @@ test('missing and null fields from an older WolfRAT do not break the page', asyn
     assert.strictEqual(page.el('now-left').textContent, '12', 'time left falls back to settings.gametime');
     assert.match(page.el('plist').innerHTML, /No players/);
     assert(!page.shown('hdr-bell'), 'no alerts from this WolfRAT: no bell');
-    assert(!page.shown('tile-notify'), 'no features.push: no Notifications tile');
+    assert(page.shown('tile-notify'), 'the Notifications tile is always there');
 
     page.run(`updateUI({type: 'state', events: [null, {id: 'x'}, {id: 2.5}, {id: -1}, {id: true}, {id: 3, kind: null, text: null, name: null, ts: null}], events_last_id: 'abc', features: {push: true}, server: {secure_address: null}})`);
     assert(page.shown('hdr-bell'));
@@ -893,6 +928,16 @@ test('missing and null fields from an older WolfRAT do not break the page', asyn
     assert.match(page.el('nt-count').textContent, /\u2014/, 'no setting from this WolfRAT');
     assert(page.el('nt-plus').disabled && page.el('nt-minus').disabled);
     assert(!page.shown('nt-secure-link'));
+    assert(!page.shown('nt-prefs'), 'no Bell and Phone choices on this WolfRAT: no rows');
+
+    // The new state keys as null, and as things they should never be.
+    page.run(`updateUI({type: 'state', objective: null, sky: null, time_restore: null, features: {sky: true, sky_scenes: null, time_left: null}})`);
+    page.run(`updateUI({type: 'state', objective: 'zones', sky: 'night', time_restore: 7, features: {sky: 1, sky_scenes: {a: 1}, time_left: 'yes'}})`);
+    for (const kind of ['zones', 'hill_team', 'hill_solo', 'flags', 'coop', 'something new', 7]) {
+        page.run(`updateUI(${JSON.stringify({type: 'state', objective: {kind}, sky: {}, time_restore: {}})})`);
+        page.run(`updateUI(${JSON.stringify({type: 'state', objective: {kind, zones: [null, 5, {}], teams: [null, 'x'], players: [null, {}, {name: null}], caps: 3, goal: 'x', held: 2}})})`);
+    }
+    assert.match(page.el('now-teams').innerHTML, /class="team jo"/, 'an unknown kind keeps the two teams');
 });
 
 test('maps: Run now asks first and keeps the queue identity; Set next posts the map', async () => {
@@ -1052,7 +1097,8 @@ test('the bell shows a red dot for alerts this phone has not seen', async () => 
     assert(page.shown('hdr-bell'));
     assert(page.shown('hdr-pip'), 'nothing seen yet on this phone');
 
-    const seen = await signedInPage(stateWith({events: EVENTS, events_last_id: 3}), {local: {wolfkey: 'k1', wolfseen: '3'}});
+    const seen = await signedInPage(stateWith({events: EVENTS, events_last_id: 3}),
+        {local: {wolfkey: 'k1', wolfseen: '3'}, serve: withPrefs(EVERY_ALERT)});
     assert(!seen.shown('hdr-pip'), 'all seen');
     seen.run(`handleWebSocketMessage(${JSON.stringify({type: 'event', event: event4})})`);
     assert(seen.shown('hdr-pip'), 'a new alert from the socket lights it');
@@ -1064,7 +1110,8 @@ test('the bell shows a red dot for alerts this phone has not seen', async () => 
 });
 
 test('the Alerts sheet: newest first, icon per kind, name in bold; opening marks all read', async () => {
-    const page = await signedInPage(stateWith({events: EVENTS, events_last_id: 3}), {local: {wolfkey: 'k1', wolfseen: '1'}});
+    const page = await signedInPage(stateWith({events: EVENTS, events_last_id: 3}),
+        {local: {wolfkey: 'k1', wolfseen: '1'}, serve: withPrefs(EVERY_ALERT)});
     page.el('hdr-bell').click();
     assert.strictEqual(page.run('sheet.kind'), 'alerts');
     const html = page.el('sheet-body').innerHTML;
@@ -1089,7 +1136,7 @@ test('the Alerts sheet: newest first, icon per kind, name in bold; opening marks
     page.run(`handleWebSocketMessage(${JSON.stringify({type: 'event', event: event5})})`);
     assert(page.shown('hdr-pip'));
 
-    const first = await signedInPage(stateWith({events: EVENTS, events_last_id: 3}));
+    const first = await signedInPage(stateWith({events: EVENTS, events_last_id: 3}), {serve: withPrefs(EVERY_ALERT)});
     first.run('openAlerts()');
     assert(!first.el('sheet-body').innerHTML.includes('al new'), 'nothing seen before: no row is marked, all are new');
     assert.strictEqual(first.local.getItem('wolfseen'), '3');
@@ -1170,10 +1217,11 @@ test('Notifications on plain HTTP: one line, and the secure address as a link', 
         server: {name: 'srv', secure_address: 'https://wolfrat.example.com'},
     }));
     assert(page.shown('tile-notify'));
-    page.serve = request => {
-        assert.strictEqual(request.path, '/api/push');
+    let stray = null;
+    page.serve = withPrefs(DEFAULT_PREFS, request => {
+        if (request.path !== '/api/push') stray = request.path;
         return respond(200, {public_key: PUBLIC_KEY, subscribed: false, first_joins: 2});
-    };
+    });
     page.run(`go('notify')`);
     await settle();
     assert(page.shown('nt-insecure'));
@@ -1182,8 +1230,8 @@ test('Notifications on plain HTTP: one line, and the secure address as a link', 
     assert(page.shown('nt-secure-link'));
     assert.strictEqual(page.el('nt-secure-link').getAttribute('href'), 'https://wolfrat.example.com');
     assert.strictEqual(page.el('nt-secure-text').textContent, 'https://wolfrat.example.com');
+    assert.strictEqual(stray, null, 'opening the screen asks for the push settings and the choices only');
     assert.strictEqual(page.el('nt-count').textContent, '2', 'the join setting works from here too');
-    assert.strictEqual(page.el('tile-notify-sub').textContent, 'Off');
 
     page.run(`updateUI(${JSON.stringify(stateWith({features: PUSH_FEATURES, server: {secure_address: 'javascript:alert(1)'}}))})`);
     assert(!page.shown('nt-secure-link'), 'only an https address becomes a link');
@@ -1192,7 +1240,8 @@ test('Notifications on plain HTTP: one line, and the secure address as a link', 
     assert(!page.shown('nt-secure-link'));
     assert(page.shown('nt-insecure'));
     page.run(`updateUI(${JSON.stringify(stateWith({features: {...ALL_FEATURES, push: false}}))})`);
-    assert(!page.shown('tile-notify'));
+    assert(page.shown('tile-notify'), 'the tile stays: the bell choices are there too');
+    assert(!page.shown('nt-joins-card'), 'no first-joins number where WolfRAT cannot notify');
 });
 
 test('Notifications on HTTPS: turn on asks, subscribes with the key and posts the subscription', async () => {
@@ -1236,7 +1285,6 @@ test('Notifications on HTTPS: turn on asks, subscribes with the key and posts th
     assert(page.shown('nt-test') && page.shown('nt-off'));
     assert(!page.shown('nt-on'));
     assert.strictEqual(page.el('nt-chip').textContent, 'ON');
-    assert.strictEqual(page.el('tile-notify-sub').textContent, 'On');
 
     await page.run('sendTestNotification()');
     assert.deepStrictEqual(posted[posted.length - 1], ['/api/push/test', {}]);
@@ -1303,12 +1351,12 @@ test('the first-joins stepper posts /api/push/settings and stays within 0-5', as
     const page = await signedInPage(stateWith({features: PUSH_FEATURES}));
     const posted = [];
     let refuse = false;
-    page.serve = request => {
+    page.serve = withPrefs(DEFAULT_PREFS, request => {
         if (request.path === '/api/push') return respond(200, {public_key: PUBLIC_KEY, subscribed: false, first_joins: 2});
         posted.push([request.path, request.body]);
         if (refuse) return respond(200, {ok: false, error: 'Not saved'});
         return respond(200, {ok: true, first_joins: request.body.first_joins});
-    };
+    });
     page.run(`go('notify')`);
     await settle();
     assert.strictEqual(page.el('nt-count').textContent, '2');
@@ -1361,6 +1409,945 @@ test('Install: the browser prompt becomes an Install app button; the app says it
     app.fire('beforeinstallprompt', {preventDefault() {}, prompt: async () => {}, userChoice: Promise.resolve({})});
     assert(!app.shown('nt-install'));
     assert.strictEqual(app.el('nt-install-text').textContent, 'Installed: you are using the app now.');
+});
+
+// ------------------------------------- the Now tab follows the game type
+const MID = ` ${String.fromCharCode(183)} `;          // the page's dot between two facts
+const LONG_DASH = String.fromCharCode(0x2014);
+const EVIL = '<img src=x onerror=alert(1)>"\'&';
+const EVIL_ESCAPED = '&lt;img src=x onerror=alert(1)&gt;&quot;&#39;&amp;';
+const SQUAD = [
+    {id: 3, name: 'Ghost-Six', team: '1', team_name: 'Joint Ops', kills: '9', deaths: '4', ping: '38'},
+    {id: 11, name: 'Rook', team: '1', team_name: 'Joint Ops', kills: '3', deaths: '7', ping: '45'},
+    {id: 5, name: 'Tinman', team: '1', team_name: 'Joint Ops', kills: '2', deaths: '4', ping: '112'},
+    {id: 12, name: 'ValleyDog', team: '2', team_name: 'Rebels', kills: '8', deaths: '5', ping: '83'},
+    {id: 7, name: 'Moose.UK', team: '2', team_name: 'Rebels', kills: '0', deaths: '9', ping: '61'},
+    {id: 9, name: EVIL, team: '2', team_name: 'Rebels', kills: '3', deaths: '1', ping: '70'},
+];
+const TEAMS = [
+    {team: 1, name: 'Joint Ops', kills: 14, players: 3},
+    {team: 2, name: 'Rebels', kills: 11, players: 3},
+];
+/** A running match: six players, 14 v 11 kills. */
+const matchState = (extra = {}) => stateWith({players: SQUAD, player_count: 6, teams: TEAMS, ...extra});
+const send = (page, state) => page.run(`updateUI(${JSON.stringify(state)})`);
+const count = (text, part) => text.split(part).length - 1;
+// The team card as it was before objectives: kills, the kills bar, the balance line.
+const KILLS_CARD = '<div class="team jo"><div class="nm">Joint Ops</div><div class="sc num">14</div>'
+    + `<small>kills${MID}3 players</small></div><div class="vs">VS</div>`
+    + '<div class="team reb"><div class="nm">Rebels</div><div class="sc num">11</div>'
+    + `<small>kills${MID}3 players</small></div><div class="split"><i style="width:56.0%"></i></div>`
+    + '<div class="balance"><span>Teams even</span><span>25 kills in all</span></div>';
+
+test('Advance and Secure: a chip per zone under the map name, zones held as the big numbers', async () => {
+    const objective = {
+        kind: 'zones',
+        zones: [{letter: 'A', team: 1}, {letter: 'B', team: 1}, {letter: 'C', team: 0}, {letter: 'D', team: 2}, {letter: '<b>', team: 2}],
+        held: {1: 2, 2: 2}, neutral: 1, total: 5,
+    };
+    const page = await signedInPage(matchState({objective, server: {game_type: 'AAS'}}));
+    assert(page.shown('now-objective'));
+    const hero = page.el('now-objective').innerHTML;
+    assert.strictEqual(count(hero, 'class="zone jo"'), 2);
+    assert.strictEqual(count(hero, 'class="zone n"'), 1);
+    assert.strictEqual(count(hero, 'class="zone reb"'), 2);
+    assert(hero.indexOf('>A</div>') < hero.indexOf('>C</div>') && hero.indexOf('>C</div>') < hero.indexOf('>D</div>'), 'in the game\'s order');
+    assert(hero.includes('>&lt;b&gt;</div>') && !hero.includes('<b>'), 'a zone letter is text');
+    assert(hero.includes('<span>Joint Ops hold 2</span><span>1 neutral</span><span>Rebels hold 2</span>'), hero);
+
+    const card = page.el('now-teams');
+    assert.strictEqual(card.className, 'card teams');
+    assert(card.innerHTML.includes(`<div class="sc num">2<small>zones</small></div><small>14 kills${MID}3 players</small>`), card.innerHTML);
+    assert(card.innerHTML.includes(`<small>11 kills${MID}3 players</small>`));
+    assert(card.innerHTML.includes('<div class="zsplit"><i class="jo" style="width:40.0%"></i><i style="width:20.0%"></i><i class="reb" style="width:40.0%"></i></div>'));
+    assert(card.innerHTML.includes('<div class="balance"><span>Level on zones</span><span>Teams even</span></div>'));
+
+    // One team ahead, and no numbers from WolfRAT: counted from the zones.
+    send(page, matchState({objective: {
+        kind: 'zones',
+        zones: [{letter: 'A', team: 1}, {letter: 'B', team: 1}, {letter: 'C', team: 1}, {letter: 'D', team: 2}],
+    }}));
+    assert(page.el('now-objective').innerHTML.includes('<span>Joint Ops hold 3</span><span></span><span>Rebels hold 1</span>'), 'nothing neutral: no word about it');
+    assert(page.el('now-teams').innerHTML.includes('<div class="sc num">3<small>zones</small></div>'));
+    assert(page.el('now-teams').innerHTML.includes('<div class="sc num">1<small>zone</small></div>'));
+    assert(page.el('now-teams').innerHTML.includes('<span>Joint Ops ahead by 2 zones</span>'));
+    assert(page.el('now-teams').innerHTML.includes('<i class="jo" style="width:75.0%"></i><i style="width:0.0%"></i><i class="reb" style="width:25.0%"></i>'));
+
+    send(page, matchState({objective: {kind: 'zones', zones: [{letter: 'A', team: 2}, {letter: 'B', team: 0}]}}));
+    assert(page.el('now-teams').innerHTML.includes('<span>Rebels ahead by 1 zone</span>'));
+
+    // The objective goes (the next map is Team Deathmatch): the card as it always was.
+    send(page, matchState({objective: null, server: {game_type: 'TDM'}}));
+    assert(!page.shown('now-objective'));
+    assert.strictEqual(page.el('now-teams').innerHTML, KILLS_CARD);
+});
+
+const HILL = {
+    kind: 'hill_team', limit_s: 420, delta: 5,
+    teams: [{team: 1, hold_s: 252, left_s: 168, holders: 2}, {team: 2, hold_s: 108, left_s: 312, holders: 0}],
+};
+const hillWith = (one, two, extra = {}) => ({
+    ...HILL, ...extra, teams: [{...HILL.teams[0], ...one}, {...HILL.teams[1], ...two}],
+});
+
+test('Team King of the Hill: who holds the hill, and each team\'s time left to win', async () => {
+    const page = await signedInPage(matchState({objective: HILL, server: {game_type: 'TKOTH'}}));
+    assert.strictEqual(page.el('now-objective').innerHTML,
+        '<div class="hill jo"><span class="dot"></span><span class="tx">The hill: Joint Ops hold it</span><small>2 in the zone</small></div>');
+    const card = page.el('now-teams').innerHTML;
+    assert(card.includes(`<div class="sc num">2:48</div><small>to win${MID}2 in the zone</small><div class="tbar"><i style="width:60.0%"></i></div>`), card);
+    assert(card.includes(`<div class="sc num">5:12</div><small>to win${MID}nobody in</small><div class="tbar"><i style="width:25.7%"></i></div>`), card);
+    assert(card.includes('<div class="balance gap"><span>First to hold the hill for 7:00</span><span>14 v 11 kills</span></div>'));
+
+    send(page, matchState({objective: hillWith({}, {holders: 1})}));
+    assert.strictEqual(page.el('now-objective').innerHTML,
+        '<div class="hill hot"><span class="dot"></span><span class="tx">The hill: contested</span><small>2 v 1 in the zone</small></div>');
+    assert(page.el('now-teams').innerHTML.includes(`<small>to win${MID}1 in the zone</small>`));
+
+    send(page, matchState({objective: hillWith({holders: 0}, {holders: 0})}));
+    assert.strictEqual(page.el('now-objective').innerHTML,
+        '<div class="hill"><span class="dot"></span><span class="tx">The hill: nobody on it</span></div>');
+
+    send(page, matchState({objective: hillWith({holders: 0}, {holders: 3})}));
+    assert.strictEqual(page.el('now-objective').innerHTML,
+        '<div class="hill reb"><span class="dot"></span><span class="tx">The hill: Rebels hold it</span><small>3 in the zone</small></div>');
+
+    // A server with no hill limit: the clock itself, no time to win and no bar.
+    send(page, matchState({objective: hillWith({left_s: null}, {left_s: null}, {limit_s: null})}));
+    const open = page.el('now-teams').innerHTML;
+    assert(open.includes(`<div class="sc num">4:12</div><small>held${MID}2 in the zone</small></div>`), open);
+    assert(open.includes(`<div class="sc num">1:48</div><small>held${MID}nobody in</small></div>`), open);
+    assert(!open.includes('tbar'));
+    assert(open.includes('<span>No time limit on the hill</span>'));
+});
+
+test('the hill clocks as the game counts them: up 1 with a holder, down by delta with none', async () => {
+    const page = makePage();
+    assert.strictEqual(page.run('hillSecond(252, 2, 5, 420)'), 253);
+    assert.strictEqual(page.run('hillSecond(108, 0, 5, 420)'), 103);
+    assert.strictEqual(page.run('hillSecond(3, 0, 5, 420)'), 0, 'not below 0');
+    assert.strictEqual(page.run('hillSecond(0, 0, 5, 420)'), 0);
+    assert.strictEqual(page.run('hillSecond(419, 3, 5, 420)'), 420);
+    assert.strictEqual(page.run('hillSecond(420, 1, 5, 420)'), 420, 'nothing above the limit');
+    assert.strictEqual(page.run('hillSecond(500, 1, 5, null)'), 501, 'no limit: it just counts');
+    assert.strictEqual(page.run('hillSecond(10, 0, 0, null)'), 10, 'a delta of 0 holds the clock');
+
+    const start = {limit: 420, delta: 5, counted: 0, teams: [{code: '1', hold: 252, holders: 2}, {code: '2', hold: 108, holders: 0}]};
+    assert.deepStrictEqual(page.json(`hillTeams(${JSON.stringify(HILL)})`), start);
+    assert.strictEqual(page.run(`hillTeams({kind: 'zones'})`), null);
+    assert.strictEqual(page.run('hillTeams(null)'), null);
+    const steps = page.json(`(() => {
+        const first = hillTeams(${JSON.stringify(HILL)});
+        const one = hillStep(first);
+        let later = one;
+        for (let i = 0; i < 29; i += 1) later = hillStep(later);
+        return {first, one, later};
+    })()`);
+    assert.deepStrictEqual(steps.first, start, 'a step makes new clocks; the ones given are not changed');
+    assert.deepStrictEqual(steps.one, {...start, counted: 1, teams: [{code: '1', hold: 253, holders: 2}, {code: '2', hold: 103, holders: 0}]});
+    assert.deepStrictEqual(steps.later.teams.map(t => t.hold), [282, 0], '30 seconds on: 252 + 30, and 108 - 150 stops at 0');
+    assert.strictEqual(steps.later.counted, 30);
+
+    // Teams in any order, numbers as text, a team left out.
+    assert.deepStrictEqual(
+        page.json(`hillTeams({kind: 'hill_team', limit_s: '300', delta: '5', teams: [{team: 2, hold_s: '40', holders: '1'}]})`),
+        {limit: 300, delta: 5, counted: 0, teams: [{code: '1', hold: 0, holders: 0}, {code: '2', hold: 40, holders: 1}]},
+    );
+});
+
+test('the Now card shows the counted hill clocks; a new state replaces them; none while a link is down', async () => {
+    const page = await signedInPage(matchState({objective: HILL}));
+    assert(page.run('hillTimer !== null'), 'the once-a-second timer runs on a hill map');
+    page.run('hillTick(); hillTick()');
+    let card = page.el('now-teams').innerHTML;
+    assert(card.includes('<div class="sc num">2:46</div>'), 'Joint Ops: 252 + 2 held, 166 s to win');
+    assert(card.includes('<div class="sc num">5:22</div>'), 'Rebels: 108 - 10 held, 322 s to win');
+    assert(card.includes('style="width:60.5%"'), 'the bar moves with the clock');
+
+    send(page, matchState({objective: hillWith({hold_s: 300, left_s: 120, holders: 1}, {hold_s: 0, left_s: 420})}));
+    card = page.el('now-teams').innerHTML;
+    assert(card.includes('<div class="sc num">2:00</div>') && card.includes('<div class="sc num">7:00</div>'), 'the state\'s own values');
+    assert.strictEqual(page.run('hillCount.counted'), 0);
+
+    // The socket drops: the clocks stand still.
+    page.sockets[0].onclose({code: 1006});
+    page.run('hillTick(); hillTick(); hillTick()');
+    assert(page.el('now-teams').innerHTML.includes('<div class="sc num">2:00</div>'));
+    assert.strictEqual(page.run('hillCount.counted'), 0);
+
+    // WolfRAT has lost the game server: no counting either.
+    const lost = await signedInPage(matchState({objective: HILL, connected: false}));
+    lost.run('hillTick()');
+    assert(lost.el('now-teams').innerHTML.includes('<div class="sc num">2:48</div>'));
+
+    // No new state for a long time: the counting stops by itself.
+    const quiet = await signedInPage(matchState({objective: HILL}));
+    quiet.run('for (let i = 0; i < 45; i += 1) hillTick()');
+    assert.strictEqual(quiet.run('hillCount.counted'), 30);
+    assert(quiet.el('now-teams').innerHTML.includes('<div class="sc num">2:18</div>'), '252 + 30 held');
+
+    // Another game type: no timer, nothing counted.
+    send(quiet, matchState({objective: null}));
+    assert.strictEqual(quiet.run('hillTimer'), null);
+    assert.strictEqual(quiet.run('hillCount'), null);
+    quiet.run('hillTick()');
+    assert.strictEqual(quiet.el('now-teams').innerHTML, KILLS_CARD);
+});
+
+test('King of the Hill: who is in the zone, and the players who held the hill longest', async () => {
+    const objective = {
+        kind: 'hill_solo', limit_s: 420, in_zone: 1,
+        players: [
+            {name: EVIL, hold_s: 259, left_s: 161, in_zone: true},
+            {name: 'ValleyDog', hold_s: 175, left_s: 245, in_zone: false},
+            {name: 'Left-Already', hold_s: 30, left_s: 390, in_zone: false},
+        ],
+    };
+    const page = await signedInPage(matchState({objective, server: {game_type: 'KOTH'}}));
+    const hero = page.el('now-objective').innerHTML;
+    assert.strictEqual(hero, `<div class="hill hot"><span class="dot"></span><span class="tx">The hill: ${EVIL_ESCAPED} is in the zone</span><small>1 in the zone</small></div>`);
+    const list = page.el('now-teams');
+    assert.strictEqual(list.className, 'list', 'a list, not the two-team card');
+    assert(!list.innerHTML.includes('<img'), 'a player name must never become markup');
+    assert(list.innerHTML.includes('<div class="lead"><span class="pos num">1</span>'
+        + `<div class="main"><b><span class="nm">${EVIL_ESCAPED}</span><span class="inz">IN THE ZONE</span></b>`
+        + `<small>held it for 4:19${MID}3 kills</small></div><div class="tm num">2:41<small>to win</small></div></div>`), list.innerHTML);
+    assert(list.innerHTML.includes('<span class="pos num">2</span><div class="main"><b><span class="nm">ValleyDog</span></b>'
+        + `<small>held it for 2:55${MID}8 kills</small></div><div class="tm num">4:05<small>to win</small></div>`), 'kills come from the player list');
+    assert(list.innerHTML.includes('<span class="nm">Left-Already</span></b><small>held it for 0:30</small></div><div class="tm num">6:30<small>to win</small>'), 'not on the player list: no kills');
+
+    // Shown as read: these clocks are not counted on.
+    assert.strictEqual(page.run('hillCount'), null);
+    assert.strictEqual(page.run('hillTimer'), null);
+
+    const many = Array.from({length: 8}, (_, i) => ({name: `P${i}`, hold_s: 90 - i, left_s: 330 + i, in_zone: i < 3}));
+    send(page, matchState({objective: {...objective, in_zone: 3, players: many}}));
+    assert.strictEqual(page.el('now-objective').innerHTML,
+        '<div class="hill hot"><span class="dot"></span><span class="tx">The hill: 3 players in the zone</span></div>');
+    assert.strictEqual(count(page.el('now-teams').innerHTML, 'class="lead"'), 5, 'five rows at most');
+    assert.strictEqual(count(page.el('now-teams').innerHTML, 'IN THE ZONE'), 3);
+
+    send(page, matchState({objective: {...objective, in_zone: 0, players: [{name: 'Rook', hold_s: 12, left_s: 408, in_zone: false}]}}));
+    assert.strictEqual(page.el('now-objective').innerHTML,
+        '<div class="hill"><span class="dot"></span><span class="tx">The hill: nobody on it</span></div>');
+
+    // One inside who is not among the listed five.
+    send(page, matchState({objective: {...objective, in_zone: 1, players: [{name: 'Rook', hold_s: 12, left_s: 408, in_zone: false}]}}));
+    assert(page.el('now-objective').innerHTML.includes('The hill: 1 player in the zone'));
+
+    send(page, matchState({objective: {kind: 'hill_solo', limit_s: null, in_zone: 0, players: [{name: 'Rook', hold_s: 75, left_s: null, in_zone: false}]}}));
+    assert(page.el('now-teams').innerHTML.includes(`<small>held it for 1:15${MID}3 kills</small></div><div class="tm num">${LONG_DASH}<small>no limit</small></div>`));
+
+    send(page, matchState({objective: {kind: 'hill_solo', limit_s: 420, in_zone: 0, players: []}}));
+    assert.strictEqual(page.el('now-teams').innerHTML, '<p class="empty">Nobody has held the hill yet</p>');
+});
+
+test('Capture the Flag and Flagball: the target under the map name, captures as the big numbers', async () => {
+    const ctf = {kind: 'flags', mode: 'ctf', caps: {1: 2, 2: 1}, goal: {1: 5, 2: 5}};
+    const page = await signedInPage(matchState({objective: ctf, server: {game_type: 'CTF'}}));
+    assert.strictEqual(page.el('now-objective').innerHTML,
+        '<div class="hill"><svg class="i sm"><use href="#flag"/></svg><span class="tx">First to 5 flags</span></div>');
+    const card = page.el('now-teams').innerHTML;
+    assert(card.includes(`<div class="sc num">2</div><small>of 5 flags${MID}3 players</small>`), card);
+    assert(card.includes(`<div class="sc num">1</div><small>of 5 flags${MID}3 players</small>`), card);
+    assert(card.includes('<div class="split"><i style="width:66.7%"></i></div>'), 'the bar by captures');
+    assert(card.includes('<div class="balance"><span>Teams even</span><span>14 v 11 kills</span></div>'));
+
+    send(page, matchState({objective: {...ctf, mode: 'fb'}}));
+    assert(page.el('now-objective').innerHTML.includes('First to 5 goals'));
+    assert(page.el('now-teams').innerHTML.includes(`<small>of 5 goals${MID}3 players</small>`));
+
+    send(page, matchState({objective: {...ctf, goal: {1: 5, 2: 4}}}));
+    assert(page.el('now-objective').innerHTML.includes('<span class="tx">Joint Ops need 5, Rebels need 4</span>'));
+    assert(page.el('now-teams').innerHTML.includes(`<small>of 4 flags${MID}3 players</small>`));
+
+    send(page, matchState({objective: {...ctf, goal: {1: 1, 2: 1}}}));
+    assert(page.el('now-objective').innerHTML.includes('First to 1 flag<'));
+    assert(page.el('now-teams').innerHTML.includes(`<small>of 1 flag${MID}3 players</small>`));
+
+    // No target: nothing under the map name, and no "of".
+    send(page, matchState({objective: {kind: 'flags', mode: 'ctf', caps: {1: 0, 2: 0}, goal: null}}));
+    assert(!page.shown('now-objective'));
+    assert.strictEqual(page.el('now-objective').innerHTML, '');
+    assert(page.el('now-teams').innerHTML.includes(`<div class="sc num">0</div><small>flags${MID}3 players</small>`));
+    assert(page.el('now-teams').innerHTML.includes('<div class="split none"></div>'));
+});
+
+test('Co-op: objectives and enemies left under the map name; the team card as it was', async () => {
+    const page = await signedInPage(matchState({
+        objective: {kind: 'coop', objectives_done: 2, objectives_total: 5, ai_alive: 34, ai_start: 80},
+        server: {game_type: 'COOP'},
+    }));
+    assert.strictEqual(page.el('now-objective').innerHTML,
+        '<div class="hill"><svg class="i sm"><use href="#target"/></svg><span class="tx">Objectives 2 of 5</span><small>34 of 80 enemies left</small></div>');
+    assert.strictEqual(page.el('now-teams').innerHTML, KILLS_CARD);
+
+    send(page, matchState({objective: {kind: 'coop', objectives_done: 0, objectives_total: 3, ai_alive: null, ai_start: 80}}));
+    assert.strictEqual(page.el('now-objective').innerHTML,
+        '<div class="hill"><svg class="i sm"><use href="#target"/></svg><span class="tx">Objectives 0 of 3</span></div>', 'both enemy numbers or none');
+});
+
+test('Deathmatch lists the top five by kills; Team Deathmatch and a remote WolfRAT keep the two teams', async () => {
+    const page = await signedInPage(matchState({server: {game_type: 'DM'}}));
+    const list = page.el('now-teams');
+    assert.strictEqual(list.className, 'list');
+    assert(!page.shown('now-objective'));
+    assert.strictEqual(count(list.innerHTML, 'class="lead"'), 5);
+    const order = ['Ghost-Six', 'ValleyDog', EVIL_ESCAPED, 'Rook', 'Tinman'].map(name => list.innerHTML.indexOf(`<span class="nm">${name}</span>`));
+    assert(order.every(at => at >= 0), list.innerHTML);
+    assert.deepStrictEqual(order, order.slice().sort((a, b) => a - b), 'most kills first; on a tie, fewer deaths');
+    assert(!list.innerHTML.includes('Moose.UK'), 'the sixth is left out');
+    assert(!list.innerHTML.includes('<img'));
+    assert(list.innerHTML.startsWith('<div class="lead"><span class="pos num">1</span><div class="main"><b><span class="nm">Ghost-Six</span></b>'
+        + `<small>9 kills${MID}4 deaths</small></div><div class="tm num">9<small>kills</small></div></div>`), list.innerHTML);
+
+    send(page, matchState({server: {game_type: 'DM'}, players: [], player_count: 0, teams: []}));
+    assert.strictEqual(page.el('now-teams').innerHTML, '<p class="empty">No players on the server</p>');
+
+    for (const server of [{game_type: 'TDM'}, {game_type: 'AAS'}, {}]) {
+        send(page, matchState({server}));
+        assert.strictEqual(page.el('now-teams').className, 'card teams');
+        assert.strictEqual(page.el('now-teams').innerHTML, KILLS_CARD, `exactly the card of before on ${server.game_type}`);
+    }
+});
+
+// ------------------------------------------------- tap the time ring
+const TIMED = {game_type: 'AAS', time_left_min: 22, time_limit_min: 30};
+const timedState = (extra = {}) => stateWith({features: {...ALL_FEATURES, time_left: true}, server: TIMED, ...extra});
+const typeMinutes = (page, value) => page.el('sheet').listeners.input.forEach(
+    handler => handler({target: {dataset: {typed: 'other'}, value}}));
+
+test('the time ring is a button where the round timer can be set; its sheet shows the choices', async () => {
+    const page = await signedInPage(timedState());
+    const ring = page.el('now-ring');
+    assert.strictEqual(ring.getAttribute('role'), 'button');
+    assert.strictEqual(ring.getAttribute('tabindex'), '0');
+    assert.strictEqual(ring.getAttribute('aria-label'), 'Change the time left');
+    assert(ring.classList.contains('tap'));
+    ring.click();
+    assert.strictEqual(page.run('sheet.kind'), 'timeleft');
+    const html = page.el('sheet-body').innerHTML;
+    assert(html.includes('<p class="sh-title">Time left on this map</p>'));
+    assert(html.includes('>22 of 30 minutes left now.</p>'), html);
+    for (const n of [5, 10, 15, 20, 30, 45, 60]) assert(html.includes(`data-act="pick" data-min="${n}">${n} min</button>`), `${n} min`);
+    assert.strictEqual(count(html, 'class="fchip on"'), 1);
+    assert(html.includes('<button class="fchip on" type="button" data-act="pick" data-min="10">'), '10 minutes to begin with');
+    assert(html.includes('data-typed="other"') && html.includes('data-enter="set"'), 'a box for any other number');
+    assert(html.includes('data-act="set">Set 10 minutes left</button>'));
+    assert(html.includes('>This round only. The next map goes back to 30 minutes.</p>'));
+
+    // The sheet follows the state while it is up; the next map goes back to what WolfRAT remembers.
+    send(page, timedState({server: {...TIMED, time_left_min: 9, time_limit_min: 10}, time_restore: {limit_min: 30}}));
+    assert.strictEqual(page.el('tl-now').textContent, '9 of 10 minutes left now.');
+    assert.strictEqual(page.el('tl-note').textContent, 'This round only. The next map goes back to 30 minutes.');
+    send(page, timedState({server: {...TIMED, time_limit_min: 45}, time_restore: null}));
+    assert.strictEqual(page.el('tl-note').textContent, 'This round only. The next map goes back to 45 minutes.');
+
+    // No round timer to set (co-op, not connected, an older WolfRAT): the ring is just the ring.
+    const plain = await signedInPage(stateWith({features: ALL_FEATURES, server: TIMED}));
+    assert.strictEqual(plain.el('now-ring').getAttribute('role'), null);
+    assert(!plain.el('now-ring').classList.contains('tap'));
+    plain.el('now-ring').click();
+    assert.strictEqual(plain.run('sheet'), null);
+    send(page, stateWith({features: ALL_FEATURES, server: TIMED}));
+    assert.strictEqual(page.el('now-ring').getAttribute('role'), null, 'the button goes when the feature does');
+    assert.strictEqual(page.el('now-ring').getAttribute('aria-label'), null);
+});
+
+test('the time sheet posts the minutes left to /api/timeleft and closes', async () => {
+    const page = await signedInPage(timedState());
+    const posted = [];
+    let answer = () => ok({replies: ['10 minutes left on this map. The next map goes back to 30 minutes.']});
+    page.serve = request => {
+        posted.push([request.path, request.method, request.body, request.headers.Authorization]);
+        return answer();
+    };
+    page.run('openTimeSheet()');
+    await page.run(`sheetAct('set')`);
+    assert.deepStrictEqual(posted, [['/api/timeleft', 'POST', {minutes: 10}, 'Bearer k1']]);
+    assert.strictEqual(page.run('sheet'), null, 'done: the sheet closes');
+    assert.strictEqual(page.el('operation-result').textContent,
+        `Accepted: Time left ${LONG_DASH} 10 minutes left on this map. The next map goes back to 30 minutes.`);
+
+    // Another chip, then a typed number, then Enter in the box.
+    page.run('openTimeSheet()');
+    page.run(`sheetAct('pick', {dataset: {min: '45'}})`);
+    assert.strictEqual(page.el('tl-set').textContent, 'Set 45 minutes left');
+    assert.strictEqual(page.el('tl-set').disabled, false);
+    typeMinutes(page, '1');
+    assert.strictEqual(page.el('tl-set').textContent, 'Set 1 minute left');
+    typeMinutes(page, '37');
+    assert.strictEqual(page.el('tl-set').textContent, 'Set 37 minutes left');
+    let prevented = false;
+    await Promise.all(page.el('sheet').listeners.keydown.map(handler => handler(
+        {key: 'Enter', target: {dataset: {enter: 'set'}}, preventDefault() { prevented = true; }})));
+    await settle();
+    assert(prevented);
+    assert.deepStrictEqual(posted[1].slice(0, 3), ['/api/timeleft', 'POST', {minutes: 37}]);
+    assert.strictEqual(page.run('sheet'), null);
+
+    // Only whole numbers from 1 to 240 are sent.
+    page.run('openTimeSheet()');
+    for (const bad of ['0', '241', '999', '1.5', '-5', 'abc', '', ' ']) {
+        typeMinutes(page, bad);
+        assert.strictEqual(page.el('tl-set').disabled, true, `"${bad}" is not a time`);
+        assert.strictEqual(page.el('tl-set').textContent, 'Type 1 to 240 minutes');
+        await page.run(`sheetAct('set')`);
+    }
+    assert.strictEqual(posted.length, 2, 'nothing sent for those');
+    typeMinutes(page, '240');
+    assert.strictEqual(page.el('tl-set').disabled, false);
+
+    // WolfRAT says no (a co-op map came on): the toast says why and the sheet stays.
+    answer = () => respond(409, {ok: false, accepted: false, replies: [], error: 'This map has no round timer.'});
+    await page.run(`sheetAct('set')`);
+    assert.deepStrictEqual(posted[2].slice(0, 3), ['/api/timeleft', 'POST', {minutes: 240}]);
+    assert.strictEqual(page.el('operation-result').dataset.outcome, 'error');
+    assert.match(page.el('operation-result').textContent, /This map has no round timer\./);
+    assert.strictEqual(page.run('sheet && sheet.kind'), 'timeleft');
+    assert.strictEqual(page.el('tl-set').disabled, false, 'ready for another try');
+});
+
+// ------------------------------------------------------ quick actions
+test('Balance teams and Start vote ask first, then send the command; !unban is in the list', async () => {
+    const page = await signedInPage(stateWith({features: ALL_FEATURES}));
+    let request = null;
+    page.serve = r => {
+        request = r;
+        return ok();
+    };
+    const asks = [
+        ['balance', 'Balance the teams?', 'WolfRAT moves players to even up the teams.', 'Balance teams', '!balanceteams'],
+        ['vote', 'Start the map vote now?', 'Players vote for the next map in game chat.', 'Start vote', '!startvote'],
+    ];
+    for (const [qa, title, text, button, command] of asks) {
+        request = null;
+        tap(page, '[data-qa]', {qa});
+        assert.strictEqual(page.run('sheet.kind'), 'confirm');
+        const html = page.el('sheet-body').innerHTML;
+        assert(html.includes(`<p class="sh-title">${title}</p>`), html);
+        assert(html.includes(`<p class="sh-text">${text}</p>`), html);
+        assert(html.includes(`data-act="yes">${button}</button>`), html);
+        page.run(`sheetAct('no')`);
+        assert.strictEqual(page.run('sheet'), null);
+        assert.strictEqual(request, null, 'Cancel sends nothing');
+
+        tap(page, '[data-qa]', {qa});
+        await page.run(`sheetAct('yes')`);
+        assert.strictEqual(request.path, '/api/chat/send');
+        assert.deepStrictEqual(request.body, {message: command});
+        assert.strictEqual(page.el('operation-result').textContent, `Accepted: ${button} ${LONG_DASH} OK`);
+        assert.strictEqual(page.run('sheet'), null);
+    }
+
+    const names = page.json('COMMANDS.map(c => c[0])');
+    assert.strictEqual(names.indexOf('!unban'), names.indexOf('!ban') + 1, '!unban comes after !ban');
+    assert.deepStrictEqual(page.json(`COMMANDS.find(c => c[0] === '!unban')`),
+        ['!unban', '<player>', "Take a player off WolfRAT's ban list"]);
+    assert(page.el('help-cmds').innerHTML.includes('<code>!unban</code> <span class="faint">&lt;player&gt;</span>'), 'the Help page lists it');
+});
+
+// ---------------------------------------------------------------- Sky
+const SKY_SCENES = [
+    {id: 'bloodmoon', label: 'Blood Moon', own: false, colours: {fog: '#b41414', horizon: '#dc1e1e', sun: '#641e1e', sky: '#3c0a0a', ground: '#280505'}},
+    {id: 'arctic', label: 'Arctic', own: false, colours: {horizon: '#D2EBFF'}},
+    {id: 'mine', label: 'My <b>dusk</b>', own: true, colours: {fog: 'red;background:url(x)', horizon: '#12345', sun: '#646464', ground: '#323232'}},
+];
+const SKY_FEATURES = {...ALL_FEATURES, sky: true, sky_scenes: SKY_SCENES};
+const SKY_ON = {summary: 'Blood Moon - until the map changes', scene: 'bloodmoon', problem: null};
+const SKY_OWN = {summary: "The map's own sky", scene: null, problem: null};
+const skyPosts = page => page.requests.filter(r => r.path === '/api/sky').map(r => r.body);
+
+test('Sky: a button on Now, a tile under More, a row in the Server list; hidden where WolfRAT cannot do it', async () => {
+    const page = await signedInPage(stateWith({features: SKY_FEATURES, sky: SKY_ON}));
+    assert(page.shown('qa-sky'));
+    assert(page.el('qa-sky').classList.contains('on'), 'marked while a scene is showing');
+    assert(page.shown('tile-sky'));
+    assert.strictEqual(page.el('tile-sky-sub').textContent, 'Blood Moon');
+    const row = page.el('now-server').innerHTML;
+    assert(row.includes('<button class="li" type="button" data-go="sky"><span class="ic"><svg class="i sm"><use href="#sky"/></svg></span>'
+        + '<div class="main"><b>Sky</b><small>Blood Moon - until the map changes</small></div><span class="chip y">ON</span></button>'), row);
+
+    tap(page, '[data-qa]', {qa: 'sky'});
+    assert.strictEqual(page.run('currentScreen'), 'sky');
+    assert.strictEqual(page.location.hash, '#sky');
+    assert.deepStrictEqual(page.history.calls[page.history.calls.length - 1], ['push', '/#sky'], 'Back returns to Now, as from Weather');
+    assert(page.shown('sky-on') && !page.shown('sky-off'));
+    assert.strictEqual(page.el('sky-summary').textContent, 'Blood Moon - until the map changes');
+    assert(page.shown('sky-chip'));
+    assert(!page.shown('sky-problem'));
+    assert.strictEqual(page.el('sky-count').textContent, '3 skies');
+
+    // The map's own sky: no ON chip, the button is not marked, the tile says what WolfRAT says.
+    send(page, stateWith({features: SKY_FEATURES, sky: SKY_OWN}));
+    assert(!page.shown('sky-chip'));
+    assert(!page.el('qa-sky').classList.contains('on'));
+    assert.strictEqual(page.el('tile-sky-sub').textContent, "The map's own sky");
+    assert(page.el('now-server').innerHTML.includes("<small>The map&#39;s own sky</small>"));
+
+    // A WolfRAT that cannot do sky colours (or an older one): no button, no tile, no row.
+    for (const state of [stateWith({features: {...ALL_FEATURES, sky: false, sky_scenes: []}, sky: null}), stateWith({features: ALL_FEATURES})]) {
+        send(page, state);
+        assert(!page.shown('qa-sky'));
+        assert(!page.shown('tile-sky'));
+        assert(!page.el('now-server').innerHTML.includes('<b>Sky</b>'));
+        assert(page.shown('sky-off') && !page.shown('sky-on'), 'the screen itself says it is not available');
+    }
+});
+
+test('Sky tiles: a swatch from the scene\'s colours, the one showing marked, built again only on a change', async () => {
+    const page = await signedInPage(stateWith({features: SKY_FEATURES, sky: SKY_ON}));
+    const tiles = page.el('sky-tiles');
+    assert.strictEqual(count(tiles.innerHTML, 'class="skyb'), 3);
+    assert(tiles.innerHTML.includes('<button class="skyb on" type="button" aria-pressed="true" data-sky="bloodmoon">'
+        + '<span class="sw" style="background:linear-gradient(180deg,rgb(220,30,30) 0%,rgb(180,20,20) 60%,rgb(60,16,16) 60%,rgb(36,9,9) 100%)"></span>'
+        + '<span class="nm">Blood Moon</span></button>'), tiles.innerHTML);
+    assert(tiles.innerHTML.includes('<button class="skyb" type="button" aria-pressed="false" data-sky="arctic">'
+        + '<span class="sw" style="background:linear-gradient(180deg,rgb(210,235,255) 0%,rgb(210,235,255) 60%,rgb(112,112,112) 60%,rgb(67,67,67) 100%)"></span>'),
+    'colours the scene leaves to the map: the fog as the horizon, a grey ground');
+    // A colour that is not #rrggbb never reaches the page; a label is text.
+    assert(!tiles.innerHTML.includes('url('), tiles.innerHTML);
+    assert(!tiles.innerHTML.includes('red;'));
+    assert(tiles.innerHTML.includes('data-sky="mine"><span class="sw" style="background:linear-gradient(180deg,rgb(120,150,190) 0%,rgb(120,150,190) 60%,rgb(62,62,62) 60%,rgb(37,37,37) 100%)"></span>'
+        + '<span class="nm">My &lt;b&gt;dusk&lt;/b&gt;</span>'), tiles.innerHTML);
+    assert.strictEqual(page.run(`skySwatch({horizon: '#fff', fog: 'rgb(1,2,3)', sun: null, ground: 7})`),
+        'linear-gradient(180deg,rgb(120,150,190) 0%,rgb(120,150,190) 60%,rgb(112,112,112) 60%,rgb(67,67,67) 100%)');
+    assert.deepStrictEqual(page.json(`[hexColour('#0A0b0C'), hexColour(' #ffffff '), hexColour('#ggg000'), hexColour('#fff'), hexColour(123456), hexColour('#12345678')]`),
+        [[10, 11, 12], [255, 255, 255], null, null, null, null]);
+
+    // The same scenes again (every state carries them): the tiles are left alone.
+    tiles.innerHTML = 'kept';
+    send(page, stateWith({features: SKY_FEATURES, sky: SKY_ON, player_count: 5}));
+    send(page, stateWith({features: SKY_FEATURES, sky: {...SKY_ON, summary: 'Blood Moon - 9 min left'}}));
+    assert.strictEqual(tiles.innerHTML, 'kept');
+    send(page, stateWith({features: SKY_FEATURES, sky: {summary: 'Arctic - 10 min left', scene: 'arctic', problem: null}}));
+    assert(tiles.innerHTML.includes('<button class="skyb on" type="button" aria-pressed="true" data-sky="arctic">'), 'another scene showing: built again');
+    assert(tiles.innerHTML.includes('<button class="skyb" type="button" aria-pressed="false" data-sky="bloodmoon">'));
+
+    // A scene called "off" would send the map's own sky: it is not offered.
+    send(page, stateWith({features: {...SKY_FEATURES, sky_scenes: [...SKY_SCENES, {id: 'off', label: 'Off'}, null, {label: 'no id'}]}, sky: SKY_OWN}));
+    assert.strictEqual(count(tiles.innerHTML, 'class="skyb'), 3);
+    send(page, stateWith({features: {...SKY_FEATURES, sky_scenes: []}, sky: SKY_OWN}));
+    assert.strictEqual(tiles.innerHTML, '<p class="empty">No sky scenes on this WolfRAT</p>');
+    assert.strictEqual(page.el('sky-count').textContent, 'Skies');
+});
+
+test('a sky tile posts the scene and how long to keep it; Back to the map\'s own sky posts "off"', async () => {
+    const page = await signedInPage(stateWith({features: SKY_FEATURES, sky: SKY_OWN}));
+    let reply = 'Sky: Arctic until the map changes.';
+    page.serve = () => ok({replies: [reply]});
+    tap(page, '[data-sky]', {sky: 'arctic'});
+    await settle();
+    assert.deepStrictEqual(skyPosts(page), [{scene: 'arctic', minutes: null}], 'until the map changes: no minutes');
+    const sent = page.requests[page.requests.length - 1];
+    assert.strictEqual(sent.method, 'POST');
+    assert.strictEqual(sent.headers.Authorization, 'Bearer k1');
+    assert.strictEqual(page.el('operation-result').textContent, 'Accepted: Sky: Arctic until the map changes.', 'the answer names Sky once');
+
+    reply = 'Sky: Blood Moon for 30 min.';
+    tap(page, '[data-keep]', {keep: '30'});
+    assert.strictEqual(page.run('skyKeep'), 30);
+    tap(page, '[data-sky]', {sky: 'bloodmoon'});
+    await settle();
+    assert.deepStrictEqual(skyPosts(page)[1], {scene: 'bloodmoon', minutes: 30});
+    assert.strictEqual(page.el('operation-result').textContent, 'Accepted: Sky: Blood Moon for 30 min.');
+
+    for (const [keep, minutes] of [['10', 10], ['60', 60], ['', null], ['7', null], ['abc', null]]) {
+        tap(page, '[data-keep]', {keep});
+        assert.strictEqual(page.run('skyKeep'), minutes, `keep "${keep}"`);
+    }
+
+    reply = "Sky: back to the map's own.";
+    tap(page, '[data-keep]', {keep: '10'});
+    page.el('sky-own').click();
+    await settle();
+    assert.deepStrictEqual(skyPosts(page)[2], {scene: 'off'}, 'no minutes with "off"');
+
+    // A second tap while the first is still on its way is not sent twice.
+    tap(page, '[data-sky]', {sky: 'arctic'});
+    tap(page, '[data-sky]', {sky: 'arctic'});
+    assert.strictEqual(page.el('sky-own').disabled, true);
+    await settle();
+    assert.strictEqual(skyPosts(page).length, 4);
+    assert.deepStrictEqual(skyPosts(page)[3], {scene: 'arctic', minutes: 10});
+    assert.strictEqual(page.el('sky-own').disabled, false);
+
+    // WolfRAT refuses: the usual toast says why.
+    page.serve = () => respond(409, {ok: false, accepted: false, replies: [], error: 'Sky: ready after the next map change.'});
+    tap(page, '[data-sky]', {sky: 'arctic'});
+    await settle();
+    assert.strictEqual(page.el('operation-result').dataset.outcome, 'error');
+    assert.strictEqual(page.el('operation-result').textContent, 'Error: Sky: ready after the next map change.');
+    page.serve = () => respond(400, {error: 'Unknown sky scene'});
+    tap(page, '[data-sky]', {sky: 'gone'});
+    await settle();
+    assert.strictEqual(page.el('operation-result').textContent, `Error: Sky ${LONG_DASH} Unknown sky scene`);
+});
+
+test('Sky with a problem: the page says why and its sky buttons do nothing', async () => {
+    const problem = 'Sky: ready after the next map change.';
+    const page = await signedInPage(stateWith({features: SKY_FEATURES, sky: {...SKY_OWN, problem}}));
+    page.serve = () => ok();
+    assert(page.shown('sky-problem'));
+    assert.strictEqual(page.el('sky-problem').textContent, problem);
+    assert.strictEqual(page.el('sky-own').disabled, true);
+    assert.strictEqual(count(page.el('sky-tiles').innerHTML, ' disabled>'), 3, 'every tile is greyed');
+
+    tap(page, '[data-sky]', {sky: 'arctic'});
+    tap(page, '[data-sky]', {sky: 'arctic'}, {disabled: true});
+    page.el('sky-own').click();
+    tap(page, '[data-keep]', {keep: '30'});
+    await settle();
+    assert.deepStrictEqual(skyPosts(page), [], 'nothing is sent');
+    assert.strictEqual(page.run('skyKeep'), null);
+    assert.strictEqual(await page.run(`setSky('arctic')`), null);
+
+    // A hostile reason is shown as text.
+    send(page, stateWith({features: SKY_FEATURES, sky: {...SKY_OWN, problem: '<img src=x onerror=alert(1)>'}}));
+    assert.strictEqual(page.el('sky-problem').textContent, '<img src=x onerror=alert(1)>');
+
+    // The problem goes: the buttons work again.
+    send(page, stateWith({features: SKY_FEATURES, sky: SKY_OWN}));
+    assert(!page.shown('sky-problem'));
+    assert.strictEqual(page.el('sky-own').disabled, false);
+    assert.strictEqual(count(page.el('sky-tiles').innerHTML, ' disabled>'), 0);
+    tap(page, '[data-sky]', {sky: 'arctic'});
+    await settle();
+    assert.deepStrictEqual(skyPosts(page), [{scene: 'arctic', minutes: null}]);
+});
+
+// ------------------------------------- what this phone hears about
+const MIXED = [
+    {id: 1, ts: NOW - 600, kind: 'join', text: 'Kestrel joined (1 player on)', name: 'Kestrel'},
+    {id: 2, ts: NOW - 500, kind: 'map', text: 'Cold Water Gap started', name: null},
+    {id: 3, ts: NOW - 400, kind: 'leave', text: 'Kestrel left', name: 'Kestrel'},
+    {id: 4, ts: NOW - 300, kind: 'vote', text: 'Map vote started: Misty Beach', name: null},
+    {id: 5, ts: NOW - 200, kind: 'kick', text: 'Rook was kicked by an admin', name: 'Rook'},
+    {id: 6, ts: NOW - 100, kind: 'server', text: 'Game server stopped', name: null},
+    {id: 7, ts: NOW - 50, kind: 'zone', text: 'Rebels took zone C (3 of 5)', name: null},
+    {id: 8, ts: NOW - 40, kind: 'flag', text: 'Joint Ops captured a flag (2 of 5)', name: null},
+    {id: 9, ts: NOW - 30, kind: 'radar', text: 'Something of a newer WolfRAT', name: null},
+];
+const MIXED_TEXTS = {
+    join: 'joined (1 player on)', map: 'Cold Water Gap started', leave: '</b> left', vote: 'Map vote started',
+    kick: 'was kicked', server: 'Game server stopped', zone: 'took zone C', flag: 'captured a flag', radar: 'Something of a newer',
+};
+/** The kinds of MIXED the Alerts sheet lists now. */
+function listedKinds(page) {
+    page.run('openAlerts()');
+    const html = page.el('sheet-body').innerHTML;
+    page.run('closeSheet()');
+    return Object.keys(MIXED_TEXTS).filter(kind => html.includes(MIXED_TEXTS[kind]));
+}
+const prefsOf = (bell, phone = {}) => ({
+    groups: GROUPS, bell: {...everyGroup(false), ...bell}, phone: {...everyGroup(false), ...phone},
+});
+
+test('the bell lists the kinds of alert this phone chose; WolfRAT\'s defaults until they have loaded', async () => {
+    // The choices never arrive here (the request fails): the defaults.
+    const page = await signedInPage(stateWith({events: MIXED, events_last_id: 9}));
+    assert.strictEqual(page.run('alertPrefsState'), 'failed');
+    assert.deepStrictEqual(listedKinds(page), ['join', 'kick', 'server', 'radar'], 'joins, admin actions and the server; a kind with no group is always listed');
+
+    const loaded = await signedInPage(stateWith({events: MIXED, events_last_id: 9}), {serve: withPrefs(DEFAULT_PREFS)});
+    const asked = loaded.requests.filter(r => r.path === '/api/alerts/prefs');
+    assert.strictEqual(asked.length, 1, 'asked once the app is shown');
+    assert.strictEqual(asked[0].method, 'GET');
+    assert.strictEqual(asked[0].headers.Authorization, 'Bearer k1');
+    assert.deepStrictEqual(listedKinds(loaded), ['join', 'kick', 'server', 'radar']);
+
+    const picky = await signedInPage(stateWith({events: MIXED, events_last_id: 9}),
+        {serve: withPrefs(prefsOf({map: true, objective: true, leave: true}))});
+    assert.deepStrictEqual(listedKinds(picky), ['map', 'leave', 'zone', 'flag', 'radar']);
+    picky.run('openAlerts()');
+    const html = picky.el('sheet-body').innerHTML;
+    assert(html.includes('<span class="ic k-zone"><svg class="i sm"><use href="#flag"/>'), 'a zone taken gets the flag icon');
+    assert(html.includes('<span class="ic k-flag"><svg class="i sm"><use href="#flag"/>'));
+    assert(html.indexOf('captured a flag') < html.indexOf('took zone C') && html.indexOf('took zone C') < html.indexOf('Cold Water Gap'), 'newest first');
+
+    const all = await signedInPage(stateWith({events: MIXED, events_last_id: 9}), {serve: withPrefs(EVERY_ALERT)});
+    assert.deepStrictEqual(listedKinds(all), Object.keys(MIXED_TEXTS));
+
+    const none = await signedInPage(stateWith({events: MIXED.slice(0, 8), events_last_id: 8}), {serve: withPrefs(prefsOf({}))});
+    none.run('openAlerts()');
+    assert.match(none.el('sheet-body').innerHTML, /<p class="empty">Nothing yet<\/p>/);
+    assert(!none.shown('hdr-pip'));
+
+    // An older WolfRAT has no such choices (404): every alert, as before.
+    const older = await signedInPage(stateWith({events: MIXED, events_last_id: 9}),
+        {serve: () => respond(404, new Error('Not Found'))});
+    assert.strictEqual(older.run('alertPrefsState'), 'missing');
+    assert.deepStrictEqual(listedKinds(older), Object.keys(MIXED_TEXTS));
+    assert(!older.shown('nt-prefs'), 'and no switches for them');
+});
+
+test('an alert the bell leaves out does not light the red dot, now or later', async () => {
+    const byKind = kind => MIXED.find(e => e.kind === kind);
+    const arrive = (page, kind) => page.run(`handleWebSocketMessage(${JSON.stringify({type: 'event', event: byKind(kind)})})`);
+    const server = JSON.parse(JSON.stringify(DEFAULT_PREFS));
+    const page = await signedInPage(stateWith({events: [MIXED[0]], events_last_id: 1}), {
+        local: {wolfkey: 'k1', wolfseen: '1'},
+        serve: withPrefs(server, request => {
+            Object.assign(server.bell, request.body.bell || {});
+            return respond(200, JSON.parse(JSON.stringify(server)));
+        }),
+    });
+    assert(!page.shown('hdr-pip'));
+    for (const kind of ['map', 'leave', 'vote']) {
+        arrive(page, kind);
+        assert(!page.shown('hdr-pip'), `${kind} is off: no dot`);
+    }
+    assert.strictEqual(page.el('hdr-bell').getAttribute('aria-label'), 'Alerts');
+    assert.deepStrictEqual(page.json('currentEvents.map(e => e.id)'), [1, 2, 3, 4], 'the page still holds them');
+    arrive(page, 'kick');
+    assert(page.shown('hdr-pip'), 'a kick is on: the dot');
+
+    // Opening the list marks the newest of all as seen, listed or not.
+    arrive(page, 'zone');
+    page.run('openAlerts()');
+    assert.strictEqual(page.local.getItem('wolfseen'), '7');
+    assert.strictEqual(count(page.el('sheet-body').innerHTML, 'class="al new"'), 1, 'only the kick is listed as new');
+    page.run('closeSheet()');
+    assert(!page.shown('hdr-pip'));
+
+    // Zones switched on afterwards: the one that came before is listed, but lights nothing.
+    await page.run(`setAlertPref('bell', 'objective', true)`);
+    assert(!page.shown('hdr-pip'));
+    assert(listedKinds(page).includes('zone'));
+    arrive(page, 'flag');
+    assert(page.shown('hdr-pip'), 'the next one does');
+
+    // Switching a group off takes its unread alert out of the dot at once.
+    await page.run(`setAlertPref('bell', 'objective', false)`);
+    assert(!page.shown('hdr-pip'));
+
+    // The Alerts sheet is up when a choice changes: its list follows.
+    page.run('openAlerts()');
+    assert(!page.el('sheet-body').innerHTML.includes('Cold Water Gap'));
+    await page.run(`setAlertPref('bell', 'map', true)`);
+    assert(page.el('sheet-body').innerHTML.includes('Cold Water Gap'));
+});
+
+/** A signed-in page on the Notifications screen. `subscribed` = this phone has notifications on. */
+async function notifyPage({subscribed = true, secure = true, prefs = DEFAULT_PREFS, firstJoins = 2, features = PUSH_FEATURES} = {}) {
+    const server = JSON.parse(JSON.stringify(prefs));
+    const posted = [];
+    const env = secure
+        ? fakePush({permission: subscribed ? 'granted' : 'default', subscribedWith: subscribed ? new Uint8Array(KEY_BYTES) : null})
+        : null;
+    const page = await signedInPage(stateWith({features}), {secure, push: env});
+    page.prefsAnswer = null;                      // set to answer the next POST another way
+    page.serve = request => {
+        if (request.path === '/api/push') return respond(200, {public_key: PUBLIC_KEY, subscribed, first_joins: firstJoins});
+        if (request.path === '/api/alerts/prefs' && request.method === 'GET') return respond(200, JSON.parse(JSON.stringify(server)));
+        if (request.path === '/api/alerts/prefs') {
+            posted.push(request.body);
+            if (page.prefsAnswer) return page.prefsAnswer(request);
+            for (const kind of ['bell', 'phone']) Object.assign(server[kind], request.body[kind] || {});
+            return respond(200, JSON.parse(JSON.stringify(server)));
+        }
+        if (request.path === '/api/push/settings') return respond(200, {ok: true, first_joins: request.body.first_joins});
+        return respond(200, {ok: true});
+    };
+    page.run(`go('notify')`);
+    await settle();
+    return {page, posted, server, env};
+}
+const switchHtml = (kind, group, isOn, title, text, greyed = false) => `<button class="tg${isOn ? ' on' : ''}" type="button" role="switch"`
+    + ` aria-checked="${isOn}" aria-label="${title}, ${kind === 'bell' ? 'in the bell' : 'as a phone notification'}"`
+    + ` data-pref="${kind}" data-group="${group}"${greyed ? ' disabled' : ''}>`
+    + `<svg class="i"><use href="#${kind}"/></svg>${text}</button>`;
+
+test('Notifications: a row for every kind of alert, with a Bell and a Phone switch', async () => {
+    const {page} = await notifyPage();
+    assert.strictEqual(page.requests.filter(r => r.path === '/api/alerts/prefs').length, 2, 'asked on arrival, and again when the screen opens');
+    assert(page.shown('nt-prefs'));
+    assert(!page.shown('nt-phone-hint'));
+    const rows = page.el('nt-rows').innerHTML;
+    assert.strictEqual(count(rows, 'class="nrow"'), 7);
+    const titles = [
+        ['join', 'Players joining', 'Phone: the first on an empty server'],
+        ['leave', 'Players leaving', 'Gone for 2 minutes'],
+        ['map', 'New map', 'Every map change'],
+        ['vote', 'Map votes', 'A vote started or ended'],
+        ['admin', 'Kicks, bans and warnings', 'From a phone or a mod&#39;s command'],
+        ['server', 'Game server down', 'It stopped, and when it is back'],
+        ['objective', 'Zones and flags', 'A zone, a flag or the hill taken'],
+    ];
+    let at = -1;
+    for (const [group, title, text] of titles) {
+        const row = `<div class="nrow"><div class="main"><b>${title}</b><small>${text}</small></div>`
+            + switchHtml('bell', group, DEFAULT_PREFS.bell[group], title, 'Bell')
+            + switchHtml('phone', group, DEFAULT_PREFS.phone[group], title, group === 'join' ? 'First 2' : 'Phone')
+            + '</div>';
+        assert(rows.indexOf(row) > at, `${title}: ${rows}`);
+        at = rows.indexOf(row);
+    }
+
+    // The join row's Phone switch names the first-joins number; "Phone" when that is 0.
+    await page.run('setFirstJoins(3)');
+    assert(page.el('nt-rows').innerHTML.includes('First 3</button>'));
+    await page.run('setFirstJoins(0)');
+    assert(page.el('nt-rows').innerHTML.includes(switchHtml('phone', 'join', true, 'Players joining', 'Phone')));
+
+    // WolfRAT offers fewer groups (or one this page does not know): only the ones both know.
+    const fewer = await notifyPage({prefs: {...DEFAULT_PREFS, groups: ['join', 'server', 'radar']}});
+    assert.strictEqual(count(fewer.page.el('nt-rows').innerHTML, 'class="nrow"'), 2);
+    assert(!fewer.page.el('nt-rows').innerHTML.includes('radar'));
+});
+
+test('a switch tap changes it at once, sends that one value, and goes back if WolfRAT says no', async () => {
+    const {page, posted} = await notifyPage();
+    const before = page.requests.length;
+    tap(page, '[data-pref]', {pref: 'bell', group: 'map'});
+    assert.strictEqual(page.run(`alertPref('bell', 'map')`), true, 'at once, before WolfRAT answers');
+    assert(page.el('nt-rows').innerHTML.includes(switchHtml('bell', 'map', true, 'New map', 'Bell')));
+    await settle();
+    assert.deepStrictEqual(posted, [{bell: {map: true}}], 'just that one value');
+    const sent = page.requests[before];
+    assert.deepStrictEqual([sent.path, sent.method, sent.headers.Authorization], ['/api/alerts/prefs', 'POST', 'Bearer k1']);
+    assert.strictEqual(page.run(`alertPref('bell', 'map')`), true);
+    assert(!page.el('operation-result').classList.contains('show'), 'the switch is the answer: no toast');
+
+    tap(page, '[data-pref]', {pref: 'phone', group: 'server'});
+    await settle();
+    assert.deepStrictEqual(posted[1], {phone: {server: false}}, 'on by default, so the tap turns it off');
+
+    // Two quick taps. The first answer was made before WolfRAT had the second tap: it must not undo it.
+    const waiting = [];
+    page.prefsAnswer = () => new Promise(resolve => waiting.push(resolve));
+    tap(page, '[data-pref]', {pref: 'bell', group: 'leave'});
+    tap(page, '[data-pref]', {pref: 'bell', group: 'vote'});
+    const afterFirst = {
+        groups: GROUPS,
+        bell: {...DEFAULT_PREFS.bell, map: true, leave: true},
+        phone: {...DEFAULT_PREFS.phone, server: false},
+    };
+    waiting[0](respond(200, afterFirst));
+    await settle();
+    assert.strictEqual(page.run(`alertPref('bell', 'vote')`), true, 'the second tap stays as tapped');
+    waiting[1](respond(200, {...afterFirst, bell: {...afterFirst.bell, vote: true}}));
+    await settle();
+    page.prefsAnswer = null;
+    assert.deepStrictEqual(posted.slice(2), [{bell: {leave: true}}, {bell: {vote: true}}]);
+    assert.deepStrictEqual(page.json('alertPrefs.bell'), {...DEFAULT_PREFS.bell, map: true, leave: true, vote: true});
+    assert.deepStrictEqual(page.json('alertPrefs.phone'), {...DEFAULT_PREFS.phone, server: false});
+
+    // WolfRAT says no: the switch goes back and the toast says why.
+    page.prefsAnswer = () => respond(400, {error: 'Unknown group'});
+    tap(page, '[data-pref]', {pref: 'bell', group: 'objective'});
+    assert.strictEqual(page.run(`alertPref('bell', 'objective')`), true);
+    await settle();
+    assert.deepStrictEqual(posted[4], {bell: {objective: true}});
+    assert.strictEqual(page.run(`alertPref('bell', 'objective')`), false, 'back to off');
+    assert(page.el('nt-rows').innerHTML.includes(switchHtml('bell', 'objective', false, 'Zones and flags', 'Bell')));
+    assert.strictEqual(page.el('operation-result').dataset.outcome, 'error');
+    assert.strictEqual(page.el('operation-result').textContent, `Error: Zones and flags${MID}Bell ${LONG_DASH} Unknown group`);
+    assert.deepStrictEqual(page.json('alertPrefs.bell'), {...DEFAULT_PREFS.bell, map: true, leave: true, vote: true}, 'the others stay');
+
+    // WolfRAT out of reach: back as well.
+    page.prefsAnswer = () => {
+        throw new Error('Failed to fetch');
+    };
+    tap(page, '[data-pref]', {pref: 'bell', group: 'join'});
+    assert.strictEqual(page.run(`alertPref('bell', 'join')`), false);
+    await settle();
+    assert.strictEqual(page.run(`alertPref('bell', 'join')`), true);
+    assert.match(page.el('operation-result').textContent, /Players joining.*Failed to fetch/);
+
+    // Not a switch of this page: nothing is sent.
+    const sentSoFar = posted.length;
+    for (const [pref, group] of [['bell', 'radar'], ['sms', 'join'], ['bell', '__proto__'], ['phone', 'toString']]) {
+        tap(page, '[data-pref]', {pref, group});
+    }
+    tap(page, '[data-pref]', {pref: 'bell', group: 'map'}, {disabled: true});
+    await settle();
+    assert.strictEqual(posted.length, sentSoFar);
+
+    // A key that stopped working signs the phone out.
+    page.prefsAnswer = () => respond(401, {error: 'Unauthorized'});
+    tap(page, '[data-pref]', {pref: 'bell', group: 'map'});
+    await settle();
+    assert(page.shown('signin'));
+    assert.strictEqual(page.run('alertPrefs'), null, 'the choices belonged to that key');
+});
+
+test('the Phone switches are off and greyed until this phone has notifications on', async () => {
+    const {page, posted, env} = await notifyPage({subscribed: false});
+    const rows = page.el('nt-rows').innerHTML;
+    assert.strictEqual(count(rows, 'data-pref="phone"'), 7);
+    assert.strictEqual(count(rows, ' disabled>'), 7, 'every Phone switch is greyed');
+    assert(rows.includes(switchHtml('phone', 'join', false, 'Players joining', 'First 2', true)), 'shown off, though this phone\'s choice is on');
+    assert(rows.includes(switchHtml('bell', 'join', true, 'Players joining', 'Bell')), 'the Bell switches work as ever');
+    assert(page.shown('nt-phone-hint'));
+    assert.strictEqual(page.el('nt-phone-hint').textContent, 'Turn on notifications above to use the Phone switches.');
+
+    tap(page, '[data-pref]', {pref: 'phone', group: 'map'});
+    await settle();
+    assert.deepStrictEqual(posted, [], 'a Phone tap does nothing yet');
+    tap(page, '[data-pref]', {pref: 'bell', group: 'map'});
+    await settle();
+    assert.deepStrictEqual(posted, [{bell: {map: true}}]);
+
+    // Notifications turned on: the switches show this phone's choices and work.
+    await page.run('turnOnNotifications()');
+    assert.strictEqual(env.subscribeCalls.length, 1);
+    const live = page.el('nt-rows').innerHTML;
+    assert.strictEqual(count(live, ' disabled>'), 0);
+    assert(live.includes(switchHtml('phone', 'join', true, 'Players joining', 'First 2')));
+    assert(live.includes(switchHtml('phone', 'server', true, 'Game server down', 'Phone')));
+    assert(!page.shown('nt-phone-hint'));
+    tap(page, '[data-pref]', {pref: 'phone', group: 'map'});
+    await settle();
+    assert.deepStrictEqual(posted[1], {phone: {map: true}});
+
+    // A plain http address cannot notify at all.
+    const http = await notifyPage({secure: false, subscribed: false});
+    assert.strictEqual(count(http.page.el('nt-rows').innerHTML, ' disabled>'), 7);
+    assert(http.page.shown('nt-phone-hint'));
+    assert.strictEqual(http.page.el('nt-phone-hint').textContent, 'Phone notifications need the secure address.');
+    assert(http.page.shown('nt-insecure') && !http.page.shown('nt-phone'));
+
+    // A WolfRAT that cannot send notifications: the bell choices are still there.
+    const mute = await notifyPage({features: {...ALL_FEATURES, push: false}});
+    assert(mute.page.shown('nt-prefs'));
+    assert.strictEqual(count(mute.page.el('nt-rows').innerHTML, ' disabled>'), 7);
+    assert.strictEqual(mute.page.el('nt-status').textContent, "This WolfRAT can't send notifications to phones.");
+    assert(!mute.page.shown('nt-on') && !mute.page.shown('nt-joins-card'));
+    assert(!mute.page.requests.some(r => r.path === '/api/push'), 'nothing to ask it about');
+});
+
+test('the choices that could not be loaded say so, and are asked for again when the screen opens', async () => {
+    const page = await signedInPage(stateWith({features: PUSH_FEATURES}));
+    assert.strictEqual(page.run('alertPrefsState'), 'failed');
+    page.serve = () => respond(500, {error: 'busy'});
+    page.run(`go('notify')`);
+    await settle();
+    assert(page.shown('nt-prefs'));
+    assert.strictEqual(page.el('nt-rows').innerHTML, '<p class="empty">Couldn&#39;t load this phone&#39;s choices.</p>'.replace(/&#39;/g, "'"));
+    assert(!page.shown('nt-phone-hint'));
+    assert.strictEqual(await page.run(`setAlertPref('bell', 'map', true)`), null, 'no switches to tap yet');
+
+    page.serve = withPrefs(prefsOf({map: true}));
+    page.run(`go('more')`);
+    page.run(`go('notify')`);
+    await settle();
+    assert.strictEqual(page.run('alertPrefsState'), 'ok');
+    assert(page.el('nt-rows').innerHTML.includes(switchHtml('bell', 'map', true, 'New map', 'Bell')));
+
+    // A later failure keeps the choices it has.
+    page.serve = () => respond(500, {error: 'busy'});
+    page.run(`go('more')`);
+    page.run(`go('notify')`);
+    await settle();
+    assert.strictEqual(page.run('alertPrefsState'), 'ok');
+    assert.strictEqual(page.run(`alertPref('bell', 'map')`), true);
+
+    // Not the answer of the contract: not taken as choices.
+    assert.strictEqual(page.run(`cleanAlertPrefs({bell: [], phone: {}})`), null);
+    assert.strictEqual(page.run(`cleanAlertPrefs({bell: {map: true}})`), null);
+    assert.deepStrictEqual(page.json(`cleanAlertPrefs({bell: {map: 'yes', join: false, radar: true}, phone: {server: true}})`),
+        {groups: null, bell: {join: false}, phone: {server: true}}, 'only true / false for the groups this page knows');
 });
 
 // ----------------------------------------------------- service worker
@@ -1462,6 +2449,23 @@ test('sw.js: a tap focuses an open page and moves it to the url, else opens one'
         'https://wolfrat.example.com/',
         'https://wolfrat.example.com/',
     ], 'only pages of this WolfRAT open');
+});
+
+test('sw.js: a notification carries its group as the tag; a newer one of that group alerts again', async () => {
+    const worker = loadWorker();
+    const notice = body => ({data: {json: () => ({title: '[UK] Mixed Maps LC', body, tag: 'server', url: '/#now'})}});
+    await worker.dispatch('push', notice('Game server is down'));
+    await worker.dispatch('push', notice('Game server is back (down 37 min)'));
+    await worker.dispatch('push', {data: {json: () => ({title: 'srv', body: 'Rebels took zone C (3 of 5)', tag: 'objective', url: '/#now'})}});
+    assert.deepStrictEqual(worker.shown.map(n => [n.options.tag, n.options.renotify, n.options.body]), [
+        ['server', true, 'Game server is down'],
+        ['server', true, 'Game server is back (down 37 min)'],
+        ['objective', true, 'Rebels took zone C (3 of 5)'],
+    ], 'the same tag replaces the older notification, and renotify makes the phone alert for it');
+
+    // A tap opens the notification's own screen.
+    await worker.dispatch('notificationclick', {notification: {data: worker.shown[1].options.data, close() {}}});
+    assert.deepStrictEqual(worker.opened, ['https://wolfrat.example.com/#now']);
 });
 
 test('sw.js still never answers /api or /ws, and keeps the app shell', async () => {

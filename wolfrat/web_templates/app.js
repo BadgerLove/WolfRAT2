@@ -28,6 +28,12 @@ const TOAST_MS = 7000;
 const RING_LENGTH = 251.3;            // 2 x pi x 40: the time ring's circle
 const FOG_MIN = 60;
 const FOG_MAX = 400;
+const MINUTES_MIN = 1;                // the time left and "keep the sky for": 1-240 minutes
+const MINUTES_MAX = 240;
+const TIME_CHOICES = [5, 10, 15, 20, 30, 45, 60];
+const TIME_DEFAULT = 10;
+const LIST_ROWS = 5;                  // King of the Hill and Deathmatch: the top five
+const HILL_COUNT_MAX = 30;            // seconds the hill clocks count on without a new state
 const WS_CONNECTING = 0;
 const WS_OPEN = 1;
 const ADMIN_TAG = '[ADMIN] ';
@@ -62,6 +68,7 @@ const COMMANDS = [
     ['!kill', '<player>', 'Kill a player'],
     ['!swap', '<player>', 'Move a player to the other team'],
     ['!ban', '<player> [reason]', "Ban on WolfRAT's own list"],
+    ['!unban', '<player>', "Take a player off WolfRAT's ban list"],
     ['!stats', '<player>', 'Career line for a player'],
     ['!storm', '[minutes]', 'Storm now'],
     ['!rain', '[minutes]', 'Rain now'],
@@ -74,13 +81,40 @@ const COMMANDS = [
     ['!sky', '<scene> | off | list', 'Sky scene'],
 ];
 const TEAM_NAMES = {1: 'Joint Ops', 2: 'Rebels'};
-const SCREENS = ['now', 'players', 'chat', 'maps', 'more', 'weather', 'lagcomp', 'notify', 'help'];
-const SUBPAGES = {weather: 'more', lagcomp: 'more', notify: 'more', help: 'more'};
+const SCREENS = ['now', 'players', 'chat', 'maps', 'more', 'weather', 'sky', 'lagcomp', 'notify', 'help'];
+const SUBPAGES = {weather: 'more', sky: 'more', lagcomp: 'more', notify: 'more', help: 'more'};
 // Alert kind -> sprite icon. Other kinds get the info icon.
 const EVENT_ICON = {
     join: 'join', leave: 'leave', map: 'map', vote: 'vote',
     kick: 'kick', ban: 'ban', warn: 'alert', server: 'server',
+    zone: 'flag', flag: 'flag',
 };
+// Alert kind -> the group its Bell and Phone switches belong to. A kind that
+// is not here belongs to no group and is always listed.
+const EVENT_GROUP = {
+    join: 'join', leave: 'leave', map: 'map', vote: 'vote',
+    kick: 'admin', ban: 'admin', warn: 'admin', server: 'server',
+    zone: 'objective', flag: 'objective',
+};
+// [group, title, small line]: the rows of "What this phone hears about".
+const ALERT_GROUPS = [
+    ['join', 'Players joining', 'Phone: the first on an empty server'],
+    ['leave', 'Players leaving', 'Gone for 2 minutes'],
+    ['map', 'New map', 'Every map change'],
+    ['vote', 'Map votes', 'A vote started or ended'],
+    ['admin', 'Kicks, bans and warnings', "From a phone or a mod's command"],
+    ['server', 'Game server down', 'It stopped, and when it is back'],
+    ['objective', 'Zones and flags', 'A zone, a flag or the hill taken'],
+];
+// What a phone gets until it chooses (the same defaults as WolfRAT's).
+const ALERT_DEFAULTS = {
+    bell: {join: true, leave: false, map: false, vote: false, admin: true, server: true, objective: false},
+    phone: {join: true, leave: false, map: false, vote: false, admin: false, server: true, objective: false},
+};
+// A sky colour the scene leaves to the map: a neutral grey-blue sky over grey ground.
+const SKY_NEUTRAL = [120, 150, 190];
+const GROUND_NEUTRAL = [150, 150, 150];
+const SKY_KEEP = [10, 30, 60];        // "Keep it for" choices, in minutes
 const BAND_CLASS = ['g', 'o', 'r'];
 const ACTION_WORDS = {
     kick: 'Kick', ban: 'Ban', warn: 'Warn', kill: 'Kill',
@@ -138,6 +172,11 @@ let chatRenderKey = '';
 let playersRenderKey = '';
 let mapsRenderKey = '';
 let weatherRenderKey = '';
+let skyRenderKey = '';
+let skyKeep = null;                    // minutes a sky stays; null = until the map changes
+let skyBusy = false;                   // a sky is on its way to WolfRAT
+let hillCount = null;                  // Team King of the Hill clocks, counted on since the last state
+let hillTimer = null;
 let fogDragging = false;
 let devices = null;
 let typingTimer = null;
@@ -154,6 +193,11 @@ let pushFailed = false;
 let pushBrowserSub = null;             // this browser's push subscription, when it has one
 let pushBusy = false;
 let stepBusy = false;
+let alertPrefs = null;                 // GET /api/alerts/prefs: this phone's Bell and Phone choices
+let alertPrefsState = 'unknown';       // unknown | ok | failed | missing (an older WolfRAT: 404)
+let alertPrefsLoading = false;
+let alertPrefsPending = 0;             // switch taps still on their way to WolfRAT
+let alertRowsKey = '';
 let installPrompt = null;              // Android Chrome's beforeinstallprompt event
 let appInstalled = false;
 
@@ -207,6 +251,14 @@ function num(value) {
 
 function plural(n, word) {
     return `${n} ${word}${n === 1 ? '' : 's'}`;
+}
+
+/** A whole number of minutes, 1-240, from a number or typed text; null for anything else. */
+function wholeMinutes(value) {
+    const text = String(value === null || value === undefined ? '' : value).trim();
+    if (!/^\d{1,3}$/.test(text)) return null;
+    const n = Number(text);
+    return n >= MINUTES_MIN && n <= MINUTES_MAX ? n : null;
 }
 
 function fmtInt(n) {
@@ -393,9 +445,13 @@ function renderOperationResult(data, context = {}) {
         || (unverified ? 'sent, but the read-back did not confirm it' : '')
         || replies[replies.length - 1]
         || subject;
+    // An answer that names its subject itself ("Sky: Blood Moon for 10 min.") says it once.
+    const named = String(detail).toLowerCase().indexOf(`${String(subject).toLowerCase()}:`) === 0;
     const message = String(detail) === String(subject)
         ? `${labels[outcome]}: ${subject}`
-        : `${labels[outcome]}: ${subject} ${DASH} ${detail}`;
+        : named
+            ? `${labels[outcome]}: ${detail}`
+            : `${labels[outcome]}: ${subject} ${DASH} ${detail}`;
     showToast(message, outcome);
     return {...result, outcome};
 }
@@ -593,6 +649,7 @@ function showApp() {
     if (!appShown) {
         appShown = true;
         routeFromHash(true);
+        loadAlertPrefs();
     }
     setLinkBar('');
 }
@@ -787,6 +844,10 @@ function signedOut(message, tone) {
     devices = null;
     pushInfo = null;                      // "subscribed" belongs to the old key
     pushBrowserSub = null;
+    alertPrefs = null;                    // so do the Bell and Phone choices
+    alertPrefsState = 'unknown';
+    alertPrefsPending = 0;
+    syncHill(null);
     linkState = 'connecting';
     showSignin(message, tone);
 }
@@ -1010,7 +1071,10 @@ function showScreen(name, force) {
         loadDevices();
         loadPush();
     }
-    if (name === 'notify' && was !== 'notify') loadPush();
+    if (name === 'notify' && was !== 'notify') {
+        loadPush();
+        loadAlertPrefs();
+    }
 }
 
 function scrollToId(id) {
@@ -1153,6 +1217,7 @@ function updateUI(state) {
     currentMissions = Array.isArray(state.missions) ? state.missions : [];
     applyFeatures();
     stateEvents(state);
+    syncHill(state);
     renderHeader();
     renderNow();
     renderPlayers(currentPlayers);
@@ -1162,6 +1227,7 @@ function updateUI(state) {
     renderNotify();
     if (currentScreen === 'notify' && !pushInfo && !pushFailed) loadPush();
     renderWeather();
+    renderSky();
     renderLagComp();
     refreshOpenSheet();
     markTargetGone();
@@ -1171,6 +1237,7 @@ function updateUI(state) {
 function applyFeatures() {
     show('qa-set-next', !!features.set_next);
     show('qa-weather', !!features.weather);
+    show('qa-sky', !!features.sky);
     show('chat-to', !!features.private_message);
     show('mp-change', !!features.set_next);
     show('help-pair', features.pairing !== false);
@@ -1444,13 +1511,34 @@ async function catchUpEvents() {
     }
 }
 
+/** This phone's choice for one switch; WolfRAT's default until the choices have loaded. */
+function alertPref(kind, group) {
+    const chosen = obj(alertPrefs && alertPrefs[kind])[group];
+    return typeof chosen === 'boolean' ? chosen : obj(ALERT_DEFAULTS[kind])[group] === true;
+}
+
+/**
+ * The bell lists an alert when its group's Bell switch is on. A kind with no
+ * group is always listed, and so is everything on an older WolfRAT that has
+ * no such choices.
+ */
+function bellShows(e) {
+    if (alertPrefsState === 'missing') return true;
+    const kind = e ? e.kind : null;
+    const group = typeof kind === 'string' && Object.prototype.hasOwnProperty.call(EVENT_GROUP, kind)
+        ? EVENT_GROUP[kind] : '';
+    return !group || alertPref('bell', group);
+}
+
 function renderBell() {
-    const unread = newestEventId() > seenEventId();
+    const seen = seenEventId();
+    const unread = currentEvents.some(e => eventId(e) > seen && bellShows(e));
     show('hdr-pip', unread);
     const bell = $('hdr-bell');
     if (bell) bell.setAttribute('aria-label', unread ? 'Alerts, new ones' : 'Alerts');
 }
 
+/** The mark is the newest alert of all, listed or not: one left out never lights the dot later. */
 function markEventsSeen() {
     const newest = newestEventId();
     if (newest > seenEventId()) writeStore(SEEN_STORE_KEY, String(newest));
@@ -1493,7 +1581,7 @@ function alertRowHtml(e, before) {
 }
 
 function alertsHtml(before) {
-    const rows = currentEvents.slice().reverse().map(e => alertRowHtml(e, before));
+    const rows = currentEvents.filter(bellShows).reverse().map(e => alertRowHtml(e, before));
     return '<p class="sh-title">Alerts</p>'
         + (rows.length ? `<div class="alerts">${rows.join('')}</div>` : '<p class="empty">Nothing yet</p>');
 }
@@ -1541,7 +1629,26 @@ function renderNow() {
         if (time.limit) offset = RING_LENGTH * (1 - Math.max(0, Math.min(1, time.left / time.limit)));
     }
     if (fg) fg.setAttribute('stroke-dashoffset', offset.toFixed(1));
-    if (ring) ring.classList.toggle('low', time.left !== null && time.limit !== 0 && time.left <= 5);
+    if (ring) {
+        ring.classList.toggle('low', time.left !== null && time.limit !== 0 && time.left <= 5);
+        // With a round timer the phone can set, the ring is a button.
+        const tappable = !!features.time_left;
+        ring.classList.toggle('tap', tappable);
+        if (tappable) {
+            ring.setAttribute('role', 'button');
+            ring.setAttribute('tabindex', '0');
+            ring.setAttribute('aria-label', 'Change the time left');
+        } else if (typeof ring.removeAttribute === 'function') {
+            ['role', 'tabindex', 'aria-label'].forEach(name => ring.removeAttribute(name));
+        }
+    }
+
+    const objective = $('now-objective');
+    if (objective) {
+        const html = objectiveHtml(objectiveOf(state));
+        objective.innerHTML = html;
+        show(objective, !!html);
+    }
 
     const next = nextMapInfo();
     setText('now-next-name', next ? next.title : 'Not set');
@@ -1550,23 +1657,336 @@ function renderNow() {
     renderServerList();
 }
 
-function renderTeams() {
-    const el = $('now-teams');
-    if (!el) return;
-    const [a, b] = teamTotals();
-    const total = a.kills + b.kills;
-    const share = total > 0 ? (a.kills / total) * 100 : 50;
+// ------------------------------- NOW: what decides the running match
+/** state.objective when it is an object with a kind, else null (Team Deathmatch, an older WolfRAT). */
+function objectiveOf(state) {
+    const o = state && state.objective;
+    return o && typeof o === 'object' && !Array.isArray(o) && typeof o.kind === 'string' ? o : null;
+}
+
+/** Advance and Secure: the numbers as WolfRAT sent them, counted from the zones where it sent none. */
+function zoneCounts(o) {
+    const zones = (Array.isArray(o.zones) ? o.zones : []).filter(z => z && typeof z === 'object');
+    const held = obj(o.held);
+    const count = code => {
+        const given = num(held[code]);
+        return given !== null && given >= 0 ? given : zones.filter(z => teamCode(z.team) === code).length;
+    };
+    const a = count('1');
+    const b = count('2');
+    const givenTotal = num(o.total);
+    const total = givenTotal !== null && givenTotal >= 0 ? givenTotal : zones.length;
+    const givenNeutral = num(o.neutral);
+    const neutral = givenNeutral !== null && givenNeutral >= 0 ? givenNeutral : Math.max(0, total - a - b);
+    return {zones, a, b, neutral, total};
+}
+
+function zonesHtml(o) {
+    const c = zoneCounts(o);
+    const chips = c.zones.map((z, i) => {
+        const code = teamCode(z.team);
+        const letter = z.letter === null || z.letter === undefined || z.letter === '' ? String(i + 1) : String(z.letter);
+        const owner = code === '0' ? 'nobody' : teamName(code);
+        return `<div class="zone ${teamClass(code) || 'n'}" title="${esc(`Zone ${letter}${DOT}${owner}`)}">${esc(letter)}</div>`;
+    }).join('');
+    return (chips ? `<div class="zones">${chips}</div>` : '')
+        + `<div class="zlegend"><span>${esc(`${teamName('1')} hold ${c.a}`)}</span>`
+        + `<span>${c.neutral ? esc(`${c.neutral} neutral`) : ''}</span>`
+        + `<span>${esc(`${teamName('2')} hold ${c.b}`)}</span></div>`;
+}
+
+/** The one-line strip under the map name: a dot (or an icon), the words, a small note on the right. */
+function hillLine(tone, text, right, icon) {
+    return `<div class="hill${tone ? ` ${tone}` : ''}">`
+        + (icon ? `<svg class="i sm"><use href="#${icon}"/></svg>` : '<span class="dot"></span>')
+        + `<span class="tx">${esc(text)}</span>${right ? `<small>${esc(right)}</small>` : ''}</div>`;
+}
+
+/**
+ * Team King of the Hill as numbers: {limit, delta, counted, teams: [{code,
+ * hold, holders}]}, team 1 first. limit null = the server has no hill limit.
+ * Null for any other kind.
+ */
+function hillTeams(objective) {
+    const o = obj(objective);
+    if (o.kind !== 'hill_team') return null;
+    const list = Array.isArray(o.teams) ? o.teams : [];
+    const limit = num(o.limit_s);
+    const delta = num(o.delta);
+    return {
+        limit: limit !== null && limit > 0 ? limit : null,
+        delta: delta !== null && delta > 0 ? delta : 0,
+        counted: 0,
+        teams: ['1', '2'].map(code => {
+            const entry = obj(list.find(t => t && typeof t === 'object' && teamCode(t.team) === code));
+            return {
+                code,
+                hold: Math.max(0, num(entry.hold_s) || 0),
+                holders: Math.max(0, num(entry.holders) || 0),
+            };
+        }),
+    };
+}
+
+/**
+ * One second on a team's hill clock, as the game counts it: up 1 with a live
+ * player in the zone, down by `delta` with none; never under 0 and never
+ * over the limit (null = no limit).
+ */
+function hillSecond(hold, holders, delta, limit) {
+    let next = holders > 0 ? hold + 1 : hold - Math.max(0, delta);
+    if (limit !== null && next > limit) next = limit;
+    return Math.max(0, next);
+}
+
+/** Both clocks one second on. A new object: the one given is not changed. */
+function hillStep(hill) {
+    return {
+        ...hill,
+        counted: hill.counted + 1,
+        teams: hill.teams.map(t => ({...t, hold: hillSecond(t.hold, t.holders, hill.delta, hill.limit)})),
+    };
+}
+
+/** No counting while the socket or the link to the game server is down, or long after the last state. */
+function hillCounting() {
+    return !!hillCount && linkState === 'open' && !!lastState && lastState.connected !== false
+        && hillCount.counted < HILL_COUNT_MAX;
+}
+
+/** Once a second between states: count the clocks on and show them. */
+function hillTick() {
+    if (!hillCounting()) return;
+    hillCount = hillStep(hillCount);
+    renderTeams();
+}
+
+/** A new state: its clocks replace the counted ones. The timer runs on a Team King of the Hill map only. */
+function syncHill(state) {
+    hillCount = hillTeams(state && state.objective);
+    if (hillCount && hillTimer === null) {
+        hillTimer = setInterval(hillTick, 1000);
+    } else if (!hillCount && hillTimer !== null) {
+        clearInterval(hillTimer);
+        hillTimer = null;
+    }
+}
+
+function hillTeamLine(o) {
+    const hill = hillTeams(o);
+    const [a, b] = hill.teams;
+    if (a.holders > 0 && b.holders > 0) {
+        return hillLine('hot', 'The hill: contested', `${a.holders} v ${b.holders} in the zone`);
+    }
+    const holder = a.holders > 0 ? a : b.holders > 0 ? b : null;
+    if (!holder) return hillLine('', 'The hill: nobody on it', '');
+    return hillLine(teamClass(holder.code), `The hill: ${teamName(holder.code)} hold it`, `${holder.holders} in the zone`);
+}
+
+/** King of the Hill: the listed players (five at most), as WolfRAT ordered them. */
+function hillPlayers(o) {
+    return (Array.isArray(o.players) ? o.players : [])
+        .filter(p => p && typeof p === 'object' && p.name !== null && p.name !== undefined && String(p.name) !== '')
+        .slice(0, LIST_ROWS);
+}
+
+function hillSoloLine(o) {
+    const inside = hillPlayers(o).filter(p => p.in_zone === true);
+    const given = num(o.in_zone);
+    const count = given !== null && given >= 0 ? Math.round(given) : inside.length;
+    if (count === 1 && inside.length === 1) {
+        return hillLine('hot', `The hill: ${inside[0].name} is in the zone`, '1 in the zone');
+    }
+    if (count > 0) return hillLine('hot', `The hill: ${plural(count, 'player')} in the zone`, '');
+    return hillLine('', 'The hill: nobody on it', '');
+}
+
+/** Capture the Flag / Flagball: what each team needs to win, null when there is no target. */
+function flagGoals(o) {
+    const goal = obj(o.goal);
+    const a = num(goal['1']);
+    const b = num(goal['2']);
+    return a !== null && b !== null && a > 0 && b > 0 ? {a, b} : null;
+}
+
+function flagWord(o) {
+    return o.mode === 'fb' ? 'goal' : 'flag';
+}
+
+function flagsLine(o) {
+    const goals = flagGoals(o);
+    if (!goals) return '';
+    const text = goals.a === goals.b
+        ? `First to ${plural(goals.a, flagWord(o))}`
+        : `${teamName('1')} need ${goals.a}, ${teamName('2')} need ${goals.b}`;
+    return hillLine('', text, '', 'flag');
+}
+
+function coopLine(o) {
+    const done = num(o.objectives_done);
+    const total = num(o.objectives_total);
+    const alive = num(o.ai_alive);
+    const start = num(o.ai_start);
+    const objectives = done !== null && total !== null ? `Objectives ${done} of ${total}` : '';
+    const enemies = alive !== null && start !== null ? `${alive} of ${start} enemies left` : '';
+    if (!objectives) return enemies ? hillLine('', enemies, '', 'target') : '';
+    return hillLine('', objectives, enemies, 'target');
+}
+
+/** Under the map name: the zones, the hill, the flag target or the co-op objectives. */
+function objectiveHtml(o) {
+    if (!o) return '';
+    if (o.kind === 'zones') return zonesHtml(o);
+    if (o.kind === 'hill_team') return hillTeamLine(o);
+    if (o.kind === 'hill_solo') return hillSoloLine(o);
+    if (o.kind === 'flags') return flagsLine(o);
+    if (o.kind === 'coop') return coopLine(o);
+    return '';
+}
+
+// ------------------------------------------------ NOW: the team card
+const VS = '<div class="vs">VS</div>';
+
+function balanceText(a, b) {
     const diff = a.players - b.players;
-    const balance = Math.abs(diff) <= 1
+    return Math.abs(diff) <= 1
         ? 'Teams even'
         : `${diff > 0 ? a.name : b.name} +${plural(Math.abs(diff), 'player')}`;
-    el.innerHTML = `<div class="team jo"><div class="nm">${esc(a.name)}</div><div class="sc num">${esc(a.kills)}</div><small>kills${DOT}${esc(plural(a.players, 'player'))}</small></div>`
-        + '<div class="vs">VS</div>'
+}
+
+/** One side of the card: the team, its big number (with a small unit), a small line, a bar when it has one. */
+function teamSideHtml(team, big, unit, small, bar) {
+    return `<div class="team ${teamClass(team.code)}"><div class="nm">${esc(team.name)}</div>`
+        + `<div class="sc num">${esc(big)}${unit ? `<small>${esc(unit)}</small>` : ''}</div>`
+        + `<small>${esc(small)}</small>${bar || ''}</div>`;
+}
+
+function bottomLine(left, right, gap) {
+    return `<div class="balance${gap ? ' gap' : ''}"><span>${esc(left)}</span><span>${esc(right)}</span></div>`;
+}
+
+/** Team Deathmatch and anything with no objective: kills, as the card always was. */
+function teamKillsHtml(a, b) {
+    const total = a.kills + b.kills;
+    const share = total > 0 ? (a.kills / total) * 100 : 50;
+    return `<div class="team jo"><div class="nm">${esc(a.name)}</div><div class="sc num">${esc(a.kills)}</div><small>kills${DOT}${esc(plural(a.players, 'player'))}</small></div>`
+        + VS
         + `<div class="team reb"><div class="nm">${esc(b.name)}</div><div class="sc num">${esc(b.kills)}</div><small>kills${DOT}${esc(plural(b.players, 'player'))}</small></div>`
         + (total > 0
             ? `<div class="split"><i style="width:${share.toFixed(1)}%"></i></div>`
             : '<div class="split none"></div>')
-        + `<div class="balance"><span>${esc(balance)}</span><span>${esc(plural(total, 'kill'))} in all</span></div>`;
+        + `<div class="balance"><span>${esc(balanceText(a, b))}</span><span>${esc(plural(total, 'kill'))} in all</span></div>`;
+}
+
+/** Advance and Secure: zones held; the bar is Joint Ops / nobody / Rebels by share of all zones. */
+function teamZonesHtml(o, a, b) {
+    const c = zoneCounts(o);
+    const side = (team, held) => teamSideHtml(team, held, held === 1 ? 'zone' : 'zones',
+        `${plural(team.kills, 'kill')}${DOT}${plural(team.players, 'player')}`);
+    const free = Math.max(0, c.total - c.a - c.b);
+    const all = c.a + free + c.b;
+    const part = n => `${((n / all) * 100).toFixed(1)}%`;
+    const bar = all > 0
+        ? `<div class="zsplit"><i class="jo" style="width:${part(c.a)}"></i><i style="width:${part(free)}"></i><i class="reb" style="width:${part(c.b)}"></i></div>`
+        : '<div class="split none"></div>';
+    const lead = c.a === c.b
+        ? 'Level on zones'
+        : `${c.a > c.b ? a.name : b.name} ahead by ${plural(Math.abs(c.a - c.b), 'zone')}`;
+    return side(a, c.a) + VS + side(b, c.b) + bar + bottomLine(lead, balanceText(a, b));
+}
+
+/** Team King of the Hill: each team's time left to win, and its clock against the limit as a bar. */
+function teamHillHtml(hill, a, b) {
+    const side = (team, t) => {
+        const where = t.holders > 0 ? `${t.holders} in the zone` : 'nobody in';
+        if (hill.limit === null) return teamSideHtml(team, clock(t.hold), '', `held${DOT}${where}`);
+        const filled = Math.max(0, Math.min(100, (t.hold / hill.limit) * 100));
+        return teamSideHtml(team, clock(hill.limit - t.hold), '', `to win${DOT}${where}`,
+            `<div class="tbar"><i style="width:${filled.toFixed(1)}%"></i></div>`);
+    };
+    const rule = hill.limit === null
+        ? 'No time limit on the hill'
+        : `First to hold the hill for ${clock(hill.limit)}`;
+    return side(a, hill.teams[0]) + VS + side(b, hill.teams[1])
+        + bottomLine(rule, `${a.kills} v ${b.kills} kills`, true);
+}
+
+/** Capture the Flag / Flagball: captures, with the target when there is one. */
+function teamFlagsHtml(o, a, b) {
+    const caps = obj(o.caps);
+    const goals = flagGoals(o);
+    const word = flagWord(o);
+    const capsA = Math.max(0, num(caps['1']) || 0);
+    const capsB = Math.max(0, num(caps['2']) || 0);
+    const side = (team, count, goal) => teamSideHtml(team, count, '',
+        `${goal === null ? `${word}s` : `of ${plural(goal, word)}`}${DOT}${plural(team.players, 'player')}`);
+    const total = capsA + capsB;
+    const bar = total > 0
+        ? `<div class="split"><i style="width:${((capsA / total) * 100).toFixed(1)}%"></i></div>`
+        : '<div class="split none"></div>';
+    return side(a, capsA, goals ? goals.a : null) + VS + side(b, capsB, goals ? goals.b : null) + bar
+        + bottomLine(balanceText(a, b), `${a.kills} v ${b.kills} kills`);
+}
+
+/** A row of a top-five list: place, name (with a tag), a small line, a big number over its unit. */
+function leadRowHtml(place, name, tag, small, big, unit) {
+    return `<div class="lead"><span class="pos num">${place}</span>`
+        + `<div class="main"><b><span class="nm">${esc(name)}</span>${tag ? `<span class="inz">${esc(tag)}</span>` : ''}</b>`
+        + `<small>${esc(small)}</small></div>`
+        + `<div class="tm num">${esc(big)}<small>${esc(unit)}</small></div></div>`;
+}
+
+/** King of the Hill: who has held the hill longest, as read (these clocks are not counted on). */
+function hillSoloRows(o) {
+    const limit = num(o.limit_s);
+    const rows = hillPlayers(o).map((p, i) => {
+        const name = String(p.name);
+        const hold = Math.max(0, num(p.hold_s) || 0);
+        let left = num(p.left_s);
+        if (left === null && limit !== null && limit > 0) left = Math.max(0, limit - hold);
+        const listed = currentPlayers.find(q => validPlayer(q) && String(q.name) === name);
+        const kills = listed ? num(listed.kills) : null;
+        return leadRowHtml(i + 1, name, p.in_zone === true ? 'IN THE ZONE' : '',
+            `held it for ${clock(hold)}${kills === null ? '' : DOT + plural(kills, 'kill')}`,
+            left === null ? DASH : clock(left), left === null ? 'no limit' : 'to win');
+    });
+    return rows.length ? rows.join('') : '<p class="empty">Nobody has held the hill yet</p>';
+}
+
+/** Deathmatch: the top players by kills (fewer deaths first on a tie). */
+function deathmatchRows() {
+    const rows = currentPlayers.filter(validPlayer)
+        .map(p => ({name: String(p.name), kills: num(p.kills) || 0, deaths: num(p.deaths)}))
+        .sort((x, y) => (y.kills - x.kills) || ((x.deaths || 0) - (y.deaths || 0)))
+        .slice(0, LIST_ROWS)
+        .map((p, i) => leadRowHtml(i + 1, p.name, '',
+            `${plural(p.kills, 'kill')}${p.deaths === null ? '' : DOT + plural(p.deaths, 'death')}`,
+            p.kills, p.kills === 1 ? 'kill' : 'kills'));
+    return rows.length ? rows.join('') : '<p class="empty">No players on the server</p>';
+}
+
+/** The card under the hero: two teams by what decides the match, or a top-five list. */
+function renderTeams() {
+    const el = $('now-teams');
+    if (!el) return;
+    const o = objectiveOf(lastState);
+    const kind = o ? o.kind : '';
+    let list = null;
+    if (kind === 'hill_solo') {
+        list = hillSoloRows(o);
+    } else if (!o && String(obj(lastState && lastState.server).game_type || '') === 'DM') {
+        list = deathmatchRows();
+    }
+    el.className = list === null ? 'card teams' : 'list';
+    if (list !== null) {
+        el.innerHTML = list;
+        return;
+    }
+    const [a, b] = teamTotals();
+    if (kind === 'zones') el.innerHTML = teamZonesHtml(o, a, b);
+    else if (kind === 'hill_team') el.innerHTML = teamHillHtml(hillCount || hillTeams(o), a, b);
+    else if (kind === 'flags') el.innerHTML = teamFlagsHtml(o, a, b);
+    else el.innerHTML = teamKillsHtml(a, b);
 }
 
 function listRow(icon, title, sub, right, target) {
@@ -1649,7 +2069,100 @@ function renderServerList() {
         rows.push(listRow('fog', 'Weather', weatherLine(state.weather),
             features.weather ? CHEVRON : '', features.weather ? {go: 'weather'} : null));
     }
+    const sky = skyState();
+    if (sky) {
+        rows.push(listRow('sky', 'Sky', sky.summary ? String(sky.summary) : DASH,
+            skyShowing() ? chip('ON', 'y') : features.sky ? CHEVRON : '',
+            features.sky ? {go: 'sky'} : null));
+    }
     el.innerHTML = rows.join('');
+}
+
+// ------------------------------------------- NOW: tap the time ring
+function timeNowText() {
+    const time = timeInfo(lastState);
+    if (time.left === null) return 'The time left is not known yet.';
+    const left = Math.round(time.left);
+    return time.limit
+        ? `${left} of ${Math.round(time.limit)} minutes left now.`
+        : `${plural(left, 'minute')} left now.`;
+}
+
+/** The round length the next map goes back to: the one WolfRAT remembers, else the one showing. */
+function restoreMinutes() {
+    const kept = num(obj(lastState && lastState.time_restore).limit_min);
+    if (kept !== null && kept > 0) return Math.round(kept);
+    const limit = timeInfo(lastState).limit;
+    return limit !== null && limit > 0 ? Math.round(limit) : null;
+}
+
+function timeNoteText() {
+    const back = restoreMinutes();
+    return back === null
+        ? 'This round only.'
+        : `This round only. The next map goes back to ${plural(back, 'minute')}.`;
+}
+
+function timeButtonText(minutes) {
+    return minutes === null
+        ? `Type ${MINUTES_MIN} to ${MINUTES_MAX} minutes`
+        : `Set ${plural(minutes, 'minute')} left`;
+}
+
+function setTimeLeft(minutes) {
+    return submitHttpOperation('/api/timeleft', {minutes}, {label: 'Time left'});
+}
+
+/** The time ring's sheet: pick or type the minutes left on this map, then one button sets it. */
+function openTimeSheet() {
+    if (!features.time_left) return false;
+    let minutes = TIME_DEFAULT;
+    let busy = false;
+    const chips = TIME_CHOICES.map(n => `<button class="fchip${n === minutes ? ' on' : ''}" type="button" data-act="pick" data-min="${n}">${n} min</button>`).join('');
+    const html = '<p class="sh-title">Time left on this map</p>'
+        + `<p id="tl-now" class="sh-text">${esc(timeNowText())}</p>`
+        + `<div id="tl-chips" class="reasons">${chips}`
+        + `<input id="tl-other" class="field mini" type="text" inputmode="numeric" pattern="[0-9]*" maxlength="3" placeholder="Other" autocomplete="off" enterkeyhint="done" data-typed="other" data-enter="set" aria-label="Minutes left, ${MINUTES_MIN} to ${MINUTES_MAX}"></div>`
+        + `<button id="tl-set" class="btn acc wide tall" type="button" data-act="set">${esc(timeButtonText(minutes))}</button>`
+        + `<p id="tl-note" class="note">${esc(timeNoteText())}</p>`;
+    const refresh = () => {
+        eachEl('#tl-chips .fchip', item => item.classList.toggle('on', wholeMinutes(item.dataset.min) === minutes));
+        const button = $('tl-set');
+        if (!button) return;
+        button.textContent = busy ? `Working${ELLIPSIS}` : timeButtonText(minutes);
+        button.disabled = busy || minutes === null;
+    };
+    openSheet('timeleft', html, {
+        pick: el => {
+            if (busy) return;
+            minutes = wholeMinutes(el.dataset.min);
+            const box = $('tl-other');
+            if (box) box.value = '';
+            refresh();
+        },
+        other: el => {
+            if (busy) return;
+            minutes = wholeMinutes(el.value);
+            refresh();
+        },
+        set: async () => {
+            if (busy || minutes === null) return null;
+            busy = true;
+            const mine = sheet;
+            refresh();
+            let result = null;
+            try {
+                result = await setTimeLeft(minutes);
+            } finally {
+                busy = false;
+            }
+            if (!deviceKey || sheet !== mine) return result;      // signed out, or the sheet has gone
+            if (isDone(result)) closeSheet();
+            else refresh();
+            return result;
+        },
+    });
+    return true;
 }
 
 function isAdminLine(m) {
@@ -1896,6 +2409,11 @@ function reopenPlayerSheet(target) {
 }
 
 function refreshOpenSheet() {
+    if (sheet && sheet.kind === 'timeleft') {
+        setText('tl-now', timeNowText());
+        setText('tl-note', timeNoteText());
+        return;
+    }
     if (!sheet || sheet.kind !== 'player' || !selectedPlayer) return;
     const player = findPlayer(selectedPlayer.pid, selectedPlayer.name);
     if (player) {
@@ -2459,6 +2977,7 @@ function quickActionTap(kind) {
         return null;
     }
     if (kind === 'weather') return go('weather', {push: true});
+    if (kind === 'sky') return go('sky', {push: true});
     if (kind === 'mix') {
         return openConfirm({
             title: 'Mix the teams?',
@@ -2469,6 +2988,24 @@ function quickActionTap(kind) {
         });
     }
     if (kind === 'start') return sendCommand('!startgame', 'Start game');
+    if (kind === 'balance') {
+        return openConfirm({
+            title: 'Balance the teams?',
+            text: 'WolfRAT moves players to even up the teams.',
+            confirm: 'Balance teams',
+            tone: 'acc',
+            run: () => sendCommand('!balanceteams', 'Balance teams'),
+        });
+    }
+    if (kind === 'vote') {
+        return openConfirm({
+            title: 'Start the map vote now?',
+            text: 'Players vote for the next map in game chat.',
+            confirm: 'Start vote',
+            tone: 'acc',
+            run: () => sendCommand('!startvote', 'Start vote'),
+        });
+    }
     return null;
 }
 
@@ -2477,6 +3014,8 @@ function renderMore() {
     const state = lastState || {};
     show('tile-weather', !!features.weather);
     setText('tile-weather-sub', state.weather ? weatherShort(state.weather) : DASH);
+    show('tile-sky', !!features.sky);
+    setText('tile-sky-sub', skyShort());
     show('tile-lagcomp', !!features.lag_comp);
     setText('tile-lagcomp-sub', state.lag_comp ? lagShort(state.lag_comp) : DASH);
     const mode = state.manual_mode;
@@ -2663,6 +3202,7 @@ function firstJoins() {
 }
 
 function phoneStatus(support) {
+    if (!features.push) return ["This WolfRAT can't send notifications to phones.", 'OFF', ''];
     if (support === 'unsupported') {
         return isIphone() && !runningInstalled()
             ? ['On iPhone, add WolfRAT to the Home Screen first (see Install below), then turn them on in the app.', 'OFF', '']
@@ -2689,10 +3229,128 @@ function installText(support) {
         : '';
 }
 
+// ----------------------- NOTIFICATIONS: what this phone hears about
+/** The answer of /api/alerts/prefs as {groups, bell, phone}; null when it is not one. */
+function cleanAlertPrefs(data) {
+    const d = obj(data);
+    const valid = value => !!value && typeof value === 'object' && !Array.isArray(value);
+    if (!valid(d.bell) || !valid(d.phone)) return null;
+    const pick = source => {
+        const out = {};
+        Object.keys(ALERT_DEFAULTS.bell).forEach(group => {
+            if (typeof source[group] === 'boolean') out[group] = source[group];
+        });
+        return out;
+    };
+    return {
+        groups: Array.isArray(d.groups) ? d.groups.map(String) : null,
+        bell: pick(d.bell),
+        phone: pick(d.phone),
+    };
+}
+
+/** New choices: the switches, and what the bell lists and its red dot. */
+function alertPrefsChanged() {
+    renderNotify();
+    eventsChanged();
+}
+
+/** This phone's Bell and Phone choices. A 404 is an older WolfRAT: no rows, the bell as it was. */
+async function loadAlertPrefs() {
+    if (!deviceKey || alertPrefsLoading) return;
+    alertPrefsLoading = true;
+    const key = deviceKey;
+    try {
+        const res = await api('/api/alerts/prefs');
+        if (deviceKey !== key) return;
+        if (res.status === 401) {
+            signedOut(SIGNED_OUT_TEXT);
+            return;
+        }
+        const prefs = res.ok ? cleanAlertPrefs(res.data) : null;
+        if (prefs) {
+            if (!alertPrefsPending) alertPrefs = prefs;      // a tap still on its way wins
+            alertPrefsState = 'ok';
+        } else if (res.status === 404) {
+            alertPrefs = null;
+            alertPrefsState = 'missing';
+        } else if (alertPrefsState !== 'ok') {
+            alertPrefsState = 'failed';
+        }
+    } finally {
+        alertPrefsLoading = false;
+    }
+    alertPrefsChanged();
+}
+
+function alertSwitchHtml(kind, group, isOn, greyed, text, title) {
+    const what = kind === 'bell' ? 'in the bell' : 'as a phone notification';
+    return `<button class="tg${isOn ? ' on' : ''}" type="button" role="switch" aria-checked="${isOn ? 'true' : 'false'}"`
+        + ` aria-label="${esc(`${title}, ${what}`)}" data-pref="${kind}" data-group="${esc(group)}"${greyed ? ' disabled' : ''}>`
+        + `<svg class="i"><use href="#${kind === 'bell' ? 'bell' : 'phone'}"/></svg>${esc(text)}</button>`;
+}
+
+/** One row per kind of alert WolfRAT offers. The Phone switches work only with notifications on. */
+function alertRowsHtml(phoneWorks) {
+    const offered = alertPrefs && Array.isArray(alertPrefs.groups) ? alertPrefs.groups : null;
+    const joins = firstJoins();
+    return ALERT_GROUPS
+        .filter(([group]) => !offered || offered.indexOf(group) >= 0)
+        .map(([group, title, text]) => `<div class="nrow"><div class="main"><b>${esc(title)}</b><small>${esc(text)}</small></div>`
+            + alertSwitchHtml('bell', group, alertPref('bell', group), false, 'Bell', title)
+            + alertSwitchHtml('phone', group, phoneWorks && alertPref('phone', group), !phoneWorks,
+                group === 'join' && joins ? `First ${joins}` : 'Phone', title)
+            + '</div>')
+        .join('');
+}
+
+/**
+ * A tap on a Bell or Phone switch: it changes at once and goes to WolfRAT as
+ * that one value. If WolfRAT does not take it, the switch goes back and a
+ * toast says why.
+ */
+async function setAlertPref(kind, group, value) {
+    if ((kind !== 'bell' && kind !== 'phone') || alertPrefsState !== 'ok' || !alertPrefs) return null;
+    const row = ALERT_GROUPS.find(([id]) => id === group);
+    if (!row) return null;
+    if (kind === 'phone' && !pushIsOn()) return null;
+    const want = !!value;
+    const before = alertPref(kind, group);
+    if (want === before) return null;
+    const key = deviceKey;
+    alertPrefs = {...alertPrefs, [kind]: {...alertPrefs[kind], [group]: want}};
+    alertPrefsPending += 1;
+    alertPrefsChanged();
+    const res = await api('/api/alerts/prefs', {method: 'POST', body: {[kind]: {[group]: want}}});
+    if (deviceKey !== key) return null;                       // signed out meanwhile
+    alertPrefsPending = Math.max(0, alertPrefsPending - 1);
+    if (res.status === 401) {
+        signedOut(SIGNED_OUT_TEXT);
+        return {ok: false, accepted: false, error: 'Signed out', outcome: 'error'};
+    }
+    let result;
+    if (res.ok) {
+        const saved = cleanAlertPrefs(res.data);
+        if (saved && !alertPrefsPending) alertPrefs = saved;  // WolfRAT's own copy, once no tap is on its way
+        result = {ok: true, outcome: 'accepted'};
+    } else {
+        // Only this switch goes back: another tap may still be on its way.
+        if (alertPrefs) alertPrefs = {...alertPrefs, [kind]: {...alertPrefs[kind], [group]: before}};
+        const error = res.status === 429
+            ? lockedText(res.retryAfter)
+            : (res.data.error || (res.status ? `HTTP ${res.status}` : 'Connection error'));
+        result = renderOperationResult({error}, {label: `${row[1]}${DOT}${kind === 'bell' ? 'Bell' : 'Phone'}`});
+    }
+    alertPrefsChanged();
+    return result;
+}
+
+function toggleAlertPref(kind, group) {
+    return setAlertPref(kind, group, !alertPref(kind, group));
+}
+
 function renderNotify() {
     const support = pushSupport();
-    show('tile-notify', !!features.push);
-    setText('tile-notify-sub', !pushInfo ? 'Player joins' : pushIsOn() ? 'On' : 'Off');
 
     // Plain HTTP: one line, and the secure address when WolfRAT knows it.
     show('nt-insecure', support === 'insecure');
@@ -2722,6 +3380,27 @@ function renderNotify() {
         if (button) button.disabled = pushBusy;
     });
 
+    // What this phone hears about. Hidden on an older WolfRAT that keeps no such choices.
+    const phoneWorks = pushIsOn();
+    show('nt-prefs', alertPrefsState !== 'missing');
+    const rows = $('nt-rows');
+    if (rows) {
+        const html = alertPrefsState === 'ok'
+            ? alertRowsHtml(phoneWorks)
+            : `<p class="empty">${alertPrefsState === 'failed' ? "Couldn't load this phone's choices." : `Loading${ELLIPSIS}`}</p>`;
+        if (html !== alertRowsKey) {
+            alertRowsKey = html;
+            rows.innerHTML = html;
+        }
+    }
+    setText('nt-phone-hint', support === 'insecure'
+        ? 'Phone notifications need the secure address.'
+        : 'Turn on notifications above to use the Phone switches.');
+    show('nt-phone-hint', alertPrefsState === 'ok' && !phoneWorks);
+
+    // The first-joins number: WolfRAT's own, so only where it can send notifications.
+    show('nt-joins-head', !!features.push);
+    show('nt-joins-card', !!features.push);
     const count = firstJoins();
     setText('nt-count', count === null ? DASH : String(count));
     const minus = $('nt-minus');
@@ -2912,6 +3591,130 @@ function setFog(metres) {
     return submitHttpOperation('/api/weather', {fog_m: value}, {label: `Fog ${value} m`});
 }
 
+// ------------------------------------------------------------------- SKY
+/** state.sky, or null when this WolfRAT cannot do sky colours. */
+function skyState() {
+    const sky = lastState && lastState.sky;
+    return sky && typeof sky === 'object' && !Array.isArray(sky) ? sky : null;
+}
+
+/** The id of the scene showing now; '' for the map's own sky. */
+function skyShowing() {
+    const sky = skyState();
+    const scene = sky ? sky.scene : null;
+    return scene === null || scene === undefined || scene === '' ? '' : String(scene);
+}
+
+/** Why a sky cannot be sent right now; '' when it can. */
+function skyProblem() {
+    const sky = skyState();
+    return sky && typeof sky.problem === 'string' ? sky.problem.trim() : '';
+}
+
+function skyScenes() {
+    return (Array.isArray(features.sky_scenes) ? features.sky_scenes : [])
+        .filter(s => s && typeof s === 'object' && s.id !== undefined && s.id !== null && s.id !== ''
+            && String(s.id) !== 'off');
+}
+
+/** The More tile's line: the scene's name when one is showing, else what WolfRAT says. */
+function skyShort() {
+    const sky = skyState();
+    if (!sky) return DASH;
+    const showing = skyShowing();
+    const scene = showing ? skyScenes().find(s => String(s.id) === showing) : null;
+    if (scene) return String(scene.label || scene.id);
+    return sky.summary ? String(sky.summary) : DASH;
+}
+
+/** "#rrggbb" as [r, g, b]; null for anything else, so a colour never goes into the page as it was sent. */
+function hexColour(value) {
+    const match = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(typeof value === 'string' ? value.trim() : '');
+    return match ? [parseInt(match[1], 16), parseInt(match[2], 16), parseInt(match[3], 16)] : null;
+}
+
+function rgbText(rgb, scale) {
+    return `rgb(${rgb.map(part => Math.max(0, Math.min(255, Math.floor(part * scale)))).join(',')})`;
+}
+
+/**
+ * A tile's picture: the sky half fades from the horizon colour to the fog,
+ * the ground half is the sun and ground colours mixed, darker lower down.
+ * A colour the scene leaves to the map gets a neutral one.
+ */
+function skySwatch(colours) {
+    const c = obj(colours);
+    const horizon = hexColour(c.horizon) || SKY_NEUTRAL;
+    const fog = hexColour(c.fog) || horizon;
+    const sun = hexColour(c.sun) || GROUND_NEUTRAL;
+    const ground = hexColour(c.ground) || sun;
+    const land = sun.map((part, i) => (part * 2 + ground[i]) / 3);
+    return `linear-gradient(180deg,${rgbText(horizon, 1)} 0%,${rgbText(fog, 1)} 60%,`
+        + `${rgbText(land, 0.75)} 60%,${rgbText(land, 0.45)} 100%)`;
+}
+
+function skyTileHtml(scene, showing, blocked) {
+    const id = String(scene.id);
+    const label = String(scene.label || scene.id);
+    const isOn = id === showing;
+    return `<button class="skyb${isOn ? ' on' : ''}" type="button" aria-pressed="${isOn ? 'true' : 'false'}" data-sky="${esc(id)}"${blocked ? ' disabled' : ''}>`
+        + `<span class="sw" style="background:${skySwatch(scene.colours)}"></span><span class="nm">${esc(label)}</span></button>`;
+}
+
+function renderSky() {
+    const available = !!features.sky;
+    show('sky-off', !available);
+    show('sky-on', available);
+    const sky = skyState();
+    const showing = skyShowing();
+    setText('sky-summary', sky && sky.summary ? sky.summary : 'No reading yet');
+    show('sky-chip', !!showing);
+    const quick = $('qa-sky');
+    if (quick) quick.classList.toggle('on', !!showing);
+    // While a sky cannot be sent, the page says why and its sky buttons do nothing.
+    const problem = skyProblem();
+    setText('sky-problem', problem);
+    show('sky-problem', !!problem);
+    const blocked = !!problem;
+    const own = $('sky-own');
+    if (own) own.disabled = blocked || skyBusy;
+    eachEl('#sky-keep .fchip', item => { item.disabled = blocked; });
+    const scenes = skyScenes();
+    setText('sky-count', scenes.length ? `${scenes.length} ${scenes.length === 1 ? 'sky' : 'skies'}` : 'Skies');
+    // The tiles are built again only when the scenes, the one showing or the problem change.
+    const key = JSON.stringify([scenes, showing, blocked]);
+    const box = $('sky-tiles');
+    if (box && key !== skyRenderKey) {
+        skyRenderKey = key;
+        box.innerHTML = scenes.length
+            ? scenes.map(s => skyTileHtml(s, showing, blocked)).join('')
+            : '<p class="empty">No sky scenes on this WolfRAT</p>';
+    }
+}
+
+/** How long the next sky stays: 10, 30 or 60 minutes, or (anything else) until the map changes. */
+function setSkyKeep(value) {
+    if (skyProblem()) return;
+    const minutes = wholeMinutes(value);
+    skyKeep = SKY_KEEP.indexOf(minutes) >= 0 ? minutes : null;
+    eachEl('#sky-keep .fchip', item => item.classList.toggle('on', wholeMinutes(item.dataset.keep) === skyKeep));
+}
+
+/** Show a scene (for the minutes picked, or until the map changes), or 'off' = the map's own sky. */
+async function setSky(scene) {
+    const id = String(scene === null || scene === undefined ? '' : scene);
+    if (!id || skyBusy || skyProblem()) return null;
+    skyBusy = true;
+    renderSky();
+    try {
+        return await submitHttpOperation('/api/sky',
+            id === 'off' ? {scene: 'off'} : {scene: id, minutes: skyKeep}, {label: 'Sky'});
+    } finally {
+        skyBusy = false;
+        renderSky();
+    }
+}
+
 // -------------------------------------------------------------- LAG COMP
 function renderLagComp() {
     const available = !!features.lag_comp;
@@ -3029,6 +3832,18 @@ function onShellClick(event) {
     }
     if ((el = t.closest('[data-cmd]'))) { sendCommand(el.dataset.cmd); return; }
     if ((el = t.closest('[data-preset]'))) { setWeatherPreset(el.dataset.preset, el.dataset.label); return; }
+    if ((el = t.closest('[data-sky]'))) {
+        if (!el.disabled) setSky(el.dataset.sky);
+        return;
+    }
+    if ((el = t.closest('[data-keep]'))) {
+        if (!el.disabled) setSkyKeep(el.dataset.keep);
+        return;
+    }
+    if ((el = t.closest('[data-pref]'))) {
+        if (!el.disabled) toggleAlertPref(el.dataset.pref, el.dataset.group);
+        return;
+    }
     if ((el = t.closest('[data-fog]'))) {
         const range = $('fog-range');
         if (range) range.value = el.dataset.fog;
@@ -3049,6 +3864,19 @@ function onSheetClick(event) {
     if (el && !el.disabled) sheetAct(el.dataset.act, el);
 }
 
+/** A box in a sheet: data-typed names the action run as it is typed in, data-enter the one Enter runs. */
+function onSheetInput(event) {
+    const t = event.target;
+    if (t && t.dataset && t.dataset.typed) sheetAct(t.dataset.typed, t);
+}
+
+function onSheetKey(event) {
+    const t = event.target;
+    if (event.key !== 'Enter' || event.isComposing || !t || !t.dataset || !t.dataset.enter) return;
+    event.preventDefault();
+    sheetAct(t.dataset.enter, t);
+}
+
 function onRoleButtonKey(event) {
     const t = event.target;
     if (!t || (event.key !== 'Enter' && event.key !== ' ')) return;
@@ -3062,6 +3890,8 @@ function bindEvents() {
     on($('shell'), 'click', onShellClick);
     on($('shell'), 'keydown', onRoleButtonKey);
     on($('sheet'), 'click', onSheetClick);
+    on($('sheet'), 'input', onSheetInput);
+    on($('sheet'), 'keydown', onSheetKey);
     on($('scrim'), 'click', () => closeSheet());
     on($('operation-result'), 'click', hideToast);
     on(document, 'keydown', event => {
@@ -3088,6 +3918,8 @@ function bindEvents() {
         scrollToId('mode-card');
     });
     on($('now-next'), 'click', () => go('maps'));
+    on($('now-ring'), 'click', () => openTimeSheet());
+    on($('sky-own'), 'click', () => setSky('off'));
     on($('mp-change'), 'click', openNextPicker);
     on($('pl-find-input'), 'input', event => {
         playerQuery = String(event.target.value || '');
