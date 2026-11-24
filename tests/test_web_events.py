@@ -284,19 +284,25 @@ def test_a_map_load_after_the_first_join_does_not_notify_twice():
 
 def test_the_link_is_reported_after_2_minutes_down_and_when_back():
     watch = LinkWatch()
-    assert watch.update(False, 0) == []                # never up yet: not lost
-    assert watch.update(False, 500) == []
-    assert watch.update(True, 600) == []
-    assert watch.update(False, 1000) == []
-    assert watch.update(False, 1100) == []             # a short drop: nothing
-    lost = watch.update(False, 1120)
+
+    def read(connected, now):
+        """The bell's events (what goes to the phones: test_web_link_watch.py)."""
+        events, _notices = watch.update(connected, now)
+        return events
+
+    assert read(False, 0) == []                        # never up yet: not lost
+    assert read(False, 500) == []
+    assert read(True, 600) == []
+    assert read(False, 1000) == []
+    assert read(False, 1100) == []                     # a short drop: nothing
+    lost = read(False, 1120)
     assert [(event.kind, event.text, event.ts) for event in lost] == [
         ("server", "Lost the link to the game server", 1000)]
-    assert watch.update(False, 1500) == []             # once
-    back = watch.update(True, 1300 + 1000)
+    assert read(False, 1500) == []                     # once
+    back = read(True, 1300 + 1000)
     assert [(event.kind, event.text) for event in back] == [
         ("server", "Game server link is back (down 21 min)")]
-    assert watch.update(False, 3000) == [] and watch.update(True, 3060) == []
+    assert read(False, 3000) == [] and read(True, 3060) == []
 
 
 def test_a_new_map_is_an_event_the_first_one_is_not():
@@ -329,4 +335,5 @@ def test_votes_start_and_end():
 
 def test_every_kind_is_in_the_contract():
     assert set(web_events.KINDS) == {
-        "join", "leave", "map", "vote", "kick", "ban", "warn", "server"}
+        "join", "leave", "map", "vote", "kick", "ban", "warn", "server",
+        "zone", "flag"}

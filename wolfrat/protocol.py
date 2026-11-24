@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from concurrent.futures import Future, InvalidStateError
 from dataclasses import dataclass, replace
+import errno
 import logging
 import random
 import threading
@@ -51,6 +52,17 @@ _SECRET_SETTING_NAMES = frozenset(
 
 class _MissionNotFoundError(ValueError):
     """A mission target is absent, rather than present but ambiguous."""
+
+
+def _connect_refused(error: BaseException) -> bool:
+    """True when a connect failed because nothing listens on the admin port
+    (the game server is not running), not because it was slow to answer."""
+
+    return (
+        isinstance(error, ConnectionRefusedError)
+        or getattr(error, "errno", None) == errno.ECONNREFUSED
+        or getattr(error, "winerror", None) == 10061
+    )
 
 
 @dataclass(frozen=True)
@@ -276,6 +288,13 @@ class ServerManager:
         self._parse_warnings_seen: set[str] = set()
         # coop_guard.CoopGuard, set by the Chat Bot tab. Every swap asks it.
         self.swap_guard = None
+        # For the phone page's "game server down" alert, read by the web
+        # server's thread.  connect_refused: the last connect attempt found
+        # nothing listening on the admin port (False again once connected).
+        # disconnected_on_purpose: the admin pressed Disconnect on the PC
+        # (the Server tab sets it; False again when he connects).
+        self.connect_refused = False
+        self.disconnected_on_purpose = False
 
     @property
     def proto(self) -> _ProtocolView:
@@ -383,6 +402,7 @@ class ServerManager:
             with self._lock:
                 # Log the full picture once per connection.
                 self._wire_seen.clear()
+            self.connect_refused = False
             self._apply_result(first)
             self._log(f"Connected to {host}:{port}")
             if self.on_session_ready is not None:
@@ -411,6 +431,7 @@ class ServerManager:
                     self._mutation_tail = completed_future(None)
             if session is not None:
                 session.close()
+            self.connect_refused = _connect_refused(error)
             self._log(f"Connection failed: {error}")
             return False, f"Connection failed: {error}"
 

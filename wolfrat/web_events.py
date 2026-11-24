@@ -1,14 +1,19 @@
-"""The phone page's alerts (the bell) and who counts for join notifications.
+"""The phone page's alerts (the bell), each phone's choices and what goes to
+the phones as notifications.
 
 Plain Python, no Qt and no network, so every rule here can be tested with a
 made-up clock:
 
 * ``EventFeed`` keeps the last 100 events in memory (any thread).
+* ``GROUPS``, ``group_of`` and ``clean_prefs``: the kinds of alert a phone
+  can switch on and off, for its bell and for its notifications.
 * ``PlayerWatch`` turns the player lists into join and leave events and says
   which joins should go to the phones ("the first couple that join" a server
   that has been empty).
-* ``LinkWatch``, ``MapWatch`` and ``VoteWatch`` turn the admin link, the
-  current map and the vote into events.
+* ``LinkWatch`` turns the admin link into "the game server stopped", "lost
+  the link" and "back", for the bell and for the phones.
+* ``MapWatch`` and ``VoteWatch`` turn the current map and the vote into
+  events.
 
 The watchers are fed by the web server's own thread (``WolfWebServer``), one
 reading at a time.
@@ -19,6 +24,7 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from collections.abc import Mapping
 from typing import NamedTuple, Optional
 
 MAX_EVENTS = 100          # kept in memory, nothing saved
@@ -27,8 +33,108 @@ JOIN_GAP = 3 * 60         # a player counts as joined only if not seen for 3 min
 LEAVE_AFTER = 2 * 60      # ...and as gone once missing for 2 minutes (map loads empty the list)
 EMPTY_AFTER = 10 * 60     # no players for 10 minutes while the link is up = empty
 LINK_LOST_AFTER = 2 * 60  # the admin link down this long is worth an alert
+DOWN_NOTICE_AFTER = 3 * 60  # ...and down this long is worth a notification
 
-KINDS = ("join", "leave", "map", "vote", "kick", "ban", "warn", "server")
+KINDS = ("join", "leave", "map", "vote", "kick", "ban", "warn", "server",
+         "zone", "flag")
+
+# --- What each phone hears about ---
+# Every kind of event belongs to one group; a phone switches each group on or
+# off twice: for its bell (the list on the page) and for its notifications.
+GROUPS = ("join", "leave", "map", "vote", "admin", "server", "objective")
+KIND_GROUPS = {
+    "join": "join",
+    "leave": "leave",
+    "map": "map",
+    "vote": "vote",
+    "kick": "admin",
+    "ban": "admin",
+    "warn": "admin",
+    "server": "server",
+    "zone": "objective",
+    "flag": "objective",
+}
+CHANNELS = ("bell", "phone")
+# What a phone gets until it chooses.
+DEFAULT_PREFS = {
+    "bell": {"join": True, "leave": False, "map": False, "vote": False,
+             "admin": True, "server": True, "objective": False},
+    "phone": {"join": True, "leave": False, "map": False, "vote": False,
+              "admin": False, "server": True, "objective": False},
+}
+# Groups whose every event is one notification.  Not "join" (only the first
+# joins on an empty server notify, see PlayerWatch) and not "server" (the
+# phones get their own lines, see LinkWatch).
+EVENT_NOTICE_GROUPS = frozenset({"leave", "map", "vote", "admin", "objective"})
+
+
+def group_of(kind):
+    """The group an event kind belongs to, or None for a kind nobody listed."""
+    return KIND_GROUPS.get(str(kind))
+
+
+def default_prefs():
+    """A phone's choices before it made any."""
+    return {channel: dict(DEFAULT_PREFS[channel]) for channel in CHANNELS}
+
+
+def clean_prefs(value):
+    """A full, valid set of choices from whatever was saved: every group in
+    both lists, anything missing or damaged at its default."""
+    saved = value if isinstance(value, Mapping) else {}
+    prefs = {}
+    for channel in CHANNELS:
+        chosen = saved.get(channel)
+        chosen = chosen if isinstance(chosen, Mapping) else {}
+        prefs[channel] = {
+            group: (chosen[group] if isinstance(chosen.get(group), bool)
+                    else DEFAULT_PREFS[channel][group])
+            for group in GROUPS
+        }
+    return prefs
+
+
+def changed_prefs(current, changes):
+    """``current`` with the switches named in ``changes`` set:
+    ``{"bell": {"map": True}, "phone": {"server": False}}``, any part of it.
+
+    Returns ``(prefs, None)``, or ``(None, reason)`` when a list, a group or a
+    value is not one of ours (then nothing is to change).
+    """
+    if not isinstance(changes, Mapping):
+        return None, "The choices must be an object"
+    prefs = clean_prefs(current)
+    for channel, switches in changes.items():
+        if channel not in CHANNELS:
+            return None, f"Unknown list of choices: {str(channel)[:40]}"
+        if not isinstance(switches, Mapping):
+            return None, f"{channel} must be an object of switches"
+        for group, value in switches.items():
+            if group not in GROUPS:
+                return None, f"Unknown kind of alert: {str(group)[:40]}"
+            if not isinstance(value, bool):
+                return None, f"{channel}.{group} must be true or false"
+            prefs[channel][group] = value
+    return prefs, None
+
+
+def prefs_reply(prefs):
+    """A phone's choices as the page gets them."""
+    prefs = clean_prefs(prefs)
+    return {"groups": list(GROUPS), "bell": prefs["bell"], "phone": prefs["phone"]}
+
+
+def duration_text(seconds):
+    """How long something lasted: "45 s", "2 min 24 s", "1 h 12 min"."""
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        minutes, rest = divmod(seconds, 60)
+        return f"{minutes} min {rest} s" if rest else f"{minutes} min"
+    hours, rest = divmod(seconds, 3600)
+    minutes = rest // 60
+    return f"{hours} h {minutes} min" if minutes else f"{hours} h"
 
 
 class Event(NamedTuple):
@@ -221,37 +327,86 @@ class PlayerWatch:
 
 
 class LinkWatch:
-    """"Lost the link to the game server" after 2 minutes down, then "back".
+    """The admin link: "the game server stopped", "lost the link", "back".
 
-    Nothing until the link has been up once (WolfRAT not connected yet is
-    not a lost link).
+    ``update(connected, now, refused, on_purpose)`` takes one reading and
+    returns ``(events, notices)``: events for the bell, and lines for the
+    phones that have the "server" group on.
+
+    * ``refused``: WolfRAT's last try to connect found nothing listening on
+      the admin port.  That is the server program itself not running; a map
+      load only drops the link for a few seconds and the port stays open.
+    * ``on_purpose``: the admin pressed Disconnect on the PC.  Nothing is
+      said and everything is forgotten; it starts fresh when he connects.
+    * Nothing until the link has been up once (WolfRAT not connected yet is
+      not a lost link), and nothing for a drop that is back before a rule
+      below fires.
+
+    The bell: "Game server stopped" as soon as a try is refused (its time is
+    when the link dropped), or "Lost the link to the game server" after 2
+    minutes down without one; then "Game server is back (down 2 min 24 s)" or
+    "Game server link is back (down 3 min)".
+
+    The phones: a stop that is over within 3 minutes is one line when it is
+    back, "Game server restarted (down 2 min 24 s)".  Still down at 3
+    minutes: "Game server is down" ("Lost the link to the game server" when
+    no try was refused), then "Game server is back (down 37 min)" ("Link to
+    the game server is back (down 5 min)").
     """
 
     def __init__(self):
+        self._forget()
+
+    def _forget(self):
         self._ever_up = False
         self._down_since = None
-        self._lost = False
+        self._stopped = False         # a try was refused: the bell said "stopped"
+        self._lost = False            # the bell said "lost the link"
+        self._told = False            # the phones were told it is down
 
-    def update(self, connected, now):
+    def update(self, connected, now, refused=False, on_purpose=False):
+        events, notices = [], []
+        if on_purpose:
+            self._forget()
+            return events, notices
         if connected:
-            events = []
-            if self._lost:
-                minutes = max(1, int((now - self._down_since) // 60))
-                events.append(Event('server', f"Game server link is back (down {minutes} min)",
-                                    None, now))
+            if self._down_since is not None:
+                down = now - self._down_since
+                if self._stopped:
+                    events.append(Event(
+                        'server', f"Game server is back (down {duration_text(down)})",
+                        None, now))
+                    notices.append(
+                        f"Game server is back (down {duration_text(down)})" if self._told
+                        else f"Game server restarted (down {duration_text(down)})")
+                elif self._lost:
+                    minutes = max(1, int(down // 60))
+                    events.append(Event(
+                        'server', f"Game server link is back (down {minutes} min)",
+                        None, now))
+                    if self._told:
+                        notices.append(
+                            f"Link to the game server is back (down {duration_text(down)})")
+            self._forget()
             self._ever_up = True
-            self._down_since = None
-            self._lost = False
-            return events
+            return events, notices
         if not self._ever_up:
-            return []
+            return events, notices
         if self._down_since is None:
             self._down_since = now
-        if not self._lost and now - self._down_since >= LINK_LOST_AFTER:
+        down = now - self._down_since
+        if refused and not self._stopped:
+            self._stopped = True
+            events.append(Event('server', "Game server stopped", None, self._down_since))
+        elif not self._stopped and not self._lost and down >= LINK_LOST_AFTER:
             self._lost = True
-            return [Event('server', "Lost the link to the game server", None,
-                          self._down_since)]
-        return []
+            events.append(Event('server', "Lost the link to the game server", None,
+                                self._down_since))
+        if not self._told and down >= DOWN_NOTICE_AFTER:
+            self._told = True
+            notices.append("Game server is down" if self._stopped
+                           else "Lost the link to the game server")
+        return events, notices
 
 
 class MapWatch:
