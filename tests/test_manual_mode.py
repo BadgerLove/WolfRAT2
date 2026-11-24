@@ -437,18 +437,18 @@ def test_manual_mode_kicks_nobody_off_the_ban_list_and_says_so_on_a_new_ban(tmp_
     rig = Rig(tmp_path)
     rig.tab.bans.add(br.BanEntry("name", "Troll", added_at=rig.now))
     go_manual()
-    rig.poll(("Dale", "82.68.58.92"), ("Troll", "5.6.7.8"))
+    rig.poll(("Dale", "198.51.100.92"), ("Troll", "5.6.7.8"))
     assert rig.punts == [] and rig.said == []
     rig.tab.ban_now("Griefer", reason="griefing")
     assert any("Manual mode" in line for line in rig.logged)
     manual_mode.state.choose(FULL)
-    rig.poll(("Dale", "82.68.58.92"), ("Troll", "5.6.7.8"))
+    rig.poll(("Dale", "198.51.100.92"), ("Troll", "5.6.7.8"))
     assert [name for name, _why in rig.punts] == ["Troll"]    # Full again: the list is kept
 
 
 def test_manual_mode_ban_button_still_kicks_the_player_you_picked(tmp_path):
     rig = Rig(tmp_path)
-    rig.poll(("Dale", "82.68.58.92"), ("Troll", "5.6.7.8"))
+    rig.poll(("Dale", "198.51.100.92"), ("Troll", "5.6.7.8"))
     go_manual()
     rig.tab.online_table.selectRow(1)
     rig.tab.online_reason.setText("griefing")

@@ -74,11 +74,11 @@ class ImportDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
             "One entry per line: <b>value</b>, or <b>value | reason</b>, or <b>value | reason | expiry</b>.<br>"
-            "Value = a name, an IP, <code>82.68.*</code>, <code>82.68.0.0/16</code> or <code>a.b.c.d-e.f.g.h</code>. "
+            "Value = a name, an IP, <code>198.51.*</code>, <code>198.51.0.0/16</code> or <code>a.b.c.d-e.f.g.h</code>. "
             "Expiry = never, 7d, 12h, 30m or a date. Babstats <code>ip=reason</code> lines and JO "
             "<code>banlist.txt</code> lines are understood. Comments (#, //, ;) are skipped."))
         self.edit = QPlainTextEdit()
-        self.edit.setPlaceholderText("82.68.58.92 | griefing | 7d\nTroll\n10.0.0.*")
+        self.edit.setPlaceholderText("198.51.100.92 | griefing | 7d\nTroll\n10.0.0.*")
         self.edit.textChanged.connect(self._preview)
         layout.addWidget(self.edit, 2)
         self.preview = QPlainTextEdit(); self.preview.setReadOnly(True)
@@ -335,7 +335,7 @@ class BansTab(QWidget):
         self.ban_table.customContextMenuRequested.connect(self._ban_table_menu)
         list_layout.addWidget(self.ban_table)
         add_row = QHBoxLayout()
-        self.add_value = QLineEdit(); self.add_value.setPlaceholderText("name, IP, 82.68.*, 82.68.0.0/16 or a.b.c.d-e.f.g.h")
+        self.add_value = QLineEdit(); self.add_value.setPlaceholderText("name, IP, 198.51.*, 198.51.0.0/16 or a.b.c.d-e.f.g.h")
         self.add_reason = QLineEdit(); self.add_reason.setPlaceholderText("reason")
         self.add_expiry = QComboBox()
         for label, _code in EXPIRY_CHOICES:
@@ -659,7 +659,7 @@ class BansTab(QWidget):
         self.save()
 
     def _with_country(self, ip: str) -> str:
-        """'GB 82.68.58.92' when a connection check has told us the country."""
+        """'GB 198.51.100.92' when a connection check has told us the country."""
         if not ip:
             return "-"
         v = self.verdicts.get(ip, self._clock())

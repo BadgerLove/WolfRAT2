@@ -8,8 +8,8 @@ own list of NAMES and IPs and punt a match the moment they appear.  This
 module is that list.
 
 Entries match a player by name (case-insensitive, optional trailing ``*``)
-or by IP (exact, ``82.68.*`` wildcards the Babstats way, ``82.68.0.0/16``,
-or ``82.68.58.1-82.68.58.99``).  A whitelist entry beats everything.
+or by IP (exact, ``198.51.*`` wildcards the Babstats way, ``198.51.0.0/16``,
+or ``198.51.100.1-198.51.100.99``).  A whitelist entry beats everything.
 """
 
 from __future__ import annotations
@@ -121,7 +121,7 @@ def ip_matches(pattern: str, ip: str) -> bool:
         if _IPV4.match(p):
             return addr == ipaddress.IPv4Address(p)
         if _WILD.match(p):
-            prefix = p[:-1]                      # "82.68." keeps the dot
+            prefix = p[:-1]                      # "198.51." keeps the dot
             return (ip + ".").startswith(prefix)
         if _CIDR.match(p):
             return addr in ipaddress.IPv4Network(p, strict=False)
@@ -329,7 +329,7 @@ def _split_fields(line: str) -> list[str]:
 
 def parse_import(text: str, *, now: float, added_by: str = "import") -> list[ParsedLine]:
     """One entry per line: ``value``, ``value | reason``, ``value | reason | expiry``.
-    Value = a name, an IP, ``82.68.*``, ``82.68.0.0/16`` or ``a.b.c.d-e.f.g.h``.
+    Value = a name, an IP, ``198.51.*``, ``198.51.0.0/16`` or ``a.b.c.d-e.f.g.h``.
     Blank lines, ``#``/``//``/``;`` comments and ``[sections]`` are ignored."""
     out = []
     for raw in text.splitlines():

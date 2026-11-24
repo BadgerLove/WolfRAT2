@@ -145,7 +145,7 @@ def test_a_failed_kick_says_why_and_announces_nothing(qtbot):
 def test_ban_uses_wolfrats_own_list_with_the_length_then_kicks(qtbot, tmp_path):
     from tests.test_bans_tab import Rig
     rig = Rig(tmp_path)
-    rig.poll(("Alice", "82.68.58.92"))
+    rig.poll(("Alice", "198.51.100.92"))
     mods = FakeMods()
     bridge, window, _web = make_bridge(mods_tab=mods, bans_tab=rig.tab)
 
@@ -155,7 +155,7 @@ def test_ban_uses_wolfrats_own_list_with_the_length_then_kicks(qtbot, tmp_path):
     assert result["ok"] is True
     assert result["replies"] == ["Alice banned (name and IP, for 7 days)"]
     entries = {(entry.kind, entry.value): entry for entry in rig.tab.bans.entries}
-    assert set(entries) == {("name", "Alice"), ("ip", "82.68.58.92")}
+    assert set(entries) == {("name", "Alice"), ("ip", "198.51.100.92")}
     for entry in entries.values():
         assert entry.expires_at == rig.now + 7 * 86400
         assert entry.added_by == "Web Admin (Pixel)"
@@ -163,14 +163,14 @@ def test_ban_uses_wolfrats_own_list_with_the_length_then_kicks(qtbot, tmp_path):
     assert window.server.calls == [("punt", ALICE, "cheating")]
     assert mods.said == ["Alice was banned by an admin"]
     # Noted as punted: the next poll does not remove (and announce) them again.
-    rig.poll(("Alice", "82.68.58.92"))
+    rig.poll(("Alice", "198.51.100.92"))
     assert rig.punts == []
 
 
 def test_ban_lengths_come_from_the_bans_tab_and_others_are_refused(qtbot, tmp_path):
     from tests.test_bans_tab import Rig
     rig = Rig(tmp_path)
-    rig.poll(("Alice", "82.68.58.92"))
+    rig.poll(("Alice", "198.51.100.92"))
     bridge, window, _web = make_bridge(mods_tab=FakeMods(), bans_tab=rig.tab)
     assert [item["id"] for item in web_bridge._ban_lengths()] == ["", "1h", "1d", "7d", "30d", "90d"]
     assert web_bridge._ban_lengths()[0] == {"id": "", "label": "Never"}
@@ -383,7 +383,7 @@ def test_the_snapshot_reaches_the_web_server(qtbot, tmp_path):
     career_panel = types.SimpleNamespace(store=store, ranks=build_ranks)
     bans = types.SimpleNamespace(
         game_type_now=lambda: 0x10000,
-        connection_for=lambda name: ("82.68.58.92", Verdict("82.68.58.92", 0.0, country="gb")),
+        connection_for=lambda name: ("198.51.100.92", Verdict("198.51.100.92", 0.0, country="gb")),
     )
     missions = types.SimpleNamespace(_find_display_name=lambda f: f"Title of {f}")
     mods = FakeMods()

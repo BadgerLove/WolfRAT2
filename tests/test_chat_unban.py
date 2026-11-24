@@ -45,9 +45,9 @@ def test_an_address_banned_with_nobody_and_a_shared_one_are_left_alone():
     bans = BanList()
     bans.add(BanEntry(KIND_NAME, "Griefer", linked="5.6.7.8"))
     bans.add(BanEntry(KIND_IP, "5.6.7.8", linked="Brother"))      # banned again with another name
-    bans.add(BanEntry(KIND_IP, "82.68.*"))                         # typed in by hand
+    bans.add(BanEntry(KIND_IP, "198.51.*"))                         # typed in by hand
     assert [(e.kind, e.value) for e in bans.remove_with_linked("Griefer")] == [("name", "Griefer")]
-    assert [(e.kind, e.value) for e in bans.entries] == [("ip", "5.6.7.8"), ("ip", "82.68.*")]
+    assert [(e.kind, e.value) for e in bans.entries] == [("ip", "5.6.7.8"), ("ip", "198.51.*")]
     assert bans.remove_with_linked("") == [] and len(bans.entries) == 2
 
 

@@ -20,18 +20,18 @@ def name(value, **kw):
 # ---- matching -----------------------------------------------------------------
 
 @pytest.mark.parametrize("pattern, addr, hit", [
-    ("82.68.58.92", "82.68.58.92", True),
-    ("82.68.58.92", "82.68.58.93", False),
-    ("82.68.58.*", "82.68.58.7", True),
-    ("82.68.*", "82.68.1.1", True),
-    ("82.6.*", "82.68.1.1", False),          # "82.6." must not match "82.68."
-    ("82.*", "83.0.0.1", False),
-    ("82.68.0.0/16", "82.68.200.1", True),
-    ("82.68.0.0/16", "82.69.0.1", False),
+    ("198.51.100.92", "198.51.100.92", True),
+    ("198.51.100.92", "198.51.100.93", False),
+    ("198.51.100.*", "198.51.100.7", True),
+    ("198.51.*", "198.51.1.1", True),
+    ("198.5.*", "198.51.1.1", False),          # "198.5." must not match "198.51."
+    ("198.*", "83.0.0.1", False),
+    ("198.51.0.0/16", "198.51.200.1", True),
+    ("198.51.0.0/16", "198.52.0.1", False),
     ("10.0.0.1-10.0.0.9", "10.0.0.5", True),
     ("10.0.0.1-10.0.0.9", "10.0.0.10", False),
-    ("82.68.58.92", "", False),
-    ("82.68.58.92", "garbage", False),
+    ("198.51.100.92", "", False),
+    ("198.51.100.92", "garbage", False),
 ])
 def test_ip_patterns(pattern, addr, hit):
     assert br.ip_matches(pattern, addr) is hit
@@ -50,8 +50,8 @@ def test_name_patterns(pattern, who, hit):
 
 
 @pytest.mark.parametrize("pattern, problem", [
-    ("82.68.58.92", None), ("82.68.*", None), ("82.68.0.0/16", None), ("1.1.1.1-1.1.1.9", None),
-    ("999.1.1.1", "not a valid IP address"), ("82.999.*", "a number in the address is over 255"),
+    ("198.51.100.92", None), ("198.51.*", None), ("198.51.0.0/16", None), ("1.1.1.1-1.1.1.9", None),
+    ("999.1.1.1", "not a valid IP address"), ("198.999.*", "a number in the address is over 255"),
     ("1.1.1.9-1.1.1.1", "the range runs backwards"), ("hello", "not an IP address, wildcard, CIDR or range"),
 ])
 def test_pattern_problems(pattern, problem):
@@ -60,11 +60,11 @@ def test_pattern_problems(pattern, problem):
 
 def test_whitelist_beats_a_ban_and_expiry_ends_one():
     bans = BanList()
-    bans.add(ip("82.68.*", reason="range"))
+    bans.add(ip("198.51.*", reason="range"))
     bans.add(name("Troll"))
-    assert bans.check("Someone", "82.68.1.1", NOW).reason == "range"
-    bans.add(ip("82.68.58.92"), whitelist=True)
-    assert bans.check("Someone", "82.68.58.92", NOW) is None
+    assert bans.check("Someone", "198.51.1.1", NOW).reason == "range"
+    bans.add(ip("198.51.100.92"), whitelist=True)
+    assert bans.check("Someone", "198.51.100.92", NOW) is None
     assert bans.check("Troll", "1.2.3.4", NOW).value == "Troll"
     bans.add(name("Troll", expires_at=NOW + 60))
     assert bans.check("troll", "", NOW + 59) is not None
@@ -124,8 +124,8 @@ def test_import_accepts_every_shape_we_promised():
     text = """
     # comment
     [Banned]
-    82.68.58.92
-    82.68.* | whole range
+    198.51.100.92
+    198.51.* | whole range
     Troll | griefing | 7d
     10.0.0.0/8, lab
     1.1.1.1-1.1.1.9\tvia tab
@@ -138,7 +138,7 @@ def test_import_accepts_every_shape_we_promised():
     good = [r for r in rows if r.entry]
     bad = [r for r in rows if not r.entry]
     assert [(r.entry.kind, r.entry.value) for r in good] == [
-        (KIND_IP, "82.68.58.92"), (KIND_IP, "82.68.*"), (KIND_NAME, "Troll"), (KIND_IP, "10.0.0.0/8"),
+        (KIND_IP, "198.51.100.92"), (KIND_IP, "198.51.*"), (KIND_NAME, "Troll"), (KIND_IP, "10.0.0.0/8"),
         (KIND_IP, "1.1.1.1-1.1.1.9"), (KIND_IP, "5.5.5.5"), (KIND_NAME, "OldJoName"), (KIND_NAME, "Someone"),
     ]
     troll = good[2].entry
@@ -155,12 +155,12 @@ def test_bad_expiry_is_reported_not_guessed():
 
 def test_export_round_trips():
     bans = BanList()
-    bans.add(ip("82.68.*", reason="range | with pipe"))
+    bans.add(ip("198.51.*", reason="range | with pipe"))
     bans.add(name("Troll", reason="griefing", expires_at=NOW + 86400))
     text = br.export_lines(bans.entries)
     back = [r.entry for r in br.parse_import(text, now=NOW)]
     assert [(e.kind, e.value, e.reason) for e in back] == [
-        (KIND_IP, "82.68.*", "range / with pipe"), (KIND_NAME, "Troll", "griefing")]
+        (KIND_IP, "198.51.*", "range / with pipe"), (KIND_NAME, "Troll", "griefing")]
     assert back[0].expires_at is None and back[1].expires_at is not None
 
 
@@ -176,10 +176,10 @@ def test_json_round_trip_survives_junk():
 # ---- firewall lines ----------------------------------------------------------------
 
 @pytest.mark.parametrize("pattern, address", [
-    ("82.68.58.92", "82.68.58.92"),
-    ("82.68.*", "82.68.0.0-82.68.255.255"),
-    ("82.*", "82.0.0.0-82.255.255.255"),
-    ("82.68.0.0/16", "82.68.0.0/16"),
+    ("198.51.100.92", "198.51.100.92"),
+    ("198.51.*", "198.51.0.0-198.51.255.255"),
+    ("198.*", "198.0.0.0-198.255.255.255"),
+    ("198.51.0.0/16", "198.51.0.0/16"),
     ("1.1.1.1 - 1.1.1.9", "1.1.1.1-1.1.1.9"),
 ])
 def test_firewall_address_shapes(pattern, address):
@@ -187,8 +187,8 @@ def test_firewall_address_shapes(pattern, address):
 
 
 def test_firewall_commands_are_one_line_and_pair_up():
-    block = br.firewall_block_command("82.68.*")
-    unblock = br.firewall_unblock_command("82.68.*")
+    block = br.firewall_block_command("198.51.*")
+    unblock = br.firewall_unblock_command("198.51.*")
     assert "\n" not in block and "\n" not in unblock
-    assert block.startswith('New-NetFirewallRule -DisplayName "WolfRAT ban 82.68.*" -Direction Inbound -Action Block -Protocol UDP -RemoteAddress 82.68.0.0-82.68.255.255')
-    assert unblock.startswith('Remove-NetFirewallRule -DisplayName "WolfRAT ban 82.68.*"')
+    assert block.startswith('New-NetFirewallRule -DisplayName "WolfRAT ban 198.51.*" -Direction Inbound -Action Block -Protocol UDP -RemoteAddress 198.51.0.0-198.51.255.255')
+    assert unblock.startswith('Remove-NetFirewallRule -DisplayName "WolfRAT ban 198.51.*"')

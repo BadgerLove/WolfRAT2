@@ -50,7 +50,7 @@ class Rig:
 
 def test_ban_from_the_online_table_then_punt_on_sight_with_cooldown(tmp_path):
     rig = Rig(tmp_path)
-    rig.poll(("Dale", "82.68.58.92"), ("Troll", "5.6.7.8"))
+    rig.poll(("Dale", "198.51.100.92"), ("Troll", "5.6.7.8"))
     assert rig.punts == [] and rig.tab.online_table.item(1, 1).text() == "5.6.7.8"
     rig.tab.online_table.selectRow(1)
     rig.tab.online_reason.setText("griefing")
@@ -60,12 +60,12 @@ def test_ban_from_the_online_table_then_punt_on_sight_with_cooldown(tmp_path):
     assert rig.tab.bans.entries[0].expires_at == rig.now + 7 * 86400
     assert rig.punts == [("Troll", "Banned: griefing")]
     rig.punts.clear()
-    rig.poll(("Dale", "82.68.58.92"), ("Troll", "5.6.7.8"))            # 5 s on, still leaving: no double punt
+    rig.poll(("Dale", "198.51.100.92"), ("Troll", "5.6.7.8"))            # 5 s on, still leaving: no double punt
     assert rig.punts == []
-    rig.poll(("Dale", "82.68.58.92"))                                  # gone - the punt worked
-    rig.poll(("Dale", "82.68.58.92"), ("Troll", "5.6.7.8"))            # back: out again straight away
+    rig.poll(("Dale", "198.51.100.92"))                                  # gone - the punt worked
+    rig.poll(("Dale", "198.51.100.92"), ("Troll", "5.6.7.8"))            # back: out again straight away
     assert rig.punts == [("Troll", "Banned: griefing")] and rig.said == ["Troll removed - banned: griefing"]
-    rig.poll(("Dale", "82.68.58.92"), ("Troll", "5.6.7.8"))            # still there 5 s later: cooldown holds
+    rig.poll(("Dale", "198.51.100.92"), ("Troll", "5.6.7.8"))            # still there 5 s later: cooldown holds
     assert len(rig.punts) == 1
     assert rig.tab.bans.entries[0].hits == 1 and rig.tab.bans.entries[0].last_hit_ip == "5.6.7.8"
 
@@ -92,16 +92,16 @@ def test_whitelist_beats_a_range_and_the_tab_says_so_in_its_log(tmp_path):
 def test_firewall_copy_needs_an_ip_row_and_puts_the_powershell_line_on_the_clipboard(tmp_path):
     rig = Rig(tmp_path)
     rig.tab.add_value.setText("Troll"); rig.tab._add_typed()
-    rig.tab.add_value.setText("82.68.*"); rig.tab._add_typed()
+    rig.tab.add_value.setText("198.51.*"); rig.tab._add_typed()
     rows = {rig.tab.ban_table.item(r, 0).text(): r for r in range(rig.tab.ban_table.rowCount())}
     rig.tab.ban_table.selectRow(rows["name"])
     assert not rig.tab.copy_block_btn.isEnabled()
     rig.tab.ban_table.selectRow(rows["ip"])
     assert rig.tab.copy_block_btn.isEnabled()
     rig.tab._copy_firewall(True)
-    assert _app.clipboard().text() == br.firewall_block_command("82.68.*")
+    assert _app.clipboard().text() == br.firewall_block_command("198.51.*")
     rig.tab._copy_firewall(False)
-    assert _app.clipboard().text() == br.firewall_unblock_command("82.68.*")
+    assert _app.clipboard().text() == br.firewall_unblock_command("198.51.*")
 
 
 def test_bad_typed_value_is_refused_with_the_reason(tmp_path):
@@ -235,19 +235,19 @@ def test_checks_off_by_default_and_nothing_is_looked_up(tmp_path):
 def test_vpn_is_kicked_once_per_visit_and_the_verdict_shows_in_the_table(tmp_path):
     rig = checks_rig(tmp_path)
     rig.tab.checks_cb.setChecked(True)
-    rig.poll(("Troll", "5.6.7.8"), ("Dale", "82.68.58.92"))
-    assert sorted(x[0] for x in rig.checker.submitted) == ["5.6.7.8", "82.68.58.92"]
+    rig.poll(("Troll", "5.6.7.8"), ("Dale", "198.51.100.92"))
+    assert sorted(x[0] for x in rig.checker.submitted) == ["198.51.100.92", "5.6.7.8"]
     assert rig.tab.online_table.item(0, 2).text() == "checking..."
-    rig.tab._on_verdict(ic.Verdict("82.68.58.92", rig.now, country="GB", provider="Zen"))
+    rig.tab._on_verdict(ic.Verdict("198.51.100.92", rig.now, country="GB", provider="Zen"))
     rig.tab._on_verdict(ic.Verdict("5.6.7.8", rig.now, proxy=True, kind="VPN", country="DE", provider="NordVPN"))
     assert rig.punts == [("Troll", "Kicked: VPN connection (NordVPN)")]
     assert rig.said == ["Troll removed - VPN connection (NordVPN)"]
     assert rig.tab.online_table.item(0, 2).text() == "VPN (DE, NordVPN)"
     assert rig.tab.online_table.item(1, 2).text() == "clear (GB, Zen)"
-    rig.poll(("Troll", "5.6.7.8"), ("Dale", "82.68.58.92"))          # still there 5 s later: no repeat
+    rig.poll(("Troll", "5.6.7.8"), ("Dale", "198.51.100.92"))          # still there 5 s later: no repeat
     assert len(rig.punts) == 1
-    rig.poll(("Dale", "82.68.58.92"))                                  # gone
-    rig.poll(("Troll", "5.6.7.8"), ("Dale", "82.68.58.92"))          # back: kicked again, from the cache
+    rig.poll(("Dale", "198.51.100.92"))                                  # gone
+    rig.poll(("Troll", "5.6.7.8"), ("Dale", "198.51.100.92"))          # back: kicked again, from the cache
     assert len(rig.punts) == 2 and len(rig.checker.submitted) == 2
 
 
@@ -291,14 +291,14 @@ def test_lookup_errors_never_kick(tmp_path):
 def test_country_letters_sit_in_front_of_the_ip_once_known(tmp_path):
     rig = checks_rig(tmp_path)
     rig.tab.checks_cb.setChecked(True)
-    rig.poll(("Dale", "82.68.58.92"))
+    rig.poll(("Dale", "198.51.100.92"))
     rig.tab.ban_now("Dale", kind="ip")
-    assert rig.tab.online_table.item(0, 1).text() == "82.68.58.92"
-    rig.tab._on_verdict(ic.Verdict("82.68.58.92", rig.now, country="GB", provider="Zen"))
-    assert rig.tab.online_table.item(0, 1).text() == "GB 82.68.58.92"
-    assert rig.tab.ban_table.item(0, 1).text() == "GB 82.68.58.92"
+    assert rig.tab.online_table.item(0, 1).text() == "198.51.100.92"
+    rig.tab._on_verdict(ic.Verdict("198.51.100.92", rig.now, country="GB", provider="Zen"))
+    assert rig.tab.online_table.item(0, 1).text() == "GB 198.51.100.92"
+    assert rig.tab.ban_table.item(0, 1).text() == "GB 198.51.100.92"
     rig.tab.pages.setCurrentIndex(2); rig.tab._refresh_history()
-    assert rig.tab.hist_table.item(0, 1).text() == "GB 82.68.58.92"
+    assert rig.tab.hist_table.item(0, 1).text() == "GB 198.51.100.92"
 
 
 # ---- idle kick ------------------------------------------------------------------
@@ -368,7 +368,7 @@ def test_zone_flip_is_reported_to_the_sprees_hook_and_zones_left_feeds_the_vote(
              ZoneInfo(5, 2, (-12567544, 54416764, 0)), ZoneInfo(2, 1, (-18556912, 47465764, 0)),
              ZoneInfo(1, 1, (-24908850, 52048208, 0))]
     rig.reader.read_zones = lambda: start
-    rig.reader.slots = [SlotInfo(1, "Dale", "82.68.58.92", (-16900178 + 100000, 52104356, 0))]
+    rig.reader.slots = [SlotInfo(1, "Dale", "198.51.100.92", (-16900178 + 100000, 52104356, 0))]
     rig.tab.on_players([{"id": "1", "name": "Dale", "team": "2"}])
     assert rig.tab.zones_left() == (1, 3) and got == []
     charlie = [ZoneInfo(z.tier, 2 if z.tier == 3 else z.team, z.pos) for z in start]

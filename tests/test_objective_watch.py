@@ -323,7 +323,7 @@ def test_no_hook_and_a_failing_hook_never_break_the_poll(tmp_path):
     rig.poll()                                          # no hook set: nothing happens
     rig.tab.on_objective_event = lambda kind, text: 1 / 0
     game.zones = zones((1, 1, 1, 2, 2))
-    rig.poll(("Alice", "82.68.58.92"))
+    rig.poll(("Alice", "198.51.100.92"))
     assert any("Alert not shown (Joint Ops took zone C (3 of 5))" in line for line in rig.logged)
     assert rig.tab.online_table.rowCount() == 1         # the rest of the poll still ran
 
@@ -332,6 +332,6 @@ def test_a_reader_without_the_new_reads_still_polls(tmp_path):
     """Older stand-in readers only have read(): nothing is read, nothing breaks."""
     rig = Rig(tmp_path)
     got = bell(rig)
-    rig.poll(("Alice", "82.68.58.92"))
+    rig.poll(("Alice", "198.51.100.92"))
     assert got == [] and rig.tab.hill_now() is None and rig.tab.cap_goals_now() is None
     assert rig.tab.zones_now() == []
