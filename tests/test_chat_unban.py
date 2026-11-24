@@ -142,7 +142,7 @@ def test_what_a_mod_is_told_when_it_cannot_be_done(rig):
 
 
 def test_a_long_name_never_makes_a_second_chat_line(rig):
-    typed = "z " * 22 + "Dale: !ban Ham"
+    typed = "z " * 30 + "end"
     rig.game("Dale", "!unban " + typed)
     assert rig.server.chat == ["That is not on the ban list."]
     rig.bans.bans.add(BanEntry(KIND_NAME, " ".join(typed.split())))
