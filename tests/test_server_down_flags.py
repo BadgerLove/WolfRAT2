@@ -168,6 +168,46 @@ def test_the_disconnect_button_marks_the_link_closed_on_purpose(qtbot, tmp_path)
         tab.shutdown()
 
 
+def test_the_real_server_manager_server_tab_and_web_server_together(qtbot, tmp_path):
+    """The three real pieces share the two flags by name: a stop and a restart
+    reach the bell, the Disconnect button says nothing."""
+    from wolfrat.app import DesktopRuntime, LogSignals, ServerTab
+    from wolfrat.web_server import WolfWebServer
+
+    manager = ServerManager(session_factory=FakeSession)
+    tab = ServerTab(manager, LogSignals(), DesktopRuntime.isolated(tmp_path))
+    qtbot.addWidget(tab)
+    service = WolfWebServer(manager, host="127.0.0.1", port=0)
+
+    def bell():
+        return [(event["kind"], event["text"]) for event in service._events.recent()]
+
+    try:
+        tab.auto_reconnect_cb.setChecked(False)
+        assert manager.connect("127.0.0.1", 4000, "admin", "pw")[0] is True
+        service._watch_tick(now=1000)                  # the link is up
+        manager.disconnect()                           # ...and drops
+        service._watch_tick(now=1005)
+        assert bell() == []
+        manager._session_factory = failing(REFUSED)    # the server program is not running
+        assert manager.connect("127.0.0.1", 4000, "admin", "pw")[0] is False
+        service._watch_tick(now=1010)
+        assert bell() == [("server", "Game server stopped")]
+        manager._session_factory = FakeSession         # it is back
+        assert manager.connect("127.0.0.1", 4000, "admin", "pw")[0] is True
+        service._watch_tick(now=1005 + 144)
+        assert bell() == [("server", "Game server stopped"),
+                          ("server", "Game server is back (down 2 min 24 s)")]
+
+        tab._do_disconnect()                           # the admin presses Disconnect
+        assert manager.disconnected_on_purpose is True and not manager.is_connected
+        for now in range(1200, 2000, 5):
+            service._watch_tick(now=now)
+        assert len(bell()) == 2                        # never a server going down
+    finally:
+        tab.shutdown()
+
+
 def test_a_dropped_link_is_not_on_purpose(qtbot, tmp_path):
     from wolfrat.app import DesktopRuntime, LogSignals, ServerTab
 

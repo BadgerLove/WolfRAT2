@@ -6,7 +6,9 @@ wolfrat/web_push.py is replaced by a fake: nothing is ever sent to a phone.
 """
 
 import asyncio
+import socket
 import threading
+import time
 from typing import NamedTuple, Optional
 
 import pytest
@@ -516,6 +518,44 @@ async def test_nothing_is_sent_once_the_web_server_has_stopped(push):
     await settle()
     assert push.sent == [] and len(push.sessions) == 1
     assert [event["kind"] for event in service._events.recent()] == ["map", "map", "kick"]
+
+
+def test_the_running_web_server_sends_on_its_own_thread(push):
+    """The real thing: the web server on its own thread and loop (start()),
+    events added from this thread as the WolfRAT window does."""
+    with socket.socket() as reservation:
+        reservation.bind(("127.0.0.1", 0))
+        port = reservation.getsockname()[1]
+    manager = Manager()
+    service = WolfWebServer(manager, host="127.0.0.1", port=port)
+    service.set_auth("operator", "web-access-token")
+    _key, device = service.create_device("pixel")
+    service._devices[device]["push"] = {"endpoint": subscription("pixel")["endpoint"],
+                                        "p256dh": "P256", "auth": "AUTH"}
+    service._devices[device]["alerts"] = {"phone": {"admin": True, "objective": True}}
+
+    def sent_bodies(count):
+        deadline = time.monotonic() + 5
+        while len(push.sent) < count and time.monotonic() < deadline:
+            time.sleep(0.01)
+        return [item["payload"]["body"] for item in push.sent]
+
+    assert service.start().result(timeout=5).ok
+    try:
+        service.admin_event("warn", "Ali", "Bob")
+        service.add_event("flag", "Joint Ops captured a flag (2 of 5)")
+        service.add_event("map", "New map: Snakebite")       # switched off: not sent
+        assert sent_bodies(2) == ["Ali was warned by Bob", "Joint Ops captured a flag (2 of 5)"]
+        server_thread = service._thread.ident
+        assert {item["thread"] for item in push.sent} == {server_thread}
+        assert server_thread != threading.get_ident()
+        assert {item["loop"] for item in push.sent} == {service._loop}
+    finally:
+        service.stop()
+    assert push.sessions[0].closed and service._notice_loop is None
+    service.add_event("flag", "Rebels captured a flag")     # stopped: kept for the bell only
+    time.sleep(0.05)
+    assert len(push.sent) == 2
 
 
 def test_events_before_the_web_server_ever_started_are_only_kept(push):
