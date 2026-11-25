@@ -185,7 +185,7 @@ def test_every_list_change_waits_while_a_load_is_running(qtbot, tmp_path, monkey
     _start_held_load(qtbot, tab, server, monkeypatch)
     sent = list(server.calls)
     mission = MissionEntry(queue_index=0, filename="A.bms", revision=1)
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("1-coop", True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: ("1-coop", True)))
     monkeypatch.setattr(app_module.QMessageBox, "question",
                         staticmethod(lambda *a, **k: app_module.QMessageBox.StandardButton.Yes))
 
@@ -318,7 +318,7 @@ def test_a_clock_that_fails_to_read_counts_as_unknown(qtbot, tmp_path, monkeypat
 
 def _save_as(monkeypatch, tab, name, answer):
     asked = []
-    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: (name, True)))
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(lambda *a, **k: (name, True)))
     monkeypatch.setattr(tab, "_confirm_overwrite",
                         lambda n, old, new: asked.append((n, old, new)) or answer)
     tab._save_preset()

@@ -11,7 +11,7 @@ import random
 import pytest
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtTest import QTest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QInputDialog
 
 from wolfrat import app as app_module
 from wolfrat.map_order_dialog import (
@@ -335,6 +335,85 @@ def test_list_changed_while_editing_and_no_saves_nothing(
     tab._open_order_editor()
     assert server.calls == []
     assert _saved(tab)["1-coop"] == _preset(FILES)
+
+
+# --------------------------------------------------------------------------
+# Saving: pick the list from a drop-down, no retyping (Dale, 2026-11-25)
+# --------------------------------------------------------------------------
+
+def _answer_drop_down(monkeypatch, answer, ok=True):
+    """Stand in for QInputDialog.getItem; records what it was shown."""
+    shown = []
+
+    def get_item(parent, title, label, items, current, editable):
+        shown.append({"items": list(items), "current": items[current],
+                      "editable": editable})
+        return (answer(items[current]) if callable(answer) else answer), ok
+
+    monkeypatch.setattr(QInputDialog, "getItem", staticmethod(get_item))
+    # Save's own size check (a saved list changing its map count) says Yes.
+    monkeypatch.setattr(
+        app_module.QMessageBox, "question",
+        lambda *a, **k: app_module.QMessageBox.StandardButton.Yes,
+    )
+    return shown
+
+
+def test_save_offers_the_saved_lists_with_the_picked_one_ready(
+    qtbot, tmp_path, monkeypatch, boxes
+):
+    server = FakeServer(FILES)
+    tab = _tab(qtbot, tmp_path, server)
+    _with_presets(tab, {
+        "18 map longlist": _preset(FILES), "co-op": _preset(["A.bms"]),
+        "deathmatch": _preset(["B.bms"]),
+    })
+    tab.preset_combo.setCurrentText("18 map longlist")
+    shown = _answer_drop_down(monkeypatch, lambda current: current)  # just OK
+    tab._save_preset()
+    assert shown == [{
+        "items": ["18 map longlist", "co-op", "deathmatch"],
+        "current": "18 map longlist", "editable": True,
+    }]
+    assert "18 map longlist" in _saved(tab)
+    assert tab.preset_combo.currentText() == "18 map longlist"
+
+
+def test_with_nothing_picked_the_box_starts_empty(qtbot, tmp_path, monkeypatch, boxes):
+    server = FakeServer(FILES)
+    tab = _tab(qtbot, tmp_path, server)
+    _with_presets(tab, {"co-op": _preset(["A.bms"])})
+    tab._save_presets()
+    tab.preset_combo.setCurrentText("(none)")
+    shown = _answer_drop_down(monkeypatch, lambda current: current)
+    tab._save_preset()
+    assert shown[0]["items"] == ["", "co-op"] and shown[0]["current"] == ""
+    assert _saved(tab) == {"co-op": _preset(["A.bms"])}  # empty OK saved nothing
+
+
+def test_a_typed_new_name_still_works(qtbot, tmp_path, monkeypatch, boxes):
+    server = FakeServer(FILES)
+    tab = _tab(qtbot, tmp_path, server)
+    _with_presets(tab, {"co-op": _preset(["A.bms"])})
+    _answer_drop_down(monkeypatch, "  weekend mix  ")
+    tab._save_preset()
+    assert "weekend mix" in _saved(tab)
+    assert tab.preset_combo.findText("weekend mix") >= 0
+
+
+def test_ok_and_save_as_uses_the_same_drop_down(qtbot, tmp_path, monkeypatch, boxes):
+    server = FakeServer(FILES)
+    tab = _tab(qtbot, tmp_path, server)
+    _with_presets(tab, {"co-op": _preset(["A.bms"])})  # not this cycle's maps
+    tab.preset_combo.setCurrentText("co-op")
+    shown = _answer_drop_down(monkeypatch, lambda current: current)
+    monkeypatch.setattr(
+        tab, "_run_order_dialog", _edit(lambda e: list(reversed(e)), True)
+    )
+    tab._open_order_editor()
+    qtbot.waitUntil(lambda: not tab._feed_active, timeout=3000)
+    assert shown[0]["current"] == "co-op"
+    assert _saved(tab)["co-op"] == _preset(FILES[::-1])
 
 
 def test_a_replace_load_remembers_the_preset(qtbot, tmp_path, monkeypatch, boxes):

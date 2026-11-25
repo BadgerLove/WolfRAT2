@@ -2693,11 +2693,29 @@ class MissionsTab(QWidget):
                 return name
         return None
 
+    def _saved_list_names(self):
+        """The saved lists, in the order the Preset drop-down shows them."""
+        return [
+            self.preset_combo.itemText(i)
+            for i in range(self.preset_combo.count())
+            if self.preset_combo.itemText(i) != "(none)"
+        ]
+
     def _ask_preset_name(self, suggestion=""):
-        """A name for OK and Save As (tests replace this)."""
+        """The name to save under, or None. A drop-down of the saved lists
+        that can also be typed in (Dale, 2026-11-25: retyping '18 map
+        longlist' every time to overwrite it felt like it wasn't editing that
+        list). The list picked next to Preset is ready, so OK saves over it;
+        with none picked the box starts empty, so nothing is overwritten by
+        just pressing OK."""
         from PyQt6.QtWidgets import QInputDialog
-        name, ok = QInputDialog.getText(
-            self, "Save Rotation", "Save this list as:", text=suggestion
+        names = self._saved_list_names()
+        if suggestion not in names:
+            names.insert(0, suggestion or "")
+        name, ok = QInputDialog.getItem(
+            self, "Save Rotation",
+            "Pick a saved list to save over it, or type a new name:",
+            names, names.index(suggestion or ""), True,
         )
         return name.strip() if ok and name.strip() else None
 
@@ -2820,10 +2838,9 @@ class MissionsTab(QWidget):
         if self._feed_busy("Save Rotation"):
             return
         try:
-            from PyQt6.QtWidgets import QInputDialog
-            name, ok = QInputDialog.getText(self, "Save Rotation", "Preset name:")
-            if ok and name.strip():
-                name = name.strip()
+            picked = self.preset_combo.currentText()
+            name = self._ask_preset_name("" if picked == "(none)" else picked)
+            if name:
                 # Read filename + play count from the table
                 maps = []
                 for row in range(self.rotation_table.rowCount()):
