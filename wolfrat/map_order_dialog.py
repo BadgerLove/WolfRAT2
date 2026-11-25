@@ -8,6 +8,10 @@ Retail has no reorder verb: the MISSION sub-verbs are LIST, AVAILABLE, ADD,
 REMOVE, CLEAR, CYCLE and SETNEXT (OpenNova docs, net/novaworld-net-re.md
 5.70.8). So MissionsTab applies the new order as MISSION CLEAR, then every
 map added back in order (the same serial feed Load Preset uses).
+
+Dale, 2026-11-25: Delete takes maps off the list here, and "OK and Save"
+also writes the edited list back to the saved list it came from, so a
+shuffle is still there the next time WolfRAT starts.
 """
 
 from __future__ import annotations
@@ -16,7 +20,7 @@ import random
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
-from PyQt6.QtCore import QItemSelectionModel, Qt
+from PyQt6.QtCore import QEvent, QItemSelectionModel, Qt
 from PyQt6.QtGui import QColor, QGuiApplication
 from PyQt6.QtWidgets import (
     QAbstractItemView,
@@ -49,6 +53,23 @@ class OrderEntry:
     def as_preset(self) -> dict:
         """The {"file", "count"} form MissionsTab feeds to the server."""
         return {"file": self.filename, "count": 2 if self.double_time else 1}
+
+
+class EditedOrder(list):
+    """What the editor returns on OK: the maps in order (a plain list), plus
+    ``save``, True when the admin pressed OK and Save."""
+
+    save = False
+
+
+def delete_rows(entries: Sequence, rows: Iterable[int]) -> tuple[list, list[int]]:
+    """Take the selected rows out. The row now at the first removed place
+    (or the new last row) is picked next, so Delete can be pressed again."""
+    gone = set(rows)
+    items = [item for row, item in enumerate(entries) if row not in gone]
+    if not gone or not items:
+        return items, []
+    return items, [min(min(gone), len(items) - 1)]
 
 
 def shuffled(entries: Sequence[OrderEntry], rng=None) -> list[OrderEntry]:
@@ -131,12 +152,17 @@ def _stem(filename: str) -> str:
 class MapOrderDialog(QDialog):
     """Reorder a copy of the Mission Cycle; ``entries()`` is the result."""
 
-    def __init__(self, entries: Sequence[OrderEntry], parent=None, rng=None):
+    def __init__(
+        self, entries: Sequence[OrderEntry], parent=None, rng=None,
+        save_name: str | None = None,
+    ):
         super().__init__(parent)
         self.setWindowTitle("Edit Map Order")
         self.setModal(True)
         self._original = list(entries)
         self._rng = rng
+        self._save_name = save_name
+        self._save_chosen = False
         self._shuffles = 0
         self._store: list[OrderEntry] = []
         self._rendering = False
@@ -145,12 +171,26 @@ class MapOrderDialog(QDialog):
         self._fit_to_screen()
 
     @classmethod
-    def ask(cls, entries: Sequence[OrderEntry], parent=None):
-        """Show the editor; the new order on OK, None on Cancel."""
-        dialog = cls(entries, parent)
+    def ask(
+        cls, entries: Sequence[OrderEntry], parent=None,
+        save_name: str | None = None,
+    ):
+        """Show the editor; an EditedOrder on OK / OK and Save, None on
+        Cancel. ``save_name`` is the saved list OK and Save writes to (None:
+        the button says "OK and Save As..." and the caller asks a name)."""
+        dialog = cls(entries, parent, save_name=save_name)
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
-        return dialog.entries()
+        return dialog.result_order()
+
+    def result_order(self) -> EditedOrder:
+        order = EditedOrder(self.entries())
+        order.save = self._save_chosen
+        return order
+
+    def accept_and_save(self) -> None:
+        self._save_chosen = True
+        self.accept()
 
     # ------------------------------------------------------------------ UI
 
@@ -162,7 +202,8 @@ class MapOrderDialog(QDialog):
         hint = QLabel(
             "Drag maps with the mouse to change the order (Ctrl or Shift + "
             "click picks several). Shuffle mixes the whole list like a deck "
-            "of cards: press it as often as you like."
+            "of cards: press it as often as you like. Delete takes the "
+            "picked maps off the list."
         )
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -222,9 +263,16 @@ class MapOrderDialog(QDialog):
             "To Bottom", "Move the picked maps to the bottom of the list.",
             self.move_selected_to_bottom,
         )
+        self.delete_button = self._side_button(
+            "Delete",
+            "Take the picked maps off this list (Delete key works too). "
+            "Undo Changes brings them back.",
+            self.delete_selected,
+        )
         self.undo_button = self._side_button(
             "Undo Changes",
-            "Put the list back in the order the server has now.",
+            "Put the list back the way the server has it now: the old order "
+            "and any deleted maps.",
             self.undo_changes,
         )
         side.addWidget(self.shuffle_button)
@@ -235,30 +283,69 @@ class MapOrderDialog(QDialog):
         ):
             side.addWidget(button)
         side.addSpacing(8)
+        side.addWidget(self.delete_button)
+        side.addSpacing(8)
         side.addWidget(self.undo_button)
         side.addStretch(1)
+        lst.installEventFilter(self)  # the Delete key in the list
         body.addLayout(side)
         layout.addLayout(body, 1)
 
         self.status_label = QLabel()
         layout.addWidget(self.status_label)
 
-        apply_hint = QLabel(
-            "OK puts this order on the server: it clears the map list and "
-            "adds these maps back in this order (a few seconds). To keep the "
-            "order for another day, Save it as a preset afterwards."
+        if self._save_name:
+            save_text = (
+                f"OK and Save also saves this list as your preset "
+                f"'{self._save_name}', so it is there the next time you "
+                "load it, even after WolfRAT restarts."
+            )
+        else:
+            save_text = (
+                "OK and Save As also saves this list as a preset: WolfRAT "
+                "asks for its name."
+            )
+        self.apply_hint = QLabel(
+            "OK puts this list on the server: it clears the map list and "
+            "adds these maps back in this order (a few seconds). " + save_text
         )
-        apply_hint.setWordWrap(True)
-        apply_hint.setStyleSheet("color: #a89a50; font-size: 8pt;")
-        layout.addWidget(apply_hint)
+        self.apply_hint.setWordWrap(True)
+        self.apply_hint.setStyleSheet("color: #a89a50; font-size: 8pt;")
+        layout.addWidget(self.apply_hint)
 
         self.button_box = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Ok
             | QDialogButtonBox.StandardButton.Cancel
         )
+        self.ok_button = self.button_box.button(
+            QDialogButtonBox.StandardButton.Ok
+        )
+        self.save_button = QPushButton(
+            "OK and Save" if self._save_name else "OK and Save As..."
+        )
+        self.save_button.setAutoDefault(False)
+        self.save_button.setToolTip(
+            f"Put this list on the server and save it as '{self._save_name}'."
+            if self._save_name else
+            "Put this list on the server and save it under a name you choose."
+        )
+        self.button_box.addButton(
+            self.save_button, QDialogButtonBox.ButtonRole.ActionRole
+        )
+        self.save_button.clicked.connect(self.accept_and_save)
         self.button_box.accepted.connect(self.accept)
         self.button_box.rejected.connect(self.reject)
         layout.addWidget(self.button_box)
+
+    def eventFilter(self, watched, event):
+        if (
+            watched is self.map_list
+            and event.type() == QEvent.Type.KeyPress
+            and event.key() == Qt.Key.Key_Delete
+        ):
+            self.delete_selected()
+            return True
+        return super().eventFilter(watched, event)
 
     def _side_button(self, text, tip, slot) -> QPushButton:
         button = QPushButton(text)
@@ -367,17 +454,24 @@ class MapOrderDialog(QDialog):
         count = self.map_list.count()
         parts = [f"{count} map" + ("" if count == 1 else "s")]
         changed = self.changed()
-        if changed:
+        removed = len(self._original) - count
+        if removed > 0:
+            parts.append(f"{removed} deleted")
+        if changed and self._order_changed():
             parts.append("order changed")
         if self._shuffles:
             parts.append(f"shuffled {self._shuffles}x")
         self.status_label.setText("   |   ".join(parts))
-        picked = bool(self.map_list.selectedItems())
+        picked_count = len(self.map_list.selectedItems())
+        picked = picked_count > 0
         for button in (
             self.up_button, self.down_button,
             self.top_button, self.bottom_button,
         ):
             button.setEnabled(picked)
+        # The list can never be emptied here: OK would clear the server's
+        # rotation and add nothing back. Clear does that on purpose.
+        self.delete_button.setEnabled(picked and picked_count < count)
         self.undo_button.setEnabled(changed)
         self.shuffle_button.setEnabled(len(set(self.entries())) > 1)
 
@@ -406,6 +500,25 @@ class MapOrderDialog(QDialog):
 
     def move_selected_to_bottom(self) -> None:
         self._move(move_to_bottom)
+
+    def _order_changed(self) -> bool:
+        """True when the maps still on the list are not in their old order."""
+        from collections import Counter
+
+        left = Counter(self.entries())
+        kept = []
+        for entry in self._original:
+            if left[entry] > 0:
+                kept.append(entry)
+                left[entry] -= 1
+        return kept != self.entries()
+
+    def delete_selected(self) -> None:
+        rows = self.selected_rows()
+        if not rows or len(rows) >= self.map_list.count():
+            return
+        items, new_rows = delete_rows(self.entries(), rows)
+        self._set_entries(items, new_rows, keep_scroll=True)
 
     def undo_changes(self) -> None:
         self._shuffles = 0

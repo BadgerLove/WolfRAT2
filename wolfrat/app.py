@@ -1944,9 +1944,10 @@ class MissionsTab(QWidget):
         # in this table: the server never saw the new order.
         self.edit_order_btn = SatisfyingButton("Edit Order /\nShuffle")
         self.edit_order_btn.setToolTip(
-            "Change the order of the Mission Cycle: drag maps with the mouse, "
-            "move them, or shuffle the list like a deck of cards. OK puts the "
-            "new order on the server."
+            "Change the Mission Cycle: drag maps with the mouse, move them, "
+            "delete them, or shuffle the list like a deck of cards. OK puts "
+            "the new list on the server; OK and Save also saves it as the "
+            "preset it came from."
         )
         self.edit_order_btn.clicked.connect(self._open_order_editor)
         action_layout.addWidget(self.edit_order_btn)
@@ -2647,7 +2648,90 @@ class MissionsTab(QWidget):
 
     def _run_order_dialog(self, entries):
         """The edited order on OK, None on Cancel (tests replace this)."""
-        return MapOrderDialog.ask(entries, self)
+        return MapOrderDialog.ask(
+            entries, self, save_name=getattr(self, "_order_save_name", None)
+        )
+
+    @staticmethod
+    def _preset_as_entries(preset):
+        """A saved list as OrderEntry-like keys, for _same_maps."""
+        entries = []
+        for item in preset or []:
+            if isinstance(item, dict):
+                filename, count = item.get("file", ""), item.get("count", 1)
+            else:
+                filename, count = str(item), 1
+            entries.append(OrderEntry(filename=filename, double_time=count == 2))
+        return entries
+
+    def _preset_holds(self, name, entries):
+        """True when saved list ``name`` holds exactly these maps (any order)."""
+        preset = self._presets.get(name)
+        return isinstance(preset, list) and self._same_maps(
+            self._preset_as_entries(preset), entries
+        )
+
+    def _order_source_preset(self, entries):
+        """The saved list the Mission Cycle came from (Dale, 2026-11-25: "save
+        it to the preset it came from"). That is a saved list holding exactly
+        the cycle's maps, in any order: the one picked next to Preset first,
+        then the one loaded last, then any other. None when no saved list
+        matches."""
+        picked = self.preset_combo.currentText()
+        tried = []
+        for name in (picked, getattr(self, "_cycle_preset", None)):
+            if name and name != "(none)" and name not in tried:
+                tried.append(name)
+                if self._preset_holds(name, entries):
+                    return name
+        others = sorted(
+            (n for n in self._presets if n not in tried),
+            key=lambda n: (n.startswith("_"), n.casefold()),
+        )
+        for name in others:
+            if self._preset_holds(name, entries):
+                return name
+        return None
+
+    def _ask_preset_name(self, suggestion=""):
+        """A name for OK and Save As (tests replace this)."""
+        from PyQt6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(
+            self, "Save Rotation", "Save this list as:", text=suggestion
+        )
+        return name.strip() if ok and name.strip() else None
+
+    def _save_edited_order(self, name, order, before):
+        """OK and Save: write the edited list to saved list ``name``.
+        False when the admin backs out (then nothing is sent either)."""
+        if name is None:
+            picked = self.preset_combo.currentText()
+            name = self._ask_preset_name("" if picked == "(none)" else picked)
+            if name is None:
+                return False
+            old = self._presets.get(name)
+            if isinstance(old, list) and not self._preset_holds(name, before):
+                reply = QMessageBox.question(
+                    self, "Save Rotation",
+                    f"You already have a saved list called '{name}' "
+                    f"({len(old)} maps), with different maps in it.\n\n"
+                    f"Replace it with this list ({len(order)} maps)?",
+                    QMessageBox.StandardButton.Yes
+                    | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return False
+        self._presets[name] = [entry.as_preset() for entry in order]
+        self._save_presets()
+        if self.preset_combo.findText(name) < 0:
+            self.preset_combo.addItem(name)
+        self.preset_combo.setCurrentText(name)
+        self._cycle_preset = name
+        removed = len(before) - len(order)
+        extra = f", {removed} map{'s' if removed != 1 else ''} deleted" if removed > 0 else ""
+        self.server._log(f"Saved the new list as '{name}' ({len(order)} maps{extra}).")
+        return True
 
     def _open_order_editor(self):
         """Edit Order / Shuffle button."""
@@ -2667,12 +2751,18 @@ class MissionsTab(QWidget):
             return
         if not self._feed_time_ok(len(before), "Edit Order"):
             return
+        self._order_save_name = self._order_source_preset(before)
         order = self._run_order_dialog(before)
         if order is None:
             return
-        if order == before:
+        save = bool(getattr(order, "save", False))
+        if list(order) == before:
+            if save:  # the server has it already; only the saved list changes
+                self._save_edited_order(self._order_save_name, order, before)
             self.server._log("Map order unchanged; nothing sent to the server.")
             return
+        if not order:
+            return  # the editor never empties the list; Clear does that
         if not self._feed_time_ok(len(order), "Edit Order"):
             return  # the map ran down while the editor was open
         if not self._same_maps(before, self._order_entries()):
@@ -2687,6 +2777,10 @@ class MissionsTab(QWidget):
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
+        if save and not self._save_edited_order(
+            self._order_save_name, order, before
+        ):
+            return
         self._apply_order(order)
 
     def _apply_order(self, order):
@@ -2698,8 +2792,7 @@ class MissionsTab(QWidget):
         self._run_feed(
             maps, "the new map order", replace=True,
             on_complete=lambda: self.server._log(
-                f"New map order is on the server: {len(maps)} maps. Save a "
-                "preset to keep this order."
+                f"New map order is on the server: {len(maps)} maps."
             ),
         )
 
@@ -3043,11 +3136,15 @@ class MissionsTab(QWidget):
             f"Loading preset '{name}' - {how}adding {len(preset)} maps..."
         )
         tail = "" if replace else " Remove unwanted maps manually."
+        whole_cycle = replace or not self.server.mission_entries
+
+        def loaded():
+            if whole_cycle:
+                self._cycle_preset = name  # Edit Order's OK and Save target
+            self.server._log(f"Preset '{name}' loaded.{tail}")
+
         self._run_feed(
-            preset, f"loading '{name}'", replace=replace,
-            on_complete=lambda: self.server._log(
-                f"Preset '{name}' loaded.{tail}"
-            ),
+            preset, f"loading '{name}'", replace=replace, on_complete=loaded,
         )
 
     def _add_missions_in_sequence(
