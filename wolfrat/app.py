@@ -33,6 +33,7 @@ from wolfrat import lag_comp
 from wolfrat import rank_tone
 from wolfrat import mycmd
 from wolfrat import single_instance
+from wolfrat import window_size
 from wolfrat.weather_tab import WeatherTab, scroll_column
 from wolfrat.mod_entrance_panel import ModEntrancePanel
 from wolfrat.mod_ranks import ModRoster
@@ -10006,6 +10007,13 @@ class MainWindow(QMainWindow):
 
         self.setMinimumSize(960, 650)
         self.resize(1000, 720)
+        # Open at the size/place it was closed at (wolfrat_window.json).
+        try:
+            window_size.restore(
+                self, window_size.load(self.runtime.path(window_size.FILENAME))
+            )
+        except Exception as error:
+            wire_log(f"Could not restore the window size: {error}")
 
         # Server manager
         self.server = ServerManager()
@@ -10930,6 +10938,14 @@ class MainWindow(QMainWindow):
         if self._shutdown:
             return
         self._shutdown = True
+        # Remember the window's size/place for next time (first, while the
+        # window is still whole).
+        try:
+            window_size.save(
+                self.runtime.path(window_size.FILENAME), window_size.capture(self)
+            )
+        except Exception as error:
+            wire_log(f"Could not save the window size: {error}")
         for timer in self.findChildren(QTimer):
             timer.stop()
 
