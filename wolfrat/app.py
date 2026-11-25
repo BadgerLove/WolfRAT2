@@ -1,5 +1,5 @@
 """
-WolfRAT 2.10.29 - Modern Joint Operations Server Admin Tool
+WolfRAT 2.10.30 - Modern Joint Operations Server Admin Tool
 Replaces the original WolfRAT v0.95 (2005, MFC70)
 """
 
@@ -10090,7 +10090,7 @@ class DownloadWorker(QThread):
 
 
 class MainWindow(QMainWindow):
-    """WolfRAT 2.10.29 Main Window."""
+    """WolfRAT 2.10.30 Main Window."""
 
     # A !command typed on the phone page, with the Future its answer goes in.
     _web_command_signal = pyqtSignal(str, object)
@@ -10112,7 +10112,7 @@ class MainWindow(QMainWindow):
         self._sync_led_timer = QTimer(self)
         self._sync_led_timer.setSingleShot(True)
         self._sync_led_timer.timeout.connect(self._clear_sync_led)
-        self.setWindowTitle("WolfRAT 2.10.29 - Joint Operations Server Admin")
+        self.setWindowTitle("WolfRAT 2.10.30 - Joint Operations Server Admin")
 
         # Set Window Icon
         icon_path = os.path.join(os.path.dirname(__file__), 'icon.ico')
@@ -10223,7 +10223,7 @@ class MainWindow(QMainWindow):
         self.signals.connected_signal.connect(self.phone_bridge.schedule_publish)
         self.signals.connected_signal.connect(lambda: sounds.play("connect"))
         self.signals.disconnected_signal.connect(lambda: self.set_connected(False, 'Disconnected'))
-        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.10.29 - Joint Operations Server Admin"))
+        self.signals.disconnected_signal.connect(lambda: self.setWindowTitle("WolfRAT 2.10.30 - Joint Operations Server Admin"))
         self.signals.disconnected_signal.connect(self.phone_bridge.schedule_publish)
         self.signals.disconnected_signal.connect(lambda: self.server_tab.handle_disconnect_ui())
         self.signals.disconnected_signal.connect(lambda: self.mods_tab.entrance_panel.on_disconnected())
@@ -10258,9 +10258,9 @@ class MainWindow(QMainWindow):
     def _update_title(self, server_name=""):
         """Update window title with server name when connected."""
         if server_name:
-            self.setWindowTitle(f"WolfRAT 2.10.29 \u2014 {server_name}")
+            self.setWindowTitle(f"WolfRAT 2.10.30 \u2014 {server_name}")
         else:
-            self.setWindowTitle("WolfRAT 2.10.29 - Joint Operations Server Admin")
+            self.setWindowTitle("WolfRAT 2.10.30 - Joint Operations Server Admin")
 
     def _build_ui(self):
         central = QWidget()
@@ -10268,7 +10268,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(central)
 
         # Header
-        header = QLabel("WolfRAT 2.10.29")
+        header = QLabel("WolfRAT 2.10.30")
         header.setStyleSheet("font-size: 22pt; font-weight: bold; color: #e8c840; padding: 12px; letter-spacing: 4px;")
         header.setAlignment(Qt.AlignmentFlag.AlignCenter)
         layout.addWidget(header)
@@ -10672,7 +10672,7 @@ class MainWindow(QMainWindow):
 
         status_bar.addSpacing(10)
 
-        ver_label = QLabel("v2.10.29 · Built by BadgerLove · FMJ Squad")
+        ver_label = QLabel("v2.10.30 · Built by BadgerLove · FMJ Squad")
         ver_label.setStyleSheet("font-size: 9pt; color: #444;")
         status_bar.addWidget(ver_label)
 
@@ -10800,7 +10800,7 @@ class MainWindow(QMainWindow):
     # ---- Auto-updater ---------------------------------------------------
 
     _VERSION_URL = "https://fmj-squad.com/version.json"
-    _CURRENT_VERSION = "2.10.29"
+    _CURRENT_VERSION = "2.10.30"
 
     @staticmethod
     def _is_newer(latest: str, current: str) -> bool:
@@ -11111,7 +11111,7 @@ def start_desktop(
 
     runtime = runtime or DesktopRuntime.production()
     app.setStyleSheet(DARK_STYLE)
-    app.setApplicationName("WolfRAT 2.10.29")
+    app.setApplicationName("WolfRAT 2.10.30")
     sounds.set_enabled(runtime.audio_enabled)
     if runtime.audio_enabled:
         sounds.initialize()
@@ -11247,7 +11247,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
         print(f"WolfRAT startup error: {error}")
         return 2
     runtime = runtime or launch.runtime
-    wire_log("=== WolfRAT 2.10.29 STARTED ===")
+    wire_log("=== WolfRAT 2.10.30 STARTED ===")
 
     # Catch-all exception handler for debugging
     import traceback
@@ -11306,7 +11306,7 @@ def main(argv=None, runtime: DesktopRuntime | None = None):
 
             bstats.bstats_start(
                 "wolfrat",
-                "2.10.29",
+                "2.10.30",
                 data_dir=runtime.data_dir,
             )
         except Exception:
