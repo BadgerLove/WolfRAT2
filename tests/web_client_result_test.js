@@ -2478,6 +2478,201 @@ test('sw.js still never answers /api or /ws, and keeps the app shell', async () 
     assert.strictEqual(await worker.dispatch('fetch', {request: {method: 'GET', url: 'https://wolfrat.example.com/'}}), 1);
 });
 
+// ------------------------------------------------------ saved map lists
+const MAP_LISTS = {
+    lists: [
+        {name: '1-coop', maps: 221, missing: 0},
+        {name: "Mudd's <b>", maps: 3, missing: 2},
+        {name: 'one map', maps: 1, missing: 1},
+    ],
+    busy: null,
+    last: null,
+};
+const LIST_FEATURES = {...ALL_FEATURES, map_lists: true};
+
+function pickList(page, name) {
+    const select = page.el('mp-list-pick');
+    select.value = name;
+    select.listeners.change.forEach(handler => handler({target: select}));
+}
+
+function pushState(page, state) {
+    page.sockets[0].onmessage({data: JSON.stringify(state)});
+}
+
+test('saved map lists: a drop-down on Maps with every saved list, names escaped', async () => {
+    const page = await signedInPage(stateWith({features: LIST_FEATURES, map_lists: MAP_LISTS}));
+    assert.ok(page.shown('mp-lists'));
+    const select = page.el('mp-list-pick');
+    assert.match(select.innerHTML, /^<option value="">Pick a saved list…<\/option>/);
+    assert.match(select.innerHTML, /<option value="1-coop">1-coop · 221 maps<\/option>/);
+    assert.match(select.innerHTML, /<option value="Mudd&#39;s &lt;b&gt;">Mudd&#39;s &lt;b&gt; · 3 maps<\/option>/);
+    assert.match(select.innerHTML, /one map · 1 map<\/option>/);
+    assert.strictEqual(select.disabled, false);
+    // Nothing picked yet: the buttons wait.
+    assert.strictEqual(page.el('mp-list-add').disabled, true);
+    assert.strictEqual(page.el('mp-list-replace').disabled, true);
+    assert.match(page.el('mp-list-note').textContent, /^Pick a list/);
+
+    pickList(page, '1-coop');
+    assert.strictEqual(page.el('mp-list-add').disabled, false);
+    assert.strictEqual(page.el('mp-list-replace').disabled, false);
+    assert.ok(!page.shown('mp-list-note'), 'nothing to warn about');
+
+    pickList(page, "Mudd's <b>");
+    assert.strictEqual(page.el('mp-list-note').textContent,
+        '2 maps in this list are not on the server and will be left out.');
+    pickList(page, 'one map');
+    assert.strictEqual(page.el('mp-list-note').textContent,
+        '1 map in this list is not on the server and will be left out.');
+
+    // The same lists again do not rebuild the drop-down (that would close the phone's open picker).
+    select.innerHTML = 'untouched';
+    pushState(page, stateWith({features: LIST_FEATURES, map_lists: MAP_LISTS}));
+    assert.strictEqual(select.innerHTML, 'untouched');
+    // A list deleted on the PC: the drop-down is built again and the pick is dropped.
+    pushState(page, stateWith({features: LIST_FEATURES, map_lists: {...MAP_LISTS, lists: MAP_LISTS.lists.slice(0, 2)}}));
+    assert.doesNotMatch(select.innerHTML, /one map/);
+    assert.strictEqual(page.el('mp-list-add').disabled, true);
+});
+
+test('saved map lists: Add to the end and Clear and add ask first, then post the list and the mode', async () => {
+    const page = await signedInPage(stateWith({features: LIST_FEATURES, map_lists: MAP_LISTS}));
+    let request = null;
+    page.serve = r => {
+        request = r;
+        return ok({replies: ["Adding '1-coop' to the end of the rotation: 221 maps"]});
+    };
+    // Nothing picked: a tap does nothing.
+    page.run(`askLoadMapList('add')`);
+    assert.strictEqual(page.run('sheet'), null);
+
+    pickList(page, '1-coop');
+    page.el('mp-list-add').click();
+    assert.strictEqual(page.run('sheet.kind'), 'confirm');
+    assert.strictEqual(request, null, 'nothing is sent before the admin says yes');
+    let sheet = page.el('sheet-body').innerHTML;
+    assert.match(sheet, /Add &#39;1-coop&#39; to the end\?/);
+    assert.match(sheet, /The 221 maps in &#39;1-coop&#39; go on after the 2 maps in the rotation now\./);
+    await page.run(`sheetAct('yes')`);
+    assert.strictEqual(request.path, '/api/maplist');
+    assert.strictEqual(request.method, 'POST');
+    assert.deepStrictEqual(request.body, {name: '1-coop', mode: 'add'});
+    assert.strictEqual(page.run('sheet'), null, 'the sheet closes once WolfRAT took it');
+
+    request = null;
+    page.el('mp-list-replace').click();
+    sheet = page.el('sheet-body').innerHTML;
+    assert.match(sheet, /Clear the rotation and add &#39;1-coop&#39;\?/);
+    assert.match(sheet, /The 2 maps in the rotation now are taken off, then the 221 maps in &#39;1-coop&#39; go on\. The map being played carries on\./);
+    assert.match(sheet, /class="btn bad"[^>]*data-act="yes">Clear and add</);
+    // Cancel sends nothing.
+    page.run(`sheetAct('no')`);
+    assert.strictEqual(request, null);
+    page.el('mp-list-replace').click();
+    await page.run(`sheetAct('yes')`);
+    assert.deepStrictEqual(request.body, {name: '1-coop', mode: 'replace'});
+
+    // A refusal stays on the screen as a toast and leaves the pick alone.
+    page.serve = () => respond(409, {ok: false, accepted: false, replies: [], error: 'Not connected to the game server'});
+    page.el('mp-list-add').click();
+    await page.run(`sheetAct('yes')`);
+    assert.match(page.el('operation-result').textContent, /Not connected to the game server/);
+    assert.strictEqual(page.run('listAwait'), null);
+    assert.strictEqual(page.run('listPick'), '1-coop');
+});
+
+test('saved map lists: an empty rotation has nothing to clear, so Clear and add reads as Add', async () => {
+    const page = await signedInPage(stateWith({features: LIST_FEATURES, map_lists: MAP_LISTS, missions: []}));
+    let request = null;
+    page.serve = r => {
+        request = r;
+        return ok();
+    };
+    pickList(page, '1-coop');
+    page.el('mp-list-replace').click();
+    const sheet = page.el('sheet-body').innerHTML;
+    assert.match(sheet, /Add &#39;1-coop&#39; to the end\?/);
+    assert.match(sheet, /The rotation is empty now\./);
+    await page.run(`sheetAct('yes')`);
+    assert.deepStrictEqual(request.body, {name: '1-coop', mode: 'replace'});
+});
+
+test('saved map lists: progress while the maps go on, then how it went', async () => {
+    const page = await signedInPage(stateWith({features: LIST_FEATURES, map_lists: MAP_LISTS}));
+    page.serve = () => ok({replies: ["Clearing the rotation and adding '1-coop': 221 maps"]});
+    pickList(page, '1-coop');
+    page.el('mp-list-replace').click();
+    await page.run(`sheetAct('yes')`);
+    assert.strictEqual(page.run('listAwait'), 0);
+
+    const running = {id: 1, name: '1-coop', mode: 'replace', state: 'running', text: '', tone: 'info'};
+    pushState(page, stateWith({features: LIST_FEATURES, map_lists: {
+        ...MAP_LISTS, busy: {label: "loading '1-coop'", done: 42, total: 221}, last: running,
+    }}));
+    assert.ok(page.shown('mp-list-busy'));
+    assert.strictEqual(page.el('mp-list-bar').style.width, '19%');
+    assert.strictEqual(page.el('mp-list-busy-text').textContent,
+        "Putting maps on the server (loading '1-coop'): 42 of 221");
+    assert.strictEqual(page.el('mp-list-add').disabled, true, 'no second load while one runs');
+    assert.strictEqual(page.el('mp-list-replace').disabled, true);
+    assert.ok(!page.shown('mp-list-last'));
+    page.run(`askLoadMapList('add')`);
+    assert.strictEqual(page.run('sheet'), null);
+
+    const done = {...running, state: 'done', tone: 'ok', text: "The rotation is now '1-coop': 221 maps."};
+    pushState(page, stateWith({features: LIST_FEATURES, map_lists: {...MAP_LISTS, last: done}}));
+    assert.ok(!page.shown('mp-list-busy'));
+    assert.strictEqual(page.el('mp-list-last').textContent, "The rotation is now '1-coop': 221 maps.");
+    assert.strictEqual(page.el('mp-list-last').className, 'note ok');
+    assert.strictEqual(page.el('operation-result').textContent, "The rotation is now '1-coop': 221 maps.");
+    assert.strictEqual(page.run('listAwait'), null, 'said once');
+    assert.strictEqual(page.el('mp-list-add').disabled, false);
+
+    // Maps left out or refused: the line and the toast are a warning.
+    page.el('mp-list-add').click();
+    await page.run(`sheetAct('yes')`);
+    const partly = {...done, id: 2, mode: 'add', tone: 'warn',
+        text: "'1-coop' was added to the end: 219 maps. The server would not add A.bms, B.bms."};
+    pushState(page, stateWith({features: LIST_FEATURES, map_lists: {...MAP_LISTS, last: partly}}));
+    assert.strictEqual(page.el('mp-list-last').className, 'note warn');
+    assert.strictEqual(page.el('operation-result').dataset.outcome, 'unverified');
+});
+
+test('saved map lists: another phone sees the progress and the result, with no toast of its own', async () => {
+    const done = {id: 7, name: '1-coop', mode: 'add', state: 'done', tone: 'ok', text: "'1-coop' was added to the end: 221 maps."};
+    const page = await signedInPage(stateWith({features: LIST_FEATURES, map_lists: {...MAP_LISTS, last: done}}));
+    assert.strictEqual(page.el('mp-list-last').textContent, "'1-coop' was added to the end: 221 maps.");
+    assert.strictEqual(page.el('operation-result').textContent, '');
+    // A load started on the PC (or an Edit Order) holds the phone's buttons too.
+    pickList(page, '1-coop');
+    pushState(page, stateWith({features: LIST_FEATURES, map_lists: {
+        ...MAP_LISTS, last: done, busy: {label: 'the new map order', done: 0, total: 49},
+    }}));
+    assert.strictEqual(page.el('mp-list-replace').disabled, true);
+    assert.strictEqual(page.el('mp-list-bar').style.width, '0%');
+    assert.ok(!page.shown('mp-list-last'));
+});
+
+test('saved map lists: hidden where WolfRAT does not offer them; no lists says where they come from', async () => {
+    let page = await signedInPage(stateWith({features: ALL_FEATURES}));
+    assert.ok(!page.shown('mp-lists'));
+    page = await signedInPage(stateWith({features: LIST_FEATURES, map_lists: null}));
+    assert.ok(page.shown('mp-lists'));
+    assert.match(page.el('mp-list-pick').innerHTML, /^<option value="">No saved lists yet<\/option>$/);
+    assert.strictEqual(page.el('mp-list-pick').disabled, true);
+    assert.match(page.el('mp-list-note').textContent, /Missions tab, Save/);
+    assert.strictEqual(page.el('mp-list-add').disabled, true);
+    // Not connected to the game server: the lists show, the buttons wait.
+    page = await signedInPage(stateWith({features: LIST_FEATURES, map_lists: MAP_LISTS, connected: false}));
+    pickList(page, '1-coop');
+    assert.strictEqual(page.el('mp-list-add').disabled, true);
+    // Broken rows from a WolfRAT that sends something odd do not break the page.
+    page = await signedInPage(stateWith({features: LIST_FEATURES, map_lists: {lists: [null, 'x', {name: ''}, {maps: 3}, {name: 'ok'}], busy: 'yes', last: 4}}));
+    assert.match(page.el('mp-list-pick').innerHTML, /<option value="ok">ok · 0 maps<\/option>$/);
+    assert.ok(!page.shown('mp-list-busy'));
+});
+
 // ------------------------------------------------------------------- run
 async function main() {
     let failed = 0;

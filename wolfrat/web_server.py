@@ -551,6 +551,7 @@ class WolfWebServer:
         router.add_post('/api/mode', protect(self._handle_mode))
         router.add_post('/api/sky', protect(self._handle_sky))
         router.add_post('/api/timeleft', protect(self._handle_timeleft))
+        router.add_post('/api/maplist', protect(self._handle_maplist))
         # The bell and phone notifications.
         router.add_get('/api/events', protect(self._handle_events))
         router.add_get('/api/push', protect(self._handle_push))
@@ -2019,6 +2020,7 @@ class WolfWebServer:
             'sky': False,
             'sky_scenes': [],
             'time_left': False,
+            'map_lists': False,
         }
         if self.on_desktop is not None:
             features.update(desktop_features or {})
@@ -2077,6 +2079,9 @@ class WolfWebServer:
             'objective': self._json_safe(top.get('objective')),
             'sky': self._json_safe(top.get('sky')),
             'time_restore': self._json_safe(top.get('time_restore')),
+            # The saved map lists, a list going on the server now, and how
+            # the last one loaded from a phone went.
+            'map_lists': self._json_safe(top.get('map_lists')),
             'features': self._json_safe(self._features(top.get('features'))),
             # The bell: the newest events (oldest first) and the newest id.
             'events': self._events.recent(web_events.STATE_EVENTS),
@@ -2745,6 +2750,11 @@ class WolfWebServer:
     async def _handle_timeleft(self, request):
         """POST /api/timeleft {minutes: 1-240}: the time left on the running map."""
         return await self._desktop_route(request, 'timeleft', ('minutes',))
+
+    async def _handle_maplist(self, request):
+        """POST /api/maplist {name: a list from map_lists.lists, mode: add|replace}:
+        put a saved map list on the server (the desktop's Load)."""
+        return await self._desktop_route(request, 'maplist', ('name', 'mode'))
 
     async def _handle_map_setnext(self, request):
         """POST /api/map/setnext {filename, index} - the desktop's Queue Next."""

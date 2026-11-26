@@ -320,6 +320,12 @@ body.typing .composer{bottom:0;padding-bottom:calc(10px + var(--safe-b))}
 .vote .bar{height:8px;border-radius:4px;background:var(--s3);overflow:hidden;margin-top:6px}
 .vote .bar i{display:block;height:100%;background:var(--accent)}
 .vote .opt{margin-top:10px}
+.lists .field{margin-top:10px}
+.lists .bar{height:8px;border-radius:4px;background:var(--s3);overflow:hidden;margin-top:16px}
+.lists .bar i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s linear}
+.lists .note.ok{color:var(--ok)}
+.lists .note.warn{color:var(--warn)}
+.lists .note.bad{color:var(--bad)}
 .vote .opt .row{font-size:14px}
 
 /* ---------- more ---------- */

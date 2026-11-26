@@ -8,8 +8,8 @@ Two jobs:
   through the desktop's own code (the Mods tab's kick/ban/warn path with its
   log line and announcement, the Bans tab's list, the Weather tab's
   ``_start``, the Sky page's scene buttons, the lag comp panel's own box and
-  list, Manual mode's switch) and settles the Future with the result dict the
-  phone gets.
+  list, Manual mode's switch, the Missions tab's saved lists) and settles the
+  Future with the result dict the phone gets.
 * **Snapshot.** What only the window knows (game type, what decides the
   match, the vote, weather, the sky, lag comp, career ranks, countries, time
   on the server, what this WolfRAT can do) is built here and published whole
@@ -36,6 +36,7 @@ from wolfrat import lag_comp
 from wolfrat import manual_mode
 from wolfrat import sky
 from wolfrat import weather
+from wolfrat import web_map_lists
 from wolfrat import web_state
 from wolfrat import web_timeleft
 from wolfrat.ban_rules import KIND_IP
@@ -192,6 +193,7 @@ class PhoneBridge(QObject):
             "mode": self._mode,
             "sky": self._sky,
             "timeleft": self._timeleft,
+            "maplist": self._maplist,
         }
         handler = handlers.get(action)
         try:
@@ -506,6 +508,47 @@ class PhoneBridge(QObject):
             shown, text = page.phone_show(scene, minutes, who)
         return _done(text) if shown else _fail(text, 409)
 
+    # --- saved map lists ---------------------------------------------------------
+
+    def _maplist(self, payload, answer):
+        """A saved map list onto the server, through the Missions tab's own
+        feed (as its Load button: "add" = Add to the end, "replace" =
+        Replace).  Answers as soon as it has started; the page follows the
+        maps going on in the snapshot's map_lists."""
+        missions = self._get("missions_tab")
+        if missions is None or not hasattr(missions, "phone_load_list"):
+            return _fail("Map lists need the WolfRAT window", 409)
+        name = payload.get("name")
+        mode = payload.get("mode")
+        if not isinstance(name, str) or not name:
+            return _fail("Pick a saved list", 400)
+        if mode not in web_map_lists.MODES:
+            return _fail('mode must be "add" or "replace"', 400)
+        who = self._who(payload)
+        started, text, status = missions.phone_load_list(name, mode == "replace", who)
+        if not started:
+            return _fail(text, status)
+        how = "cleared the rotation and loaded" if mode == "replace" else "added"
+        tail = "" if mode == "replace" else " to the end of the rotation"
+        line = f"{who} {how} the map list '{name}'{tail}"
+        wire_log(f"[WEB] {line}")
+        mods = self._get("mods_tab")
+        if mods is not None and hasattr(mods, "mod_log"):
+            mods.mod_log.addItem(f"[{_now()}] {line}")
+        return _done(text)
+
+    def _map_lists_state(self):
+        """The saved lists, the feed running now and how the last load from a
+        phone went; None when this WolfRAT has no Missions tab for it."""
+        missions = self._get("missions_tab")
+        if missions is None or not hasattr(missions, "phone_lists"):
+            return None
+        return web_map_lists.block(
+            missions.phone_lists(),
+            getattr(missions, "_feed", None),
+            getattr(missions, "_phone_last", None),
+        )
+
     # --- time left on this map -------------------------------------------------
 
     def _time_reading(self):
@@ -633,6 +676,13 @@ class PhoneBridge(QObject):
         """Rebuild the snapshot soon (once for a burst of signals)."""
         self._publish_timer.start()
 
+    def publish_soon(self, *_args):
+        """As schedule_publish, for a steady run of calls (a map list going on
+        the server, one call per map): a call while a rebuild is already
+        waiting does not push it back, so the page keeps getting progress."""
+        if not self._publish_timer.isActive():
+            self._publish_timer.start()
+
     def publish(self):
         self._part("time left", self.check_time_restore)
         try:
@@ -668,6 +718,8 @@ class PhoneBridge(QObject):
         sky_state = self._part("sky", self._sky_state)
         top["sky"] = sky_state
         top["time_restore"] = self._part("time_restore", self._time_restore_state)
+        map_lists = self._part("map_lists", self._map_lists_state)
+        top["map_lists"] = map_lists
         top["features"] = {
             "bans": self._get("bans_tab") is not None and self._get("mods_tab") is not None,
             "warn": self._get("mods_tab") is not None,
@@ -684,6 +736,7 @@ class PhoneBridge(QObject):
             if sky_state is not None else [],
             "time_left": bool(self._part(
                 "time_left", lambda: self._time_left_problem() is None, default=False)),
+            "map_lists": map_lists is not None,
         }
         players = self._part("players", self._player_extras, default={})
         return {"top": top, "players": players}

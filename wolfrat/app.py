@@ -1730,6 +1730,14 @@ class MissionsTab(QWidget):
     """
 
     _feed = None  # class default: the feed lock is free (see _run_feed)
+    # Who to tell instead of the PC's "these maps were skipped" box: set by
+    # _run_feed for the feed that is running (the phone page's loads).
+    _feed_report = None
+    # Called whenever a feed starts, moves on a map or ends (the phone page
+    # shows the progress). MainWindow points it at the phone bridge.
+    on_feed_changed = None
+    # The last saved list loaded from the phone page (see phone_load_list).
+    _phone_last = None
 
     # Whole minutes left on the map, or None when unknown, stale or untimed
     # (a co-op map has no clock: the server says 0/30 all game, Dale
@@ -2535,18 +2543,36 @@ class MissionsTab(QWidget):
     def _feed_active(self):
         return self._feed is not None
 
-    def _feed_busy(self, title):
-        """True, after telling the admin, while a feed is still running."""
+    def _feed_busy_text(self):
+        """Why the map list can't be changed right now (a feed is still
+        running), or None."""
         feed = self._feed
         if feed is None:
+            return None
+        return (
+            f"WolfRAT is still putting maps on the server ({feed['label']}: "
+            f"{feed['done']} of {feed['total']} done)."
+        )
+
+    def _feed_busy(self, title):
+        """True, after telling the admin, while a feed is still running."""
+        text = self._feed_busy_text()
+        if text is None:
             return False
         QMessageBox.information(
             self, title,
-            f"WolfRAT is still putting maps on the server ({feed['label']}: "
-            f"{feed['done']} of {feed['total']} done).\n\n"
-            "Wait until it has finished, then try again.",
+            f"{text}\n\nWait until it has finished, then try again.",
         )
         return True
+
+    def _feed_changed(self):
+        """A feed started, moved on or ended: tell whoever shows it."""
+        callback = self.on_feed_changed
+        if callback is not None:
+            try:
+                callback()
+            except Exception:
+                pass
 
     # A map change stalls the server for ~15 s (Dale's own log: WolfRAT's
     # commands time out 15-16 s after each map load), long enough to time
@@ -2556,46 +2582,70 @@ class MissionsTab(QWidget):
     FEED_SECONDS_PER_MAP = 0.4   # his server: 219 maps in 44 s, so x2 to spare
     FEED_SAFETY_SECONDS = 60     # minutes arrive whole and up to a minute old
 
-    def _feed_time_ok(self, count, title):
-        """False, after telling the admin, when the map ends too soon for
-        ``count`` maps to go on the server. Unknown time (co-op) is allowed."""
+    def _feed_time_problem(self, count):
+        """Why ``count`` maps can't go on the server right now (the map ends
+        too soon), or None. Unknown time (co-op) is allowed."""
         try:
             minutes = self.minutes_left()
         except Exception:
             minutes = None
         if minutes is None:
-            return True
+            return None
         needed = 10 + self.FEED_SECONDS_PER_MAP * count
         if minutes * 60 >= needed + self.FEED_SAFETY_SECONDS:
-            return True
+            return None
         left = "less than a minute" if minutes < 1 else (
             "about 1 minute" if minutes == 1 else f"about {minutes} minutes"
         )
         took = max(1, round(needed / 60))
-        QMessageBox.information(
-            self, title,
+        return (
             f"There is {left} left on this map. Putting {count} maps on the "
             f"server takes up to {took} minute{'s' if took != 1 else ''}, "
             "and a map change in the middle would cut it off.\n\n"
-            "Wait until the next map has started, then try again.",
+            "Wait until the next map has started, then try again."
         )
+
+    def _feed_time_ok(self, count, title):
+        """False, after telling the admin, when the map ends too soon for
+        ``count`` maps to go on the server. Unknown time (co-op) is allowed."""
+        problem = self._feed_time_problem(count)
+        if problem is None:
+            return True
+        QMessageBox.information(self, title, problem)
         return False
 
-    def _run_feed(self, entries, label, *, replace, on_complete=None):
+    def _run_feed(self, entries, label, *, replace, on_complete=None,
+                  report=None, on_stopped=None):
         """Put ``entries`` on the server in order (Load Preset, Edit Order);
         MISSION CLEAR first when ``replace``. Holds the feed lock (``_feed``)
         until it ends, whether it finishes, the CLEAR fails or the
-        connection drops."""
+        connection drops.
+
+        ``report(failed, disconnected)`` hears about the maps that did not
+        go on instead of the box on the PC, and ``on_stopped(message)`` runs
+        when the feed ends early (the phone page's loads: nobody is at the
+        PC to press OK)."""
         entries = list(entries)
         self._feed = {"label": label, "done": 0, "total": len(entries)}
+        self._feed_report = report
+        self._feed_changed()
 
         def finished():
             self._feed = None
+            self._feed_report = None
             if on_complete is not None:
                 on_complete()
+            self._feed_changed()
 
-        def stopped(_message=None):
+        def stopped(message=None):
             self._feed = None
+            if message is not None:
+                # The CLEAR failed: nothing more comes. (A lost connection
+                # stops with no message and reports the maps right after.)
+                self._feed_report = None
+            if on_stopped is not None:
+                on_stopped(message)
+            self._feed_changed()
 
         def start(_result=None):
             try:
@@ -2603,8 +2653,8 @@ class MissionsTab(QWidget):
                     entries, on_complete=finished, on_stopped=stopped
                 )
             except Exception as error:
-                self._feed = None
                 self.server._log(f"{label} stopped: {error}")
+                stopped(str(error))
 
         if not replace:
             start()
@@ -3165,6 +3215,136 @@ class MissionsTab(QWidget):
             preset, f"loading '{name}'", replace=replace, on_complete=loaded,
         )
 
+    # ---- Saved lists from the phone page (Dale, 2026-11-26) ----
+    # The phone's Maps screen offers the saved lists in a drop-down with
+    # "Add to the end" and "Clear and add". Same feed and the same checks as
+    # Load above, but nothing here opens a box: nobody is at the PC.
+
+    def phone_lists(self):
+        """The saved lists for the phone's drop-down, in the Preset
+        drop-down's order: [{"name", "maps", "missing"}]. "missing" counts
+        the maps the server no longer has (None while its list is unread)."""
+        available = (
+            self.server.available_mission_entries
+            if self.server.is_connected else None
+        )
+        on_server = (
+            {mission.filename.casefold() for mission in available}
+            if available else None
+        )
+        rows = []
+        for name in self._saved_list_names():
+            preset = self._presets.get(name)
+            if not isinstance(preset, list):
+                continue
+            try:
+                files = [str(self._preset_entry_file(entry)) for entry in preset]
+            except Exception:
+                continue
+            missing = None if on_server is None else len(
+                {f.casefold() for f in files if f.casefold() not in on_server}
+            )
+            rows.append({"name": name, "maps": len(files), "missing": missing})
+        return rows
+
+    def phone_load_list(self, name, replace, who="Web Admin"):
+        """Put saved list ``name`` on the server for the phone page: after
+        the cycle when ``replace`` is False, instead of it when True.
+
+        Returns (started, text, status). Maps the server no longer has are
+        left out and stay in the saved list (Load's "Skip and load"). How it
+        went is kept in ``_phone_last`` for the page."""
+        busy = self._feed_busy_text()
+        if busy is not None:
+            return False, f"{busy} Wait until it has finished, then try again.", 409
+        preset = self._presets.get(name) if isinstance(name, str) else None
+        if name == "(none)" or not isinstance(preset, list):
+            return False, "That list is no longer saved in WolfRAT", 409
+        if not self.server.is_connected:
+            return False, "Not connected to the game server", 409
+        available = self.server.available_mission_entries
+        if not available:
+            # Empty means the server has not answered yet, not that every
+            # map is gone (as in _check_preset_maps).
+            return (
+                False,
+                "WolfRAT has not received the server's map list yet - try "
+                "again in a moment",
+                409,
+            )
+        on_server = {mission.filename.casefold() for mission in available}
+        keep, missing = [], []
+        try:
+            for entry in preset:
+                filename = str(self._preset_entry_file(entry))
+                if filename.casefold() in on_server:
+                    keep.append(entry)
+                elif filename not in missing:
+                    missing.append(filename)
+        except Exception:
+            return False, f"The saved list '{name}' cannot be read", 409
+        if not keep:
+            return False, f"None of the maps in '{name}' are on the server", 409
+        problem = self._feed_time_problem(len(keep))
+        if problem is not None:
+            return False, " ".join(problem.split()), 409
+
+        current = len(self.server.mission_entries)
+        replace = bool(replace) and current > 0   # nothing to clear when empty
+        whole_cycle = replace or current == 0
+        previous = self._phone_last or {}
+        last = {
+            "id": int(previous.get("id", 0)) + 1,
+            "name": name,
+            "mode": "replace" if replace else "add",
+            "total": len(keep),
+            "missing": list(missing),
+            "failed": [],
+            "lost": False,
+            "state": "running",
+            "error": "",
+            "who": who,
+        }
+        self._phone_last = last
+        how = "replacing the cycle, " if replace else ""
+        self.server._log(
+            f"Loading preset '{name}' from the phone ({who}) - {how}adding "
+            f"{len(keep)} maps..."
+        )
+        if missing:
+            self.server._log(
+                f"Skipped in preset '{name}' (no longer on the server, kept "
+                f"in the preset): " + ", ".join(missing)
+            )
+
+        def report(failed, disconnected):
+            last["failed"] = list(failed)
+            last["lost"] = bool(disconnected)
+            self._feed_changed()
+
+        def loaded():
+            if whole_cycle:
+                self._cycle_preset = name  # Edit Order's OK and Save target
+            last["state"] = "done"
+            self.server._log(f"Preset '{name}' loaded from the phone.")
+
+        def stopped(message=None):
+            last["state"] = "stopped"
+            last["error"] = str(message or "")
+
+        self._run_feed(
+            keep, f"loading '{name}'", replace=replace, on_complete=loaded,
+            report=report, on_stopped=stopped,
+        )
+        text = (
+            f"Clearing the rotation and adding '{name}'" if replace
+            else f"Adding '{name}' to the end of the rotation"
+        )
+        text += f": {len(keep)} map{'s' if len(keep) != 1 else ''}"
+        if missing:
+            text += f" ({len(missing)} left out, not on the server)"
+        return True, text, None
+
     def _add_missions_in_sequence(
         self, entries, index=0, on_complete=None, failed=None, on_stopped=None
     ):
@@ -3209,6 +3389,7 @@ class MissionsTab(QWidget):
         self.server._log(f"  [{index + 1}/{len(entries)}] Added {filename}")
         if self._feed is not None:
             self._feed["done"] = index + 1
+            self._feed_changed()
         self._add_missions_in_sequence(
             entries, index + 1, on_complete, failed, on_stopped
         )
@@ -3222,6 +3403,7 @@ class MissionsTab(QWidget):
         )
         if self._feed is not None:
             self._feed["done"] = index + 1
+            self._feed_changed()
         failed.append(filename)
         if not self.server.is_connected:
             # Connection gone: the rest would only fail the same way.
@@ -3237,6 +3419,11 @@ class MissionsTab(QWidget):
         )
 
     def _report_failed_preset_adds(self, failed, disconnected=False):
+        report, self._feed_report = self._feed_report, None
+        if report is not None:
+            # A load from the phone page: it hears about it, no box here.
+            report(list(failed), disconnected)
+            return
         shown = failed[:20]
         lines = "\n".join(f"  • {filename}" for filename in shown)
         if len(failed) > len(shown):
@@ -10161,6 +10348,8 @@ class MainWindow(QMainWindow):
         # this window knows is published to the web server as one snapshot.
         self.phone_bridge = PhoneBridge(self, self.web_server, parent=self)
         self.phone_bridge.attach()
+        # A map list going on the server: the page follows it map by map.
+        self.missions_tab.on_feed_changed = self.phone_bridge.publish_soon
         # The page's alerts: kicks, bans and warnings the server took (chat
         # commands and the phone's buttons), and a look at the player list
         # after every update (joins, leaves, notifications).

@@ -171,6 +171,9 @@ let lastChatSeen = null;
 let chatRenderKey = '';
 let playersRenderKey = '';
 let mapsRenderKey = '';
+let listPick = '';            // the saved map list picked in the drop-down
+let listsRenderKey = '';      // what the drop-down was last built from
+let listAwait = null;         // this phone started a load: the newest result's id before it
 let weatherRenderKey = '';
 let skyRenderKey = '';
 let skyKeep = null;                    // minutes a sky stays; null = until the map changes
@@ -2823,6 +2826,7 @@ function renderMaps(missions) {
     const valid = currentMissions.filter(validMission);
     setText('mp-count', `Rotation${DOT}${plural(valid.length, 'map')}`);
     renderMapCards();
+    renderMapLists();
     const el = $('map-list');
     if (!el) return;
     const query = mapQuery.trim().toLowerCase();
@@ -2871,6 +2875,111 @@ function renderMapCards() {
     } else {
         show(card, false);
     }
+}
+
+// ---------------------------------------------------------- saved map lists
+// WolfRAT's saved rotations (the Missions tab's Preset box) in a drop-down:
+// add one to the end of the rotation, or clear the rotation and add it.
+function mapListsInfo() {
+    const block = obj((lastState || {}).map_lists);
+    return {
+        rows: (Array.isArray(block.lists) ? block.lists : [])
+            .filter(l => l && typeof l === 'object' && typeof l.name === 'string' && l.name !== ''),
+        busy: block.busy && typeof block.busy === 'object' ? block.busy : null,
+        last: block.last && typeof block.last === 'object' ? block.last : null,
+    };
+}
+
+function pickedList() {
+    return mapListsInfo().rows.find(l => l.name === listPick) || null;
+}
+
+function renderMapLists() {
+    const card = $('mp-lists');
+    if (!card) return;
+    const offered = !!features.map_lists;
+    show(card, offered);
+    if (!offered) return;
+    const {rows, busy, last} = mapListsInfo();
+    if (listPick && !rows.some(l => l.name === listPick)) listPick = '';
+    const select = $('mp-list-pick');
+    if (select) {
+        // Built again only when the lists changed: a rebuild would close the phone's open picker.
+        const key = JSON.stringify(rows.map(l => [l.name, l.maps]));
+        if (key !== listsRenderKey) {
+            listsRenderKey = key;
+            select.innerHTML = `<option value="">${rows.length ? `Pick a saved list${ELLIPSIS}` : 'No saved lists yet'}</option>`
+                + rows.map(l => `<option value="${esc(l.name)}">${esc(l.name)}${DOT}${esc(plural(num(l.maps) || 0, 'map'))}</option>`).join('');
+            select.value = listPick;
+        }
+        select.disabled = !rows.length;
+    }
+
+    const picked = rows.find(l => l.name === listPick) || null;
+    const missing = picked ? num(picked.missing) || 0 : 0;
+    let note = '';
+    if (!rows.length) note = 'Save a rotation in WolfRAT on the PC (Missions tab, Save) and it shows up here.';
+    else if (!picked) note = 'Pick a list, then add it to the end of the rotation, or clear the rotation and add it.';
+    else if (missing) note = `${plural(missing, 'map')} in this list ${missing === 1 ? 'is' : 'are'} not on the server and will be left out.`;
+    setText('mp-list-note', note);
+    show('mp-list-note', !!note);
+
+    const ready = !!picked && !busy && !!(lastState && lastState.connected);
+    const add = $('mp-list-add');
+    const replace = $('mp-list-replace');
+    if (add) add.disabled = !ready;
+    if (replace) replace.disabled = !ready;
+
+    show('mp-list-busy', !!busy);
+    if (busy) {
+        const done = num(busy.done) || 0;
+        const total = num(busy.total) || 0;
+        const bar = $('mp-list-bar');
+        if (bar && bar.style) bar.style.width = `${total ? Math.min(100, Math.round((done / total) * 100)) : 0}%`;
+        setText('mp-list-busy-text', `Putting maps on the server${busy.label ? ` (${busy.label})` : ''}: ${done} of ${total}`);
+    }
+
+    const said = !busy && last && last.state !== 'running' && last.text ? String(last.text) : '';
+    const tone = last && ['ok', 'warn', 'bad'].indexOf(last.tone) >= 0 ? last.tone : '';
+    const lastEl = $('mp-list-last');
+    if (lastEl) {
+        lastEl.textContent = said;
+        lastEl.className = `note${said ? (tone ? ` ${tone}` : '') : ' hide'}`;
+    }
+    // The load this phone started has ended: say how it went, once.
+    if (listAwait !== null && last && (num(last.id) || 0) > listAwait && last.state !== 'running') {
+        listAwait = null;
+        if (said) showToast(said, tone === 'ok' ? 'accepted' : tone === 'warn' ? 'unverified' : 'error');
+    }
+}
+
+function loadMapList(name, mode) {
+    const {last} = mapListsInfo();
+    listAwait = last ? num(last.id) || 0 : 0;
+    return submitHttpOperation('/api/maplist', {name, mode}, {label: 'Map list'}).then(result => {
+        if (!isDone(result)) listAwait = null;
+        return result;
+    });
+}
+
+function askLoadMapList(mode) {
+    const list = pickedList();
+    if (!list || mapListsInfo().busy) return;
+    const name = list.name;
+    const count = num(list.maps) || 0;
+    const current = currentMissions.filter(validMission).length;
+    const replace = mode === 'replace' && current > 0;
+    openConfirm({
+        title: replace ? `Clear the rotation and add '${name}'?` : `Add '${name}' to the end?`,
+        text: replace
+            ? `The ${plural(current, 'map')} in the rotation now ${current === 1 ? 'is' : 'are'} taken off, then the ${plural(count, 'map')} in '${name}' go on. The map being played carries on.`
+            : (current
+                ? `The ${plural(count, 'map')} in '${name}' go on after the ${plural(current, 'map')} in the rotation now.`
+                : `The ${plural(count, 'map')} in '${name}' go on the server. The rotation is empty now.`),
+        confirm: replace ? 'Clear and add' : 'Add to the end',
+        tone: replace ? 'danger' : 'acc',
+        run: () => loadMapList(name, mode === 'replace' ? 'replace' : 'add'),
+    });
 }
 
 function switchMap(queueIndex, filename, title) {
@@ -3921,6 +4030,12 @@ function bindEvents() {
     on($('now-ring'), 'click', () => openTimeSheet());
     on($('sky-own'), 'click', () => setSky('off'));
     on($('mp-change'), 'click', openNextPicker);
+    on($('mp-list-pick'), 'change', event => {
+        listPick = String((event.target && event.target.value) || '');
+        renderMapLists();
+    });
+    on($('mp-list-add'), 'click', () => askLoadMapList('add'));
+    on($('mp-list-replace'), 'click', () => askLoadMapList('replace'));
     on($('pl-find-input'), 'input', event => {
         playerQuery = String(event.target.value || '');
         renderPlayers();

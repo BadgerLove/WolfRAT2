@@ -211,6 +211,21 @@
 
   <div id="mp-vote" class="card vote hide"></div>
 
+  <div id="mp-lists" class="card lists hide">
+    <div class="ov">Saved map lists</div>
+    <select id="mp-list-pick" class="field" aria-label="Saved map list"></select>
+    <p id="mp-list-note" class="note"></p>
+    <div class="sh-btns">
+      <button id="mp-list-add" class="btn" type="button" disabled>Add to the end</button>
+      <button id="mp-list-replace" class="btn acc" type="button" disabled>Clear and add</button>
+    </div>
+    <div id="mp-list-busy" class="hide">
+      <div class="bar"><i id="mp-list-bar"></i></div>
+      <p id="mp-list-busy-text" class="note"></p>
+    </div>
+    <p id="mp-list-last" class="note hide"></p>
+  </div>
+
   <div class="search"><svg class="i sm"><use href="#search"/></svg><input id="mp-find" type="search" placeholder="Find a map in the rotation&hellip;" autocomplete="off" autocorrect="off" spellcheck="false" aria-label="Find a map"></div>
 
   <div class="sechead"><span id="mp-count" class="ov">Rotation</span></div>
